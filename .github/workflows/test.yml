@@ -216,6 +216,9 @@ jobs:
           } >>"$GITHUB_STEP_SUMMARY"
           if [ "$cbuild" -ne 0 ] || [ "$hang" -ne 0 ] || [ "$fail" -ne 0 ]; then
             echo "::error::kqueue isolation total=$total pass=$pass fail=$fail hang=$hang"
+            while IFS= read -r issue; do
+              [ -z "$issue" ] || echo "::error::$issue"
+            done <"$report"
             exit 1
           fi
           echo "== mox 模块测试 =="
