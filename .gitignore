@@ -1,0 +1,21 @@
+# 构建产物与缓存
+zig-out/
+.zig-cache/
+zig-cache/
+
+# 本地交叉编译的测试二进制
+.linux/
+.verify/
+.sig/
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 临时探针 / 脚本（本项目开发期用过的一次性产物）
+.tmp_*
+.mox_*
+.zonprobe/

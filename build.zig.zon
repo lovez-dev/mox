@@ -1,0 +1,18 @@
+.{
+    // 包名：外部消费者 `zig fetch --save` 时用它作为依赖表里的键。
+    .name = .mox,
+    .version = "0.1.0",
+    // 由 Zig 工具链在首次 `zig build` 时生成并写回；之后不再改动。
+    .fingerprint = 0x3f50f07f12876f0,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{},
+    // 只把编译所需文件纳入包哈希；其余（README、CI、示例数据）不进包。
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        // 许可证随包分发：`zig fetch` 的消费者也应拿到授权文本。
+        "LICENSE",
+        "README.md",
+    },
+}

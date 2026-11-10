@@ -1,0 +1,1 @@
+static asset served through the Work pool

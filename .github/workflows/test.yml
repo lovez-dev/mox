@@ -1,0 +1,110 @@
+name: test
+
+on:
+  # 只在这两条长期分支上跑，避免临时分支/试错提交把 CI 配额烧光。
+  push:
+    branches: [main, dev]
+  # 进 main 的改动一律走 PR，PR 上先跑一遍再合并。
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 平台覆盖：Windows / Linux 的 x86_64 与 arm64，加上 macOS。
+# 不做 BSD。运行时保证为 Windows IOCP 与 Linux io_uring；
+# macOS kqueue 运行时验证留待以后，这里只做原生构建与编译校验。
+jobs:
+  runtime:
+    name: ${{ matrix.os }} ${{ matrix.arch }}（${{ matrix.runtime }}）
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: Windows
+            arch: x86_64
+            runtime: IOCP
+            runner: windows-latest
+            cross: aarch64-windows
+          - os: Windows
+            arch: arm64
+            runtime: IOCP
+            runner: windows-11-arm
+            cross: x86_64-windows
+          - os: Linux
+            arch: x86_64
+            runtime: io_uring
+            runner: ubuntu-latest
+            cross: aarch64-linux
+          - os: Linux
+            arch: arm64
+            runtime: io_uring
+            runner: ubuntu-24.04-arm
+            cross: x86_64-linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Zig 0.17.1
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.17.1
+
+      - name: 版本与架构核对
+        run: |
+          zig version
+          echo "目标后端：${{ matrix.runtime }} / ${{ matrix.arch }}"
+
+      # 托管 runner 可能禁用 io_uring；失败时便于区分代码问题与环境问题。
+      - name: 检查 io_uring 可用性
+        if: runner.os == 'Linux'
+        run: |
+          cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo "（无此 sysctl）"
+          uname -a
+
+      - name: mox + mox_io 全量测试
+        run: zig build test --summary all
+
+      - name: 单独跑 io 模块根测试
+        run: zig test src/io/io.zig
+
+      - name: 构建示例
+        run: zig build
+
+      - name: 真包依赖验证（外部消费者编译）
+        run: zig build test-package
+
+      - name: 三把性能尺子
+        run: |
+          zig build bench -Drounds=2000 -Doptimize=ReleaseFast
+          zig build bench-blocking -Drounds=2000 -Doptimize=ReleaseFast
+          zig build bench-concurrent -Dconns=8 -Drounds=1000 -Doptimize=ReleaseFast
+
+      # ARM runner 上顺带验证 x86 目标的交叉编译没被写坏。
+      - name: 交叉编译校验（另一架构）
+        run: zig test src/io/io.zig -target ${{ matrix.cross }} --test-no-exec
+
+  macos:
+    name: macOS arm64（kqueue，运行时待验证）
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Zig 0.17.1
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.17.1
+
+      - name: 版本与架构核对
+        run: |
+          zig version
+          uname -m
+
+      # kqueue 运行时尚未验证，因此这里不跑 `zig build test`；
+      # 以后在 Darwin/BSD 上确认后再把全量测试加回来。
+      - name: 原生构建示例（kqueue 代码路径编译）
+        run: zig build
+
+      - name: 真包依赖验证（外部消费者编译）
+        run: zig build test-package
+
+      - name: kqueue 原生编译校验（不执行）
+        run: zig test src/io/io.zig --test-no-exec
