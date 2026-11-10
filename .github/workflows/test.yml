@@ -1,10 +1,9 @@
 name: test
 
 on:
-  # 只在这两条长期分支上跑，避免临时分支/试错提交把 CI 配额烧光。
+  # 只维护单一 main 分支：直接推 main 触发 CI，全绿且确认 OK 后打 tag。
   push:
-    branches: [main, dev]
-  # 进 main 的改动一律走 PR，PR 上先跑一遍再合并。
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
