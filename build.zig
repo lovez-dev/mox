@@ -1,5 +1,24 @@
 const std = @import("std");
 
+/// 供外部消费者在 `build.zig` 里调用：把若干目录编译期嵌入成 VFS 模块。
+///
+///     const mox_build = std.Build.lazyImport(b, @This(), "mox") orelse
+///         @panic("mox 依赖未就绪");
+///     const embed = mox_build.addEmbed(b, .{ .dirs = &.{
+///         .{ .dir = "assets", .mount = "/assets" },
+///     } });
+///     exe.step.dependOn(embed.step);
+///     exe.root_module.addImport("mox_vfs", embed.module);
+///
+/// 生成模块导出 `mount(&loop)`、`get(path)`、`files`、`git_rev` 等；
+/// 具体契约见 `src/embed.build.zig`。实现放在 `src/` 下是因为只有
+/// `build.zig.zon` 的 `.paths` 里的文件才会随包分发给外部消费者。
+pub const embed = @import("src/embed.build.zig");
+
+pub fn addEmbed(b: *std.Build, opts: embed.Options) embed.Generated {
+    return embed.add(b, opts);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});

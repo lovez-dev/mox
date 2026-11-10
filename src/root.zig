@@ -11,6 +11,8 @@ pub const router = @import("router.zig");
 pub const middleware = @import("middleware.zig");
 
 pub const serve = server.serve;
+pub const serveWith = server.serveWith;
+pub const MountHook = server.MountHook;
 pub const Config = types.Config;
 pub const Context = types.Context;
 pub const Response = types.Response;

@@ -32,12 +32,25 @@ pub const Context = types.Context;
 pub const Handler = types.Handler;
 pub const Config = types.Config;
 
+/// `Loop` 建好、监听开始之前调用的钩子：用于把编译期嵌入的静态资源
+/// 挂到 `loop.memory_fs`。生成的 `embed.mount` 是泛型函数（`anytype`），
+/// 不能直接当函数指针传，调用方包一层即可：
+///     fn mountAll(l: *mox_io.Loop) !void { return embed.mount(l); }
+///     try mox.serveWith(cfg, mountAll);
+pub const MountHook = *const fn (*Loop) anyerror!void;
+
 pub fn serve(config: Config) !void {
+    return serveWith(config, null);
+}
+
+pub fn serveWith(config: Config, mount_hook: ?MountHook) !void {
     var router = try Router.init(config.gpa, config.routes);
     defer router.deinit();
 
     var loop = try mox_io.open(config.gpa);
     defer loop.deinit();
+
+    if (mount_hook) |hook| try hook(&loop);
 
     const listener = try loop.createSocket(config.address);
     defer loop.close(listener);
@@ -560,4 +573,39 @@ test "静态路由命中内存文件时不触碰磁盘" {
     try std.testing.expect(std.mem.indexOf(u8, wire, "200") != null);
     try std.testing.expect(std.mem.indexOf(u8, wire, vfs_body) != null);
     try std.testing.expect(std.mem.indexOf(u8, wire, "text/html") != null);
+}
+
+// `serveWith` 的挂载钩子必须在 `loop.run()` 之前被调用，且能改写
+// memory_fs。钩子提交一个短定时器，由它在 run 内部 stop，无需网络连接。
+test "serveWith 在启动前调用 VFS 挂载钩子" {
+    if (@import("builtin").os.tag == .windows) try mox_io.platform.startup();
+
+    const Ctx = struct {
+        var called: usize = 0;
+        var mounted: bool = false;
+        var timer: mox_io.Timer = undefined;
+
+        fn hook(loop: *Loop) anyerror!void {
+            called += 1;
+            try loop.mountMemory("/probe.txt", "embedded");
+            mounted = loop.memory_fs.lookup("/probe.txt") != null;
+            // run() 会重置 running，所以 stop 必须由 run 内部的回调触发。
+            timer = mox_io.Timer.init(10);
+            timer.c.callback = onTick;
+            loop.add(&timer.c);
+        }
+        fn onTick(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    };
+
+    try serveWith(.{
+        .gpa = std.heap.page_allocator,
+        .address = try std.Io.net.IpAddress.parse("127.0.0.1", 0),
+        .routes = &.{},
+    }, Ctx.hook);
+
+    try std.testing.expectEqual(@as(usize, 1), Ctx.called);
+    try std.testing.expect(Ctx.mounted);
 }

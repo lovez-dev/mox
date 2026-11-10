@@ -391,13 +391,14 @@ DNS 端到端实测：`example.com` 经 223.5.5.5 解析，Linux 20 ms、Windows
 
 ## 验证状态
 
-**当前保证的运行时只有 Windows（IOCP）与 Linux（io_uring）。**
+**当前四个后端都有运行时实测**：Windows IOCP、Linux io_uring、Linux epoll、
+macOS arm64 kqueue 均在 CI 中跑全量测试。
 
 | 目标 | 架构 | 状态 |
 |---|---|---|
 | Windows（IOCP） | x86_64 / arm64 | 全量测试、真包依赖、性能尺子均在 CI 中运行 |
-| Linux（io_uring） | x86_64 / arm64 | 同上；开发机 WSL 实跑 29/29 |
-| macOS（kqueue） | arm64 | CI 保留原生构建 + 包依赖 + 编译校验；**运行时留待以后** |
+| Linux（io_uring + epoll） | x86_64 / arm64 | 同上；`zig build test` 同时跑 epoll 专属测试（44/44），WSL 开发机亦实跑 |
+| macOS（kqueue） | arm64 | CI 真跑全量 kqueue 运行时测试，逐条隔离 + 20 秒看门狗 |
 
 BSD 不在覆盖范围内。
 
@@ -429,6 +430,61 @@ try loop.mountMemory("/assets/app.css", @embedFile("assets/app.css"));
 - 同名路径再次 `mount` 会覆盖旧条目（`mount` 只在初始化时调用，不在热路径增删）。
 - `Loop.fileSize` 命中内存表时直接返回长度；未命中才回落到后端的真实文件读取。
 - 缓冲区小于文件内容时 `ReadFile.getResult()` 返回 `error.BufferTooSmall`，不静默截断。
+
+### 编译期嵌入整个目录
+
+`@embedFile` 不能跨包路径，逐个手写 `mountMemory` 也麻烦。mox 在包里带了
+一个 build helper，把目录递归内联成一份生成的 Zig 模块（源码见
+`src/embed.build.zig`，结构命名沿用 lovez 的 `Embed`）：
+
+```zig
+// 调用方 build.zig
+const mox_build = std.Build.lazyImport(b, @This(), "mox") orelse
+    @panic("mox 依赖未就绪");
+const embed = mox_build.addEmbed(b, .{
+    .dirs = &.{
+        .{ .dir = "assets", .mount = "/assets" },
+        .{ .dir = "templates", .mount = "/tmpl" },
+    },
+    .git_rev = true, // 可选：注入构建时版本戳
+});
+exe.step.dependOn(embed.step);
+exe.root_module.addImport("mox_vfs", embed.module);
+```
+
+生成模块导出 `Embed.files`（按路径排序）、`get` / `exists` / `list`、
+`git_rev`，以及 `mount(loop)`。运行时把资源挂进事件循环：
+
+```zig
+const embed = @import("mox_vfs");
+
+// 直接用 Loop：泛型 mount 可以自动推导。
+var loop = try mox_io.open(gpa);
+defer loop.deinit();
+try embed.mount(&loop);
+
+// 用 mox.serveWith：钩子要具体函数指针，包一层把 anytype 具体化。
+fn mountAll(l: *mox_io.Loop) anyerror!void { return embed.mount(l); }
+try mox.serveWith(.{ .gpa = gpa, .address = addr, .routes = routes }, mountAll);
+```
+
+`serve(config)` 保持不变，转调 `serveWith(config, null)`；不挂 VFS 的用户
+零改动。之后返回 `Response{ .file_path = "/assets/app.css" }` 就会命中内存表。
+
+约定与校验（都在构建期完成，写错直接编译失败）：
+
+- `mount` 前缀必须以 `/` 开头，且与 HTTP 请求路径一致；不填前缀时
+  目录内相对路径本身必须以 `/` 开头。避免生成运行时永远匹配不到的 key。
+- 路径分隔符统一成 `/`；重复路径、超过 `max_file_size`（默认 8 MiB）
+  直接让构建失败。
+- `git_rev = true` 时注入 `"<short-rev>"`，工作树有改动加 `-dirty`；
+  git 不可用或不在仓库里回落 `"dirty"`，不会让构建失败。
+- `Embed` 是**静态数据源**，`Loop.memory_fs`（`MemoryFs`）是运行时可挂载
+  的表；`mount()` 只负责把前者灌进后者，两者不是可互换的实现。
+
+`examples/consumer/` 是这套用法的真包依赖夹具：通过 `b.dependency("mox")`
+拿模块、用 `addEmbed` 生成资源、再走 `serveWith` 挂载；实测
+`GET /assets/a.txt` 返回内存中的 `hello-from-vfs`。
 
 ## 说明
 
