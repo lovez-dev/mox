@@ -514,15 +514,15 @@ const k32 = struct {
 };
 
 /// 单调毫秒时钟；开销小到每轮循环调用一次也无妨。
+pub fn tickCount() u64 {
+    return k32.GetTickCount64();
+}
+
 /// 阻塞接收，仅用于测试 / benchmark 的客户端线程。
 pub fn recvBlocking(s: SOCKET, buf: []u8) SocketError!usize {
     const rc = c.recv(s, buf.ptr, @intCast(buf.len), 0);
     if (rc < 0) return error.RequestFailed;
     return @intCast(rc);
-}
-
-pub fn tickCount() u64 {
-    return k32.GetTickCount64();
 }
 
 /// 发起一次重叠接收。返回 `null` 表示操作尚未完成——

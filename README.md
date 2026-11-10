@@ -387,6 +387,37 @@ CI（`.github/workflows/test.yml`）分两块：
   测试独立编译、独立 20 秒看门狗，逐条报告挂死/失败及其断言输出，避免
   一条卡住吞掉其余结果；另做示例构建、真包依赖验证与 x86_64 交叉编译校验。
 
+## 与 zio.ev 的性能对照
+
+`bench/compare/` 是一个**独立的构建**（有自己钉死 commit 的 `.zon`），
+不会给 mox 主包引入 `oktest` / `zio` 依赖——外部消费者 `zig fetch` 时
+拿到的仍然只有 mox 自身代码。统计由 [oktest] 提供。
+
+```sh
+cd bench/compare
+zig build compare          # 优化编译，同进程跑两边，输出 Markdown + JSON
+```
+
+GitHub Actions 里 `bench-compare.yml` 是**手动触发**（`workflow_dispatch`），
+覆盖与测试矩阵相同的 5 个平台；每次 push 不跑，避免共享 runner 的性能
+波动变成门禁噪音。结果写进 job 的 step summary，原始输出上传为 artifact。
+
+对照的边界，务必如实理解：
+
+- 只比**低层 callback 事件循环**：`mox_io.Loop` vs `zio.ev.Loop`。
+  zio 的 `Runtime`（栈式协程 / work-stealing）不参与，那是不同抽象层级。
+- 每次测量是一个完整 TCP echo 会话：建连 → 2000 轮 `recv → send` → 拆连。
+  建连开销混进样本，对两边一致，但会**稀释**事件循环本身的差异。
+- 两边都由 oktest 用同一个 `std.Io.Clock.awake` 计时，`std.Io.Threaded`
+  只提供时钟 vtable，不参与任何 I/O，与 mox「不使用 `std.Io` 异步运行时
+  句柄」的约束不冲突。
+- zio.ev 的功能远多于 mox_io（取消、epoll 回退、buffer 抽象、结构化并发）。
+  **数字差异不能解读为设计优劣**，功能少本身就可能更快。
+- GitHub-hosted runner 是共享虚拟机：oktest 的 `noisy` / RSD / CI95 标记
+  正是用来暴露这一点。只看**同机比值**，不要拿绝对值跨机器比较。
+
+[oktest]: https://github.com/naipad/oktest
+
 ## 说明
 
 - 代码注释统一使用中文。

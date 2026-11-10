@@ -1,0 +1,25 @@
+.{
+    // 独立构建：性能对照程序不进 mox 主包的依赖表，避免外部消费者
+    // `zig fetch` 时被顺带拉入 oktest / zio。
+    .name = .mox_bench_compare,
+    .version = "0.1.0",
+    .fingerprint = 0xa61e5e9a3016234,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        // 本地上级目录即 mox 本体；用 path 依赖保证测到的永远是工作树代码。
+        .mox = .{ .path = "../.." },
+        .oktest = .{
+            .url = "git+https://github.com/naipad/oktest#fabac25d19f3061445dc18d704b024c766eba2c9",
+            .hash = "oktest-0.0.0-YKa1X7LAAQDjJgzS7bqFqj0Bxfs4BZ7BUHdA9yig2M-a",
+        },
+        .zio = .{
+            .url = "git+https://github.com/lalinsky/zio#299a618b6a53607abcf360d8256dd1e86e9a6cdd",
+            .hash = "zio-0.19.0-xHbVVI4kLwCDQRgFZre6XZuVtCzXLIpO3Yeeb_ZgJNIU",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
