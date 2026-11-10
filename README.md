@@ -7,7 +7,8 @@
   没有每连接分配之外的额外开销。
 - **自有 I/O 抽象**：`mox_io.Io{ userdata, vtable }`。上层只认这个接口，
   不接触任何平台类型；新增后端 = 填满一个 `VTable`。
-- **三个手写原生后端**：Linux `io_uring`、BSD/Darwin `kqueue`、Windows `IOCP`。
+- **手写原生后端**：Linux `io_uring`（默认，失败自动回落 `epoll`）、
+  Linux `epoll`、BSD/Darwin `kqueue`、Windows `IOCP`。
   热路径（网络、定时器）走原生异步；文件等无可移植异步接口的操作走 `Work` 池兜底。
 - **不含 HTTPS**：TLS 由 nginx 等反向代理终止，框架只处理明文 HTTP/1.1。
 
@@ -91,7 +92,7 @@ pub fn main() !void {
 调用方持有 NetRecv / NetSend / NetAccept / NetConnect / Timer / Work
         │  Loop.add(&node.c)
         ▼
-Loop ── io.vtable.recv/send/accept/connect ──► 后端（IOCP / io_uring / kqueue）
+Loop ── io.vtable.recv/send/accept/connect ──► 后端（IOCP / io_uring / epoll / kqueue）
         ▲                                          │
         └──── io.vtable.wait() 返回 Ref ───────────┘
                  │
@@ -134,6 +135,8 @@ src/
     backends/
       windows.zig   IOCP + 手写 Winsock 层
       uring.zig     io_uring 环
+      linux.zig     Linux 后端门面（默认 uring，失败回落 epoll）
+      epoll.zig     epoll 就绪→完成桥接
       kqueue.zig    kqueue 就绪→完成桥接
 examples/basic.zig   端到端示例
 examples/consumer/   外部消费者（真包依赖验证夹具）
@@ -185,6 +188,27 @@ A/B 是临时把 `loop.zig` 的 `batch_size` 改成 1 跑出来的，已改回 6
 **这些数字只用于本项目改动前后的自身对比。** zio 没有提供同 workload 的
 benchmark，API 也不兼容；在建立 zio 适配器与共同负载之前，不能据此声称
 「与 zio 对齐」或「不比 zio 差」。
+
+## Linux 后端：io_uring 与 epoll
+
+`platform.create()`（Linux 上由 `backends/linux.zig` 充当门面）默认建
+`io_uring`。`io_uring_setup` 失败（内核不支持、`seccomp` 拦截、
+`/proc/sys/kernel/io_uring_disabled=1`、资源不足）时自动回落到 `epoll`，
+上层 `Loop` 完全无感——两个后端返回的是同一个 `VTable` 契约。
+
+`epoll` 是「就绪」接口而非「完成」接口，因此 `backends/epoll.zig` 与 kqueue
+后端同构：每个未完成操作注册一个 `EPOLL.ONESHOT` 事件并记一条 `Pending`；
+`waitBatch` 拿到就绪事件后就地执行非阻塞 `recvfrom` / `sendto` / `accept`，
+再合成循环期望的完成包。`Work` 唤醒用 `eventfd` 挂进同一个 epoll 实例。
+`ONESHOT` 触发后内核会禁用注册，同一 fd 再次提交操作由 `epoll_ctl(MOD)`
+重新武装——这条路径有专门的回归测试（同一 fd 连续两次 `recv`）。
+
+同步辅助函数（建 socket / bind / listen / 文件读写）与事件循环无关，
+`epoll.zig` 直接复用 `uring.zig` 的 POSIX 实现，不重复一套编组代码。
+
+`zig build test` 在 Linux 上会跑 `epoll` 专属测试（timer、accept/recv/send、
+Work 唤醒、异步 connect、ONESHOT 重挂、后端选择），因此无论 CI runner 是否
+启用 io_uring，epoll 路径都真实执行而不是只做编译校验。
 
 ## 新增一个后端
 
@@ -252,6 +276,7 @@ exe.root_module.addImport("mox_io", dep.module("mox_io"));
 | 后端 | 部分写入 | 说明 |
 |---|---|---|
 | Linux io_uring | 常见 | `send` 在缓冲满时明确短写；回归测试在 WSL 上稳定触发 |
+| Linux epoll | 常见 | 与 io_uring 同一套 POSIX socket；就绪后就地 `sendto`，短写语义一致 |
 | Windows IOCP | 少见 | `WSASend` 会把整块缓冲挂进内核发送队列，通常一次性完成，流控留在内核 |
 | kqueue | 常见 | 与 POSIX 语义一致；后端已在 macOS CI 跑通全量测试，短写本身未单独实测 |
 
@@ -278,11 +303,11 @@ UDP 数据报原先只能在 `Work` 池里用阻塞 `recvfrom` 实现。这个�
 |---|---|---|
 | io_uring | `prep_recvmsg` / `prep_sendmsg` | 实测通过 |
 | IOCP | `WSARecvFrom` / `WSASendTo` | 实测通过 |
-| kqueue | `EVFILT_READ` / `EVFILT_WRITE` + 就地 `recvfrom` / `sendto` | 仅编译校验（无 BSD / Darwin 主机） |
+| epoll | `EPOLL.IN` / `EPOLL.OUT` + 就地 `recvfrom` / `sendto` | WSL 实测通过 |
+| kqueue | `EVFILT_READ` / `EVFILT_WRITE` + 就地 `recvfrom` / `sendto` | macOS CI 实测通过 |
 
-三个后端都改走了内核异步，这个挂死在结构上被消除；但要区分证据等级：
-io_uring 与 IOCP 有运行时实测，kqueue 只有编译证据 —— 它的运行时正确性
-尚未被任何机器证明过，拿到 BSD/Darwin 主机上第一件事就是跑这条回归。
+四个后端都改走了内核异步，这个挂死在结构上被消除；四者都有运行时实测，
+其中 kqueue 的证据来自 macOS arm64 CI，BSD 目标仍只做编译校验。
 
 设计上沿用既有分层，没有侵入核心：
 

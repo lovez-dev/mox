@@ -215,7 +215,7 @@ pub const ReadFile = @import("file.zig").ReadFile;
 /// 的文件，再在这里加一个分支。
 pub const platform = switch (builtin.os.tag) {
     .windows => @import("backends/windows.zig"),
-    .linux => @import("backends/uring.zig"),
+    .linux => @import("backends/linux.zig"),
     .macos, .freebsd, .netbsd, .openbsd, .dragonfly => @import("backends/kqueue.zig"),
     else => @compileError("mox_io: no backend for this target yet"),
 };
@@ -291,6 +291,8 @@ test {
         _ = @import("backends/windows.zig");
     } else if (builtin.os.tag == .linux) {
         _ = @import("backends/uring.zig");
+        _ = @import("backends/linux.zig");
+        _ = @import("backends/epoll.zig");
     } else if (builtin.os.tag == .macos or builtin.os.tag == .freebsd) {
         _ = @import("backends/kqueue.zig");
     }
