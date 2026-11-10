@@ -61,7 +61,15 @@ fn fdOf(h: Handle) c.fd_t {
 
 // ---- kevent 辅助函数 -------------------------------------------------------
 
+/// 只有真正注册进 kqueue 的 fd 才需要 `O_NONBLOCK`：`finishOne` 在事件
+/// 就绪后就地执行 `recv/send/accept`，不能让它们把事件循环线程卡住。
+/// 同步辅助函数（`acceptSocket` / `connectSocket` / `sendBlocking` ...）
+/// 不经过这里，因此保持阻塞语义，与 io_uring / IOCP 两个后端一致。
+/// `EVFILT.USER` 的 ident 不是 fd，必须跳过。
 fn evAdd(state: *State, ident: usize, filter: i16, flags: u16) !void {
+    if (filter == c.EVFILT.READ or filter == c.EVFILT.WRITE) {
+        setNonblock(@intCast(ident));
+    }
     var changes = [_]c.Kevent{.{
         .ident = ident,
         .filter = filter,
@@ -507,9 +515,10 @@ pub fn createTcpSocket(address: net.IpAddress) !Handle {
         .ip4 => @intCast(c.AF.INET),
         .ip6 => @intCast(c.AF.INET6),
     };
-    const h = try createSocket(domain, c.SOCK.STREAM, c.IPPROTO.TCP);
-    setNonblock(h);
-    return h;
+    // 与 io_uring / IOCP 后端一致：socket 创建时保持阻塞。
+    // 非阻塞属性由 `evAdd` 在注册进 kqueue 时才赋予，避免把
+    // `acceptSocket` / `connectSocket` 这类同步辅助函数变成 EAGAIN。
+    return createSocket(domain, c.SOCK.STREAM, c.IPPROTO.TCP);
 }
 
 /// 语义选项 → BSD `setsockopt`。`TCP_NODELAY` 在 `c.TCP` 下；
