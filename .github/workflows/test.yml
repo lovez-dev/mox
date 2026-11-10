@@ -166,13 +166,22 @@ jobs:
           zig version
           uname -m
 
-      # kqueue 运行时尚未验证，因此这里不跑 `zig build test`；
-      # 以后在 Darwin/BSD 上确认后再把全量测试加回来。
+      # kqueue 后端此前从未在任何机器上运行过，这里首次让它真跑。
+      # 若失败，说明发现了真实缺陷而非环境噪音 —— 这正是要买的信息。
+      - name: mox + mox_io 全量测试（kqueue 运行时）
+        run: zig build test --summary all
+
+      - name: 单独跑 io 模块根测试
+        run: zig test src/io/io.zig
+
       - name: 原生构建示例（kqueue 代码路径编译）
         run: zig build
 
       - name: 真包依赖验证（外部消费者编译）
         run: zig build test-package
 
-      - name: kqueue 原生编译校验（不执行）
-        run: zig test src/io/io.zig --test-no-exec
+      # 交叉目标编译校验：确认为其它架构生成的代码没被写坏。
+      # （本机 kqueue 的运行时行为已由上面的全量测试覆盖，不再需要
+      #   「只编译不执行」那一步。）
+      - name: 交叉编译校验（x86_64 macOS）
+        run: zig test src/io/io.zig -target x86_64-macos --test-no-exec
