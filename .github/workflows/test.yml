@@ -71,8 +71,15 @@ jobs:
           else
             tar -xf zig-pkg
           fi
-          # 解压出的目录名就是 zig-<plat>-0.17.1，把它放进 PATH。
-          echo "$PWD/zig-${plat}-0.17.1" >> "$GITHUB_PATH"
+          # 解压出的目录名就是 zig-<plat>-0.17.1。
+          # Windows 上后续步骤默认跑在 pwsh 里，它读不懂 bash 的 MSYS 风格
+          # 路径（/d/a/...），必须写 Windows 原生路径，否则 zig 找不到。
+          zigdir="$PWD/zig-${plat}-0.17.1"
+          if [ "$os" = "Windows" ]; then
+            zigdir="$(cygpath -w "$zigdir" 2>/dev/null || echo "$zigdir")"
+          fi
+          echo "$zigdir" >> "$GITHUB_PATH"
+          echo "已加入 PATH: $zigdir"
           "$PWD/zig-${plat}-0.17.1/zig" version
 
       # 缓存两样东西：本地 .zig-cache（构建产物）与全局缓存（std 编译结果）。
