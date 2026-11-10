@@ -187,7 +187,9 @@ pub const TruncateFile = struct {
     }
 };
 
-/// 删除文件。走 `Work` 池；文件不存在按成功处理（幂等）。
+/// 删除文件。走 `Work` 池。
+/// 注意：平台层 `deleteFile` 返回 `void`，所有失败都被吞掉（含文件不存在
+/// 与权限不足），所以 `getResult()` 实际上永远不会报错。
 pub const DeleteFile = struct {
     work: Work,
     io: Io,

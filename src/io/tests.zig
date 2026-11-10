@@ -1045,11 +1045,14 @@ test "DeleteFile 删除文件且重复删除不报错" {
     try l.run();
     try df2.getResult();
 
-    // 读已删除的文件必须失败。
     var buf: [16]u8 = undefined;
     var rf = ReadFile.init(l.io, path, &buf, null);
     rf.work.c.callback = &Ctx.cb;
     l.add(&rf.work.c);
     try l.run();
-    try std.testing.expectError(@as(anyerror, error.FileNotFound), rf.getResult());
+    // 读已删除的文件必须失败。这里不断言具体错误名：各后端对「文件不存在」
+    // 的映射不同（Windows/POSIX 走 FileNotFound，macOS kqueue 走 OpenFailed）。
+    if (rf.getResult()) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
 }

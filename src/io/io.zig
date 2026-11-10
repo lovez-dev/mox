@@ -130,7 +130,8 @@ pub const VTable = struct {
     appendFile: *const fn (userdata: ?*anyopaque, path: []const u8, bytes: []const u8) anyerror!void,
     /// 把文件阻塞截断到 `size` 字节（`Work` 池线程）。
     truncateFile: *const fn (userdata: ?*anyopaque, path: []const u8, size: u64) anyerror!void,
-    /// 删除文件（`Work` 池线程）。文件不存在时不报错。
+    /// 删除文件（`Work` 池线程）。平台层实现返回 `void`，**所有**失败
+    /// （文件不存在、权限不足等）都被吞掉，因此这个槽位不会产生错误。
     deleteFile: *const fn (userdata: ?*anyopaque, path: []const u8) anyerror!void,
     /// 把套接字的完成包路由到本后端（Windows 上同时为监听套接字启用 `AcceptEx`）。
     associate: *const fn (userdata: ?*anyopaque, socket: Handle, key: usize) anyerror!void,

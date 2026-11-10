@@ -533,7 +533,8 @@ try mox.serveWith(.{ .gpa = gpa, .address = addr, .routes = routes }, mountAll);
     偏移超出文件长度时短读为 0 字节而不报错。
   - `WriteFile`：默认整文件覆盖写；`initAppend(...)` 追加到末尾并保留既有内容。
   - `TruncateFile`：把文件截断到指定长度。
-  - `DeleteFile`：删除文件，文件不存在按成功处理（幂等）。
+  - `DeleteFile`：删除文件。平台层实现返回 `void`，所有失败都被吞掉
+    （含文件不存在与权限不足），因此它不会报错——需要可靠删除请自行先 `fileSize` 探测。
   `VTable` 上对应的 `readFileInto`/`readFileAt`/`writeFileAll`/`appendFile`/
   `truncateFile`/`deleteFile` 是所有后端共用的兜底，没有可移植的原生异步接口。
 
