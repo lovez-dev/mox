@@ -19,6 +19,3 @@ Thumbs.db
 .tmp_*
 .mox_*
 .zonprobe/
-
-# zig fetch 在 build root 解包的依赖源码（由 .zon 的 url/hash 复现，不入库）
-zig-pkg/
