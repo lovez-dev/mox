@@ -59,6 +59,9 @@ pub const Loop = struct {
     /// `drainRetired` 因超时提前返回的次数。正常关停应当为 0；
     /// 非零说明有完成包没能在预算内回来，context 归属已转交调用方。
     retired_timeouts: usize = 0,
+    /// 进程内内存文件表，供静态路由挂载编译期资源 / 测试替身。
+    /// 数组在堆上，`Loop` 按值拷贝不会让它悬空。
+    memory_fs: @import("file.zig").MemoryFs = undefined,
 
     // 已完成、待在循环线程投递的 `Work`。无锁，且不依赖 std.Io。
     pool: Pool = .{ .allocator = undefined },
@@ -66,13 +69,13 @@ pub const Loop = struct {
     /// 从 `io` 构造循环。线程池用 `allocator` 存放线程句柄；
     /// 后端不提供分配器时可用 `std.heap.page_allocator`。
     pub fn init(io: Io) Loop {
-        var self: Loop = .{ .io = io, .allocator = std.heap.page_allocator, .pool = Pool.init(std.heap.page_allocator, pool_mod.default_max_workers) };
+        var self: Loop = .{ .io = io, .allocator = std.heap.page_allocator, .pool = Pool.init(std.heap.page_allocator, pool_mod.default_max_workers), .memory_fs = @import("file.zig").MemoryFs.init(std.heap.page_allocator) };
         self.timers.initWithAllocator(self.allocator);
         return self;
     }
 
     pub fn initWithAllocator(io: Io, allocator: std.mem.Allocator) Loop {
-        var self: Loop = .{ .io = io, .allocator = allocator, .pool = Pool.init(allocator, pool_mod.default_max_workers) };
+        var self: Loop = .{ .io = io, .allocator = allocator, .pool = Pool.init(allocator, pool_mod.default_max_workers), .memory_fs = @import("file.zig").MemoryFs.init(allocator) };
         self.timers.initWithAllocator(self.allocator);
         return self;
     }
@@ -82,6 +85,7 @@ pub const Loop = struct {
         self.pool.shutdown();
         self.retired.deinit(self.allocator);
         self.timers.deinit();
+        self.memory_fs.deinit();
         self.io.vtable.deinit(self.io.userdata);
     }
 
@@ -356,8 +360,16 @@ pub const Loop = struct {
         self.io.vtable.close(self.io.userdata, socket);
     }
 
-    /// 返回文件字节数，供静态文件响应分配缓冲区。
+    /// 挂载一个内存文件（通常是编译期常量或测试替身）。路径按字节精确匹配；
+    /// `bytes` 的生命周期必须长于本循环，这里不复制。
+    pub fn mountMemory(self: *Loop, path: []const u8, bytes: []const u8) !void {
+        try self.memory_fs.mount(path, bytes);
+    }
+
+    /// 返回文件字节数，供静态文件响应分配缓冲区。内存文件命中时直接返回
+    /// 其长度，不触碰磁盘；未命中才回落到后端的 `fileSize`。
     pub fn fileSize(self: *Loop, path: []const u8) !u64 {
+        if (self.memory_fs.size(path)) |n| return n;
         return self.io.vtable.fileSize(self.io.userdata, path);
     }
 

@@ -387,6 +387,24 @@ CI（`.github/workflows/test.yml`）分两块：
   测试独立编译、独立 20 秒看门狗，逐条报告挂死/失败及其断言输出，避免
   一条卡住吞掉其余结果；另做示例构建、真包依赖验证与 x86_64 交叉编译校验。
 
+
+## 内存文件（VFS）
+
+`Loop.memory_fs` 可以挂载编译期资源或测试替身，静态文件路由会优先命中它，
+不再 open/read/close 真实磁盘（池线程只做一次 memcpy，不做阻塞 I/O）：
+
+```zig
+var loop = try mox_io.open(gpa);
+defer loop.deinit();
+try loop.mountMemory("/assets/app.css", @embedFile("assets/app.css"));
+```
+
+- 路径按字节精确匹配，不做任何规范化；`path` / `bytes` 由调用方持有，
+  `mountMemory` 不复制、也不负责释放，其生命周期必须长于本循环。
+- 同名路径再次 `mount` 会覆盖旧条目（`mount` 只在初始化时调用，不在热路径增删）。
+- `Loop.fileSize` 命中内存表时直接返回长度；未命中才回落到后端的真实文件读取。
+- 缓冲区小于文件内容时 `ReadFile.getResult()` 返回 `error.BufferTooSmall`，不静默截断。
+
 ## 说明
 
 - 代码注释统一使用中文。

@@ -222,7 +222,7 @@ fn serveFile(conn: *Connection, response: Response, keep_alive: bool) void {
     conn.keep_alive = keep_alive;
     conn.defer_status = response.status;
     conn.defer_ctype = response.content_type;
-    conn.file_work = mox_io.ReadFile.init(conn.loop.io, path, conn.file_buf);
+    conn.file_work = mox_io.ReadFile.init(conn.loop.io, path, conn.file_buf, conn.loop.memory_fs.lookup(path));
     conn.file_work.work.c.callback = onFileRead;
     conn.loop.add(&conn.file_work.work.c);
 }
@@ -468,4 +468,96 @@ test "响应发生部分写入时续发剩余字节，不静默丢弃" {
     try loop.run();
 
     try std.testing.expectEqual(payload, partial.received.load(.acquire));
+}
+
+// 静态路由 + 内存文件端到端：挂载一个磁盘上不存在的路径，走完整的
+// recv → 解析 → 路由 → serveFile → ReadFile → send 链路。
+// 这条测试也是 `serveFile` 把 `memory_fs.lookup(path)` 传给 `ReadFile.init`
+// 的接线证据：若那里被改回 `null`，本测试会因 FileNotFound 而变红。
+test "静态路由命中内存文件时不触碰磁盘" {
+    if (@import("builtin").os.tag == .windows) try mox_io.platform.startup();
+    const alloc = std.heap.page_allocator;
+
+    const vfs_path = "/virtual/does-not-exist-on-disk.html";
+    const vfs_body = "<h1>from memory</h1>";
+
+    const S = struct {
+        var received: [4096]u8 = undefined;
+        var received_len: usize = 0;
+        var done: std.atomic.Value(bool) = .init(false);
+
+        fn handler(ctx: *Context) !Response {
+            _ = ctx;
+            return .{ .file_path = vfs_path, .content_type = "text/html" };
+        }
+
+        fn client(addr: std.Io.net.IpAddress) void {
+            const s = mox_io.platform.createTcpSocket(addr) catch return;
+            defer mox_io.platform.closeSocket(s);
+            mox_io.platform.connectSocket(s, addr) catch return;
+            const req = "GET /asset HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            _ = mox_io.platform.sendBlocking(s, req) catch return;
+            var n: usize = 0;
+            while (n < received.len) {
+                const got = mox_io.platform.recvBlocking(s, received[n..]) catch break;
+                if (got == 0) break;
+                n += got;
+            }
+            received_len = n;
+            done.store(true, .release);
+        }
+
+        fn tick(loop: *Loop, c: *Completion) void {
+            const t: *mox_io.Timer = @fieldParentPtr("c", c);
+            if (done.load(.acquire)) {
+                loop.stop();
+                return;
+            }
+            // 原地重新武装同一个节点；新建栈上 Timer 会让 completion 悬空。
+            t.* = mox_io.Timer.init(20);
+            t.c.callback = tick;
+            loop.add(&t.c);
+        }
+    };
+
+    const bind_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    const listener = try mox_io.platform.createTcpSocket(bind_addr);
+    defer mox_io.platform.closeSocket(listener);
+    try mox_io.platform.setReuseAddress(listener, true);
+    try mox_io.platform.bindSocket(listener, bind_addr);
+    const bound = try mox_io.platform.localAddress(listener);
+    try mox_io.platform.listenSocket(listener, 8);
+
+    S.done.store(false, .release);
+    S.received_len = 0;
+    const t = try std.Thread.spawn(.{}, S.client, .{bound});
+    defer t.join();
+
+    const accepted = try mox_io.platform.acceptSocket(listener);
+    defer mox_io.platform.closeSocket(accepted.socket);
+
+    var loop = try mox_io.open(alloc);
+    defer loop.deinit();
+    try loop.associate(accepted.socket, 1);
+    try loop.mountMemory(vfs_path, vfs_body);
+
+    var router = try Router.init(alloc, &.{
+        .{ .method = .GET, .path = "/asset", .handler = S.handler },
+    });
+    defer router.deinit();
+
+    const conn = try alloc.create(Connection);
+    conn.* = .{ .alloc = alloc, .loop = &loop, .router = &router, .socket = accepted.socket };
+    postRecv(conn);
+
+    var heartbeat = mox_io.Timer.init(20);
+    heartbeat.c.callback = S.tick;
+    loop.add(&heartbeat.c);
+
+    try loop.run();
+
+    const wire = S.received[0..S.received_len];
+    try std.testing.expect(std.mem.indexOf(u8, wire, "200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, vfs_body) != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "text/html") != null);
 }

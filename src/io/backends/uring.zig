@@ -839,7 +839,7 @@ test "io_uring: ReadFile reads a file off the loop thread" {
         }
     };
     var buf: [64]u8 = undefined;
-    var rf = root.ReadFile.init(l.io, path, &buf);
+    var rf = root.ReadFile.init(l.io, path, &buf, null);
     rf.work.c.callback = &Ctx.cb;
     l.add(&rf.work.c);
     try l.run();

@@ -254,13 +254,97 @@ test "ReadFile reads a file off the loop thread" {
     };
 
     var buf: [64]u8 = undefined;
-    var rf = ReadFile.init(l.io, path, &buf);
+    var rf = ReadFile.init(l.io, path, &buf, null);
     rf.work.c.callback = &Ctx.cb;
     l.add(&rf.work.c);
     try l.run();
 
     try std.testing.expect(Ctx.ok);
     try std.testing.expectEqualStrings("static-asset-body", try rf.getResult());
+}
+
+// 内存文件走完整条 `Loop.add → Work → 回调` 链路，但路径在磁盘上不存在：
+// 若实现回落到了 `readFileInto`，这条测试会直接失败。
+test "MemoryFs 命中时不碰磁盘且结果进入回调" {
+    var l = Loop.init(try platform.create(std.testing.allocator));
+    defer l.deinit();
+
+    const path = "這個路徑在磁盤上絕對不存在/memory-only.bin";
+    const body = "compiled-in-asset";
+    try l.mountMemory(path, body);
+    try std.testing.expectEqual(@as(u64, body.len), try l.fileSize(path));
+
+    const Ctx = struct {
+        var ok = false;
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            ok = true;
+            loop.stop();
+        }
+    };
+
+    var buf: [64]u8 = undefined;
+    var rf = ReadFile.init(l.io, path, &buf, l.memory_fs.lookup(path));
+    rf.work.c.callback = &Ctx.cb;
+    l.add(&rf.work.c);
+    try l.run();
+
+    try std.testing.expect(Ctx.ok);
+    try std.testing.expectEqualStrings(body, try rf.getResult());
+}
+
+// 缓冲区小于内存文件时必须报错，而不是静默截断。
+test "MemoryFs 缓冲区不足时返回 BufferTooSmall" {
+    var l = Loop.init(try platform.create(std.testing.allocator));
+    defer l.deinit();
+    try l.mountMemory("/big", "0123456789");
+
+    const Ctx = struct {
+        var ok = false;
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            ok = true;
+            loop.stop();
+        }
+    };
+
+    var buf: [4]u8 = undefined;
+    var rf = ReadFile.init(l.io, "/big", &buf, l.memory_fs.lookup("/big"));
+    rf.work.c.callback = &Ctx.cb;
+    l.add(&rf.work.c);
+    try l.run();
+
+    try std.testing.expect(Ctx.ok);
+    try std.testing.expectError(error.BufferTooSmall, rf.getResult());
+}
+
+// 未挂载的路径仍回落到真实文件，避免 VFS 把原有行为吃掉。
+test "MemoryFs 未命中时回落到后端 readFileInto" {
+    var l = Loop.init(try platform.create(std.testing.allocator));
+    defer l.deinit();
+
+    const path = "zig-cache-mox-vfs-fallback-test.txt";
+    try platform.writeFileAll(path, "on-disk-body");
+    defer platform.deleteFile(path);
+    try std.testing.expect(l.memory_fs.lookup(path) == null);
+
+    const Ctx = struct {
+        var ok = false;
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            ok = true;
+            loop.stop();
+        }
+    };
+
+    var buf: [64]u8 = undefined;
+    var rf = ReadFile.init(l.io, path, &buf, l.memory_fs.lookup(path));
+    rf.work.c.callback = &Ctx.cb;
+    l.add(&rf.work.c);
+    try l.run();
+
+    try std.testing.expect(Ctx.ok);
+    try std.testing.expectEqualStrings("on-disk-body", try rf.getResult());
 }
 
 test "取消在飞操作后不回调，只回收对象" {
