@@ -125,7 +125,7 @@ src/
     queue.zig       侵入式 FIFO 就绪队列
     timer.zig       定时器有序链表
     pool.zig        Work 线程池
-    file.zig        阻塞文件读兜底
+    file.zig        文件节点：ReadFile / WriteFile / SendFile / Truncate / Delete
     tests.zig       事件循环测试
     queue.zig       就绪 FIFO
     timer.zig       定时器有序表
@@ -400,6 +400,74 @@ loop.add(&s.work.c);
 
 两道防线都有变异测试证明有效：撤掉 `MSG_NOSIGNAL` 后进程被信号杀死；只靠
 `SIG_IGN` 时裸 `write` 能拿到 `EPIPE` 并存活。
+## 文件系统操作
+
+除读写删之外，`Loop` 还提供目录与元数据操作。**这些都是同步入口**（直接调
+平台层），在 `Work` 节点内部复用；在循环线程里直接调用会卡住整个循环，
+异步场景请用对应的节点。
+
+| 操作 | 语义 |
+|---|---|
+| `makeDir(path, mode)` | 逐级创建（`mkdir -p`），已存在不报错 |
+| `removeDir(path)` | 只删空目录，非空报 `DirNotEmpty`，**不递归** |
+| `rename(from, to)` | 跨设备报 `CrossDevice`，不退化成「复制+删除」 |
+| `symLink(target, link)` | Windows 需管理员权限或开发者模式 |
+| `statPath(path)` | 返回 `FileKind` / `size` / `mtime_ms`，跟随符号链接 |
+| `listDir(path, buf)` | 列出条目（`DirEntry` 数组），返回条数 |
+
+`makeDir` 逐级创建、`removeDir` 不递归是刻意的：递归删除太危险，静默截断
+路径会操作到别的文件——宁可明确失败。
+
+### Unix domain socket
+
+```zig
+const listener = try loop.createUnixSocket();
+try loop.bindUnix(listener, "/tmp/app.sock");   // 已存在报 PathAlreadyExists
+try loop.listen(listener, 8);
+// 之后与 TCP 完全同形：NetAccept / NetRecv / NetSend
+```
+
+三个 POSIX 后端各自实现（io_uring 走 `prep_connect` 原生异步；epoll 与
+kqueue 做非阻塞 connect）。**Windows 整组槽位为 `null`**，返回
+`error.Unsupported`。
+
+已知限制：`connect` 的 `sockaddr_un` 要活到内核读完，只能塞进 64 字节的
+`Scratch`，扣掉结构头后路径上限约 62 字节。覆盖 `/tmp/x.sock`、
+`/var/run/x.sock` 这类常见路径；超出时明确报 `NameTooLong`，而不是截断
+连到别的 socket。
+
+### 原生异步文件 I/O（仅 io_uring）
+
+Linux 上文件读写是真异步——提交 SQE，完成时回调，不占池线程：
+
+```zig
+var f = root.ReadFileAsync.init("/path/to/file ", &buf);
+f.c.callback = &onRead;
+loop.add(&f.c);
+```
+
+`openat` 与 `close` 留同步，只 `read`/`write` 异步。两条实测结论支撑这个
+取舍：`IOSQE_IO_LINK` **不会**把前一条的返回值传给后一条的 fd 字段；把
+`close` 链在 `read` 后面，它的 CQE 会回 `-125`（ECANCELED）导致 fd 泄漏。
+两者都是纳秒到微秒级的元数据操作，留在同步侧没有可观测代价。
+
+非 io_uring 后端 `readFileAsync`/`writeFileAsync` 为 `null`，节点返回
+`error.Unsupported`，调用方回落 `ReadFile`（`Work` 版）。
+
+### 零拷贝文件 → socket（`SendFile`）
+
+```zig
+var sf = root.SendFile.init(loop.io, socket, "/path/to/big.bin");
+sf.work.c.callback = &onSent;   // 或直接 loop.sendFile(socket, path, 0, 0)
+```
+
+`sendfile(2)` 把页缓存直接送进 socket 缓冲，不经用户态。走 `Work` 池而不是
+异步后端——它本身已是零拷贝，只有数据量大时才阻塞，两者结合同时拿到「不
+阻塞循环」和「不复制数据」。
+
+三平台签名不同（Darwin 参数顺序与 Linux 相反，FreeBSD 多一个出参），逐个
+适配。Windows 的 `TransmitFile` 在 std 里没绑定，槽位为 `null`。
+
 ## 作为包被依赖
 
 仓库根有 `build.zig.zon`，包名 `mox`，最低 Zig 版本 `0.17.1`。外部项目
@@ -555,8 +623,8 @@ macOS arm64 kqueue 均在 CI 中跑全量测试。
 
 | 目标 | 架构 | 状态 |
 |---|---|---|
-| Windows（IOCP） | x86_64 / arm64 | 全量测试、真包依赖、性能尺子均在 CI 中运行；子进程四场景本地实跑；`Signal` 明确返回 `Unsupported` |
-| Linux（io_uring + epoll） | x86_64 / arm64 | 同上；`zig build test` 同时跑 epoll 专属测试，WSL 开发机实跑 59/61（含子进程、信号与 WatchFd；uring 与 epoll 双后端各跑一遍） |
+| Windows（IOCP） | x86_64 / arm64 | 全量测试、真包依赖、性能尺子均在 CI 中运行；子进程四场景本地实跑；`Signal` / UDS / 异步文件 I/O / `sendfile` 明确返回 `Unsupported` |
+| Linux（io_uring + epoll） | x86_64 / arm64 | 同上；`zig build test` 同时跑 epoll 专属测试，WSL 开发机实跑 71/76（含子进程、信号、WatchFd、目录操作、UDS、异步文件 I/O 与 sendfile；uring 与 epoll 双后端各跑一遍） |
 | macOS（kqueue） | arm64 | CI 真跑全量 kqueue 运行时测试，逐条隔离 + 20 秒看门狗 |
 
 BSD 不在覆盖范围内。
