@@ -1821,3 +1821,110 @@ test "ReadFileAsync 的 offset 生效（从中间读）" {
     // offset=3 起读 8 字节 → "3456789"（只剩 7 字节）。
     try std.testing.expectEqualStrings("3456789", try f.getResult());
 }
+
+// ===== 零拷贝文件 → socket =====
+
+test "SendFile 在 Windows 上返回 Unsupported" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var l = try testLoop();
+    defer l.deinit();
+    const f = l.io.vtable.sendFileTo;
+    try std.testing.expect(f == null);
+}
+
+test "SendFile 把文件内容经 sendfile 送进 socket" {
+    // 用 Unix domain socket 做连接对：本机 UDS 的 connect 立即完成，
+    // 不需要 TCP 握手时序，测试更稳定。
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var l = try testLoop();
+    defer l.deinit();
+    if (l.io.vtable.sendFileTo == null) return error.SkipZigTest;
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "sendfile");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var fbuf: [600]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&fbuf, "{s}/sf.txt", .{dir});
+    defer l.deleteFile(fpath);
+    const payload = "sendfile-payload-42";
+    try l.writeFileAll(fpath, payload);
+
+    var spath_buf: [80]u8 = undefined;
+    const sock_path = try std.fmt.bufPrint(&spath_buf, "{s}/s.sock", .{dir});
+    if (sock_path.len > 60) return error.SkipZigTest;
+    defer l.deleteFile(sock_path);
+
+    // 服务端：bind + listen，然后同步 accept（UDS 上客户端 connect 会立即
+    // 排队，accept 不会阻塞）。
+    const listener = try l.createUnixSocket();
+    defer l.close(listener);
+    try l.bindUnix(listener, sock_path);
+    try l.listen(listener, 4);
+
+    // 客户端在另一线程 connect 并读数据——不能用 std.c（Linux 不链 libc）。
+    const Reader = struct {
+        var n: usize = 0;
+        var buf: [64]u8 = undefined;
+        fn run(path: []const u8) void {
+            const lx = std.os.linux;
+            const fd = lx.socket(lx.AF.UNIX, lx.SOCK.STREAM, 0);
+            const fd_s: isize = @bitCast(fd);
+            if (fd_s < 0) return;
+            defer _ = lx.close(@intCast(fd_s));
+            var sa: lx.sockaddr.un = undefined;
+            @memset(std.mem.asBytes(&sa), 0);
+            sa.family = lx.AF.UNIX;
+            @memcpy(sa.path[0..path.len], path);
+            const len: lx.socklen_t = @intCast(@offsetOf(lx.sockaddr.un, "path") + path.len + 1);
+            if (@as(isize, @bitCast(lx.connect(@intCast(fd_s), @ptrCast(&sa), len))) != 0) return;
+            // 读到 EOF 或缓冲满。
+            while (n < buf.len) {
+                const rc = lx.read(@intCast(fd_s), buf[n..].ptr, buf.len - n);
+                const rc_s: isize = @bitCast(rc);
+                if (rc_s <= 0) break;
+                n += @intCast(rc_s);
+            }
+        }
+    };
+
+    const t = try std.Thread.spawn(.{}, Reader.run, .{sock_path});
+
+    // accept：走 `NetAccept` 节点（同步 `vtAccept` 需要预建 socket，
+    // io_uring 上会 close 掉它再用内核分配的 fd，不适合同步入口）。
+    const Conn = struct {
+        var fd: Handle = INVALID_HANDLE;
+        var done = false;
+        fn cb(lp: *Loop, c: *Completion) void {
+            const a: *root.NetAccept = @fieldParentPtr("c", c);
+            fd = a.getResult() catch INVALID_HANDLE;
+            done = true;
+            lp.stop();
+        }
+    };
+    const accept_sock = try l.createUnixSocket();
+    defer l.close(accept_sock);
+    var acc = root.NetAccept.init(listener, accept_sock);
+    var wd = Timer.init(5000);
+    acc.c.callback = &Conn.cb;
+    l.add(&acc.c);
+    l.watchdog(&acc.c, &wd, 5000);
+    try l.run();
+    try std.testing.expect(Conn.done);
+    const conn = Conn.fd;
+    if (conn == INVALID_HANDLE) {
+        t.join();
+        return error.SkipZigTest;
+    }
+
+    // 对 conn 做 sendfile（同步入口，走 Work 池的节点内部也用这个）。
+    const sent = try l.sendFile(conn, fpath, 0, 0);
+    try std.testing.expectEqual(payload.len, sent);
+    l.close(conn);
+
+    t.join();
+    try std.testing.expectEqualStrings(payload, Reader.buf[0..Reader.n]);
+}

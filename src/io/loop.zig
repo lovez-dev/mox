@@ -418,6 +418,13 @@ pub const Loop = struct {
         try self.io.vtable.associate(self.io.userdata, socket, key);
     }
 
+    /// 零拷贝把文件送进 socket（阻塞，`sendfile`）。不支持时返回
+    /// `error.Unsupported`。异步场景请用 `SendFile` 节点。
+    pub fn sendFile(self: *Loop, socket: Handle, path: []const u8, offset: u64, count: usize) !usize {
+        const f = self.io.vtable.sendFileTo orelse return error.Unsupported;
+        return f(self.io.userdata, socket, path, offset, count);
+    }
+
     /// 建一个 Unix domain socket（`AF_UNIX` + `SOCK_STREAM`）。
     /// 后端不支持时（Windows）返回 `error.Unsupported`。
     pub fn createUnixSocket(self: *Loop) !Handle {

@@ -266,6 +266,11 @@ pub const VTable = struct {
     /// 发起异步写文件（覆盖）。
     writeFileAsync: ?*const fn (userdata: ?*anyopaque, path: [*:0]const u8, offset: u64, bytes: []const u8, scratch: *Scratch) anyerror!?void = null,
 
+    /// 把文件内容零拷贝送进套接字（Linux `sendfile` / BSD `sendfile`）。
+    /// 返回实际发送字节数。`offset` 是文件内起始偏移，由后端推进。
+    /// 不支持时（Windows）为 `null`，调用方回落到「读进缓冲再 `send`」。
+    sendFileTo: ?*const fn (userdata: ?*anyopaque, socket: Handle, path: []const u8, offset: u64, count: usize) anyerror!usize = null,
+
     /// 关闭套接字。
     close: *const fn (userdata: ?*anyopaque, socket: Handle) void,
 

@@ -557,6 +557,53 @@ fn vtWriteFileAsync(
     return null;
 }
 
+// ---- 零拷贝文件→socket ----------------------------------------------------
+//
+// Linux 的 `sendfile(2)` 把页缓存直接送进 socket 缓冲，不经用户态。
+// 一次调用最多发 `0x7ffff000` 字节（内核单次上限），超出要循环。
+
+pub fn vtSendFileTo(
+    userdata: ?*anyopaque,
+    socket: root.Handle,
+    path: []const u8,
+    offset: u64,
+    count: usize,
+) anyerror!usize {
+    _ = userdata;
+    var zbuf: [4096]u8 = undefined;
+    const zpath = try pathZ(path, &zbuf);
+
+    const in_fd = openSync(zpath, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch |e| return e;
+    defer _ = linux.close(in_fd);
+
+    const out_fd = fdOf(socket);
+    var off: linux.off_t = @intCast(offset);
+    // `count == 0` 表示整文件：先问出大小再发。
+    var remaining: usize = if (count == 0) blk: {
+        const st = try stat(path);
+        break :blk @intCast(st.size - @min(st.size, offset));
+    } else count;
+
+    var total: usize = 0;
+    while (remaining > 0) {
+        const chunk = @min(remaining, 0x7ffff000);
+        const rc = linux.sendfile(out_fd, in_fd, &off, chunk);
+        const rc_s: isize = @bitCast(rc);
+        if (rc_s < 0) {
+            if (total != 0) break; // 已经发出去一部分，当作短写
+            return switch (-rc_s) {
+                @backingInt(linux.E.NOENT) => error.FileNotFound,
+                @backingInt(linux.E.PIPE) => error.BrokenPipe,
+                else => error.SendFileFailed,
+            };
+        }
+        if (rc_s == 0) break; // 文件读完
+        total += @intCast(rc_s);
+        remaining -= @intCast(rc_s);
+    }
+    return total;
+}
+
 fn vtNotify(userdata: ?*anyopaque) void {
     const state = stateOf(userdata);
     var one: u64 = 1;
@@ -697,6 +744,7 @@ const vtable_storage: root.VTable = .{
     .watchFd = vtWatchFd,
     .readFileAsync = vtReadFileAsync,
     .writeFileAsync = vtWriteFileAsync,
+    .sendFileTo = vtSendFileTo,
     .createUnix = vtCreateUnix,
     .bindUnix = vtBindUnix,
     .connectUnix = vtConnectUnix,

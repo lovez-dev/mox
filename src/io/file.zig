@@ -13,6 +13,7 @@ const root = @import("io.zig");
 
 const Io = root.Io;
 const Work = root.Work;
+const Handle = root.Handle;
 
 /// 进程内内存文件表。条目由调用方在启动时 `mount`，生命周期必须长于
 /// 任何 `ReadFile`；通常挂在 `Loop` 上，随循环一起销毁。
@@ -113,6 +114,49 @@ pub const ReadFile = struct {
     pub fn getResult(self: *const ReadFile) ![]const u8 {
         if (self.err) |e| return e;
         return self.buf[0..self.len];
+    }
+};
+
+/// 把文件内容零拷贝送进套接字。POSIX 走 `sendfile(2)`：数据从页缓存直接进
+/// socket 缓冲，不经用户态。Windows 无对应绑定，节点返回 `error.Unsupported`
+/// （调用方应回落到「读进缓冲再 `send`」）。
+///
+/// 走 `Work` 池而不是异步后端：`sendfile` 本身在数据量大时才会阻塞，
+/// 而它已经是零拷贝——把两者结合，就同时拿到「不阻塞循环」和「不复制数据」。
+pub const SendFile = struct {
+    work: Work,
+    io: Io,
+    socket: Handle,
+    path: []const u8,
+    offset: u64 = 0,
+    /// 最多发多少字节。0 表示整文件。
+    count: usize = 0,
+    sent: usize = 0,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, socket: Handle, path: []const u8) SendFile {
+        return .{ .work = Work.init(run), .io = io, .socket = socket, .path = path };
+    }
+
+    pub fn initCount(io: Io, socket: Handle, path: []const u8, offset: u64, count: usize) SendFile {
+        return .{ .work = Work.init(run), .io = io, .socket = socket, .path = path, .offset = offset, .count = count };
+    }
+
+    fn run(w: *Work) void {
+        const self: *SendFile = @fieldParentPtr("work", w);
+        const f = self.io.vtable.sendFileTo orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        self.sent = f(self.io.userdata, self.socket, self.path, self.offset, self.count) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    pub fn getResult(self: *const SendFile) !usize {
+        if (self.err) |e| return e;
+        return self.sent;
     }
 };
 

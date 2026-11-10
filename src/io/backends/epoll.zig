@@ -216,6 +216,11 @@ fn vtAssociate(userdata: ?*anyopaque, socket: Handle, key: usize) anyerror!void 
     _ = key;
 }
 
+fn vtSendFileTo(userdata: ?*anyopaque, socket: root.Handle, path: []const u8, offset: u64, count: usize) anyerror!usize {
+    _ = userdata;
+    return uring.vtSendFileTo(null, socket, path, offset, count);
+}
+
 fn vtCreateUnix(userdata: ?*anyopaque) anyerror!root.Handle {
     _ = userdata;
     return uring.vtCreateUnix(null);
@@ -552,6 +557,7 @@ const vtable_storage: root.VTable = .{
     .updateConnect = vtUpdateConnect,
     .cancel = vtCancel,
     .watchFd = vtWatchFd,
+    .sendFileTo = vtSendFileTo,
     .createUnix = vtCreateUnix,
     .bindUnix = vtBindUnix,
     .connectUnix = vtConnectUnix,

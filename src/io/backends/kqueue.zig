@@ -425,6 +425,64 @@ fn vtConnectUnix(userdata: ?*anyopaque, socket: root.Handle, path: []const u8, s
     return error.ConnectFailed;
 }
 
+// ---- 零拷贝文件→socket ----------------------------------------------------
+//
+// Darwin 与 FreeBSD 的 `sendfile` 签名不同：
+//   Darwin:  (in, out, offset, len: *off_t, hdtr, flags)
+//   FreeBSD: (in, out, offset, nbytes: usize, hdtr, sbytes: ?*off_t, flags)
+// 两者都是「偏移 + 长度上限」语义，一次调用可能只发一部分，要循环。
+// Darwin 还要把 SIGPIPE 抑制掉——已在 `createSocket` 设了 `SO_NOSIGPIPE`。
+
+fn vtSendFileTo(
+    userdata: ?*anyopaque,
+    socket: root.Handle,
+    path: []const u8,
+    offset: u64,
+    count: usize,
+) anyerror!usize {
+    _ = userdata;
+    var zbuf: [4096]u8 = undefined;
+    const zp = try zpath(path, &zbuf);
+
+    const in_fd = c.open(zp, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c.mode_t, 0));
+    if (in_fd < 0) return error.FileNotFound;
+    defer _ = c.close(in_fd);
+
+    const out_fd = fdOf(socket);
+    var off: c.off_t = @intCast(offset);
+    var remaining: usize = if (count == 0) blk: {
+        const st = try stat(path);
+        break :blk @intCast(st.size - @min(st.size, offset));
+    } else count;
+
+    var total: usize = 0;
+    while (remaining > 0) {
+        var sent: c.off_t = @intCast(remaining);
+        const rc = switch (builtin.os.tag) {
+            .macos, .ios, .tvos, .watchos, .visionos => c.sendfile(in_fd, out_fd, off, &sent, null, 0),
+            else => blk: {
+                var sbytes: c.off_t = 0;
+                break :blk c.sendfile(in_fd, out_fd, off, remaining, null, &sbytes, 0);
+            },
+        };
+        if (rc != 0) {
+            // Darwin/BSD 即使成功也可能返回 -1 + EAGAIN；这里当作短写结束。
+            if (total != 0) break;
+            return error.SendFileFailed;
+        }
+        const n: usize = if (builtin.os.tag == .macos or builtin.os.tag == .ios or
+            builtin.os.tag == .tvos or builtin.os.tag == .watchos or builtin.os.tag == .visionos)
+            @intCast(@max(sent, 0))
+        else
+            @intCast(remaining);
+        if (n == 0) break;
+        total += n;
+        off += @intCast(n);
+        remaining -= @min(remaining, n);
+    }
+    return total;
+}
+
 fn vtNotify(userdata: ?*anyopaque) void {
     const state = stateOf(userdata);
     var change = [_]c.Kevent{.{
@@ -575,6 +633,7 @@ const vtable_storage: root.VTable = .{
     .createUnix = vtCreateUnix,
     .bindUnix = vtBindUnix,
     .connectUnix = vtConnectUnix,
+    .sendFileTo = vtSendFileTo,
     .close = vtClose,
     .waitBatch = vtWaitBatch,
     .notify = vtNotify,
