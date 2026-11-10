@@ -188,7 +188,8 @@ jobs:
           while IFS= read -r name; do
             [ -z "$name" ] && continue
             total=$((total + 1))
-            zig test src/io/io.zig --test-filter "$name" >/tmp/kqueue-one.log 2>&1 &
+            one=/tmp/kqueue-one.log
+            zig test src/io/io.zig --test-filter "$name" >"$one" 2>&1 &
             runner=$!
             ( sleep 20; kill -9 "$runner" 2>/dev/null ) &
             watchdog=$!
@@ -198,9 +199,13 @@ jobs:
             wait "$watchdog" 2>/dev/null
             if [ "$rc" -eq 137 ]; then
               echo "HANG $name" >>"$report"
+              echo "--- $name (HANG) ---" >>"$report"
+              tail -20 "$one" >>"$report"
               hang=$((hang + 1))
             elif [ "$rc" -ne 0 ]; then
               echo "FAIL $name rc=$rc" >>"$report"
+              echo "--- $name (rc=$rc) ---" >>"$report"
+              tail -20 "$one" >>"$report"
               fail=$((fail + 1))
             else
               pass=$((pass + 1))
