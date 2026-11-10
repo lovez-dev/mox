@@ -483,6 +483,37 @@ fn vtTruncateFile(userdata: ?*anyopaque, path: []const u8, size: u64) anyerror!v
     return truncateFile(path, size);
 }
 
+fn vtMakeDir(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
+    _ = userdata;
+    return makeDir(path, mode);
+}
+
+fn vtRemoveDir(userdata: ?*anyopaque, path: []const u8) anyerror!void {
+    _ = userdata;
+    return removeDir(path);
+}
+
+fn vtRename(userdata: ?*anyopaque, old_path: []const u8, new_path: []const u8) anyerror!void {
+    _ = userdata;
+    return rename(old_path, new_path);
+}
+
+fn vtSymLink(userdata: ?*anyopaque, target: []const u8, link_path: []const u8) anyerror!void {
+    _ = userdata;
+    return symLink(target, link_path);
+}
+
+fn vtStatPath(userdata: ?*anyopaque, path: []const u8) anyerror!root.Stat {
+    _ = userdata;
+    const st = try stat(path);
+    return .{ .kind = @fromBackingInt(@intCast(@backingInt(st.kind))), .size = st.size, .mtime_ms = st.mtime_ms };
+}
+
+fn vtListDir(userdata: ?*anyopaque, path: []const u8, buf: []root.DirEntry) anyerror!usize {
+    _ = userdata;
+    return listDir(path, @ptrCast(buf));
+}
+
 fn vtDeleteFile(userdata: ?*anyopaque, path: []const u8) anyerror!void {
     _ = userdata;
     deleteFile(path);
@@ -504,6 +535,12 @@ const vtable_storage: root.VTable = .{
     .appendFile = vtAppendFile,
     .truncateFile = vtTruncateFile,
     .deleteFile = vtDeleteFile,
+    .makeDir = vtMakeDir,
+    .removeDir = vtRemoveDir,
+    .rename = vtRename,
+    .symLink = vtSymLink,
+    .statPath = vtStatPath,
+    .listDir = vtListDir,
     .associate = vtAssociate,
     .recv = vtRecv,
     .send = vtSend,
@@ -728,6 +765,180 @@ pub fn writeFileAll(path: []const u8, bytes: []const u8) !void {
         off += try cvt(linux.write(fd, bytes.ptr + off, bytes.len - off));
     }
 }
+
+// ---- 目录与元数据（同样在 `Work` 池线程中执行） --------------------------
+
+/// 路径转 NUL 结尾的定长缓冲。路径超长直接报错，不截断——截断会静默
+/// 操作到别的文件，比失败更糟。
+fn pathZ(path: []const u8, buf: []u8) ![*:0]const u8 {
+    if (path.len >= buf.len) return error.NameTooLong;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    return buf[0..path.len :0];
+}
+
+/// 创建目录（含所有缺失的父目录，等价 `mkdir -p`）。
+/// `mode` 受进程 umask 影响，与 `mkdir(1)` 一致。
+pub fn makeDir(path: []const u8, mode: u32) !void {
+    if (path.len == 0) return error.InvalidPath;
+    var buf: [1024]u8 = undefined;
+    var i: usize = 0;
+    // 逐级创建：遇到 '/' 就尝试建前缀，已存在（EEXIST）视为正常。
+    while (i <= path.len) : (i += 1) {
+        if (i != path.len and path[i] != '/') continue;
+        if (i == 0) continue;
+        const prefix = try pathZ(path[0..i], &buf);
+        const rc = linux.mkdirat(linux.AT.FDCWD, prefix, @intCast(mode));
+        const rc_s: isize = signed(rc);
+        // EEXIST 不算失败；其他错误上报。
+        if (rc_s < 0 and rc_s != -@as(isize, @backingInt(linux.E.EXIST))) return error.MakeDirFailed;
+    }
+    return;
+}
+
+/// 删除空目录。非空时返回 `error.DirNotEmpty`（不递归，避免误删）。
+pub fn removeDir(path: []const u8) !void {
+    var buf: [1024]u8 = undefined;
+    const p = try pathZ(path, &buf);
+    // `AT.REMOVEDIR` 让 unlinkat 走 rmdir 语义。
+    const rc = linux.unlinkat(linux.AT.FDCWD, p, linux.AT.REMOVEDIR);
+    const rc_s: isize = signed(rc);
+    if (rc_s == 0) return;
+    if (rc_s == -@as(isize, @backingInt(linux.E.NOTEMPTY))) return error.DirNotEmpty;
+    if (rc_s == -@as(isize, @backingInt(linux.E.NOENT))) return error.FileNotFound;
+    return error.RemoveDirFailed;
+}
+
+/// 重命名 / 移动。跨设备时内核返回 `EXDEV`，这里如实上报而不是偷偷
+/// 退化成「复制 + 删除」——那会在中途失败时留下半个文件。
+pub fn rename(old_path: []const u8, new_path: []const u8) !void {
+    var obuf: [1024]u8 = undefined;
+    var nbuf: [1024]u8 = undefined;
+    const o = try pathZ(old_path, &obuf);
+    const n = try pathZ(new_path, &nbuf);
+    const rc = linux.renameat(linux.AT.FDCWD, o, linux.AT.FDCWD, n);
+    const rc_s: isize = signed(rc);
+    if (rc_s == 0) return;
+    if (rc_s == -@as(isize, @backingInt(linux.E.XDEV))) return error.CrossDevice;
+    if (rc_s == -@as(isize, @backingInt(linux.E.NOENT))) return error.FileNotFound;
+    return error.RenameFailed;
+}
+
+/// 创建符号链接：`target` 是链接指向的路径（可以是相对路径），`link_path`
+/// 是要创建的链接本身。
+pub fn symLink(target: []const u8, link_path: []const u8) !void {
+    var tbuf: [1024]u8 = undefined;
+    var lbuf: [1024]u8 = undefined;
+    const t = try pathZ(target, &tbuf);
+    const l = try pathZ(link_path, &lbuf);
+    const rc = linux.symlinkat(t, linux.AT.FDCWD, l);
+    const rc_s: isize = signed(rc);
+    if (rc_s == 0) return;
+    if (rc_s == -@as(isize, @backingInt(linux.E.EXIST))) return error.PathAlreadyExists;
+    return error.SymLinkFailed;
+}
+
+/// 文件类型。与 `std.fs.File.Kind` 的常用子集对齐，够静态服务判断
+/// 「是不是普通文件」用。
+pub const FileKind = enum { file, directory, sym_link, other };
+
+/// 路径元数据。`mtime_ms` 是 Unix 毫秒，便于直接做 `If-Modified-Since`。
+pub const Stat = struct {
+    kind: FileKind,
+    size: u64,
+    /// 最后修改时间（Unix 毫秒）。
+    mtime_ms: i64,
+};
+
+/// 取路径元数据。**跟随符号链接**（与 `stat(1)` 一致）；要拿链接本身用
+/// `AT.SYMLINK_NOFOLLOW` 的变体，这里不提供。
+pub fn stat(path: []const u8) !Stat {
+    var buf: [1024]u8 = undefined;
+    const p = try pathZ(path, &buf);
+    var stx: linux.Statx = std.mem.zeroes(linux.Statx);
+    // 0.17 的 std 只绑了 `statx`（没有 `fstatat` 包装）。掩码要显式要
+    // TYPE / SIZE / MTIME 三项；内核可能回填不了全部，故按 `stx.mask` 判断。
+    const mask = linux.STATX{
+        .TYPE = true,
+        .MODE = true,
+        .SIZE = true,
+        .MTIME = true,
+    };
+    const rc_s = signed(linux.statx(linux.AT.FDCWD, p, 0, mask, &stx));
+    if (rc_s < 0) {
+        if (rc_s == -@as(isize, @backingInt(linux.E.NOENT))) return error.FileNotFound;
+        return error.StatFailed;
+    }
+    const kind: FileKind = switch (stx.mode & linux.S.IFMT) {
+        linux.S.IFREG => .file,
+        linux.S.IFDIR => .directory,
+        linux.S.IFLNK => .sym_link,
+        else => .other,
+    };
+    // 内核没回填 mtime 时给 0，调用方据此认为「未知」，而不是假装 1970。
+    const mtime_ms: i64 = if (stx.mask.MTIME)
+        stx.mtime.sec * 1000 + @divTrunc(@as(i64, stx.mtime.nsec), 1_000_000)
+    else
+        0;
+    return .{
+        .kind = kind,
+        .size = if (stx.mask.SIZE) stx.size else 0,
+        .mtime_ms = mtime_ms,
+    };
+}
+
+/// 列目录项。`buf` 由调用方提供，返回**条目名切片**（不含路径前缀），
+/// 超出缓冲时截断到能放下的部分——调用方据返回值判断是否还有剩余。
+///
+/// 不排序、不含 `.` 与 `..`：排序是策略，交给调用方。
+pub fn listDir(path: []const u8, buf: []DirEntry) !usize {
+    var pbuf: [1024]u8 = undefined;
+    const p = try pathZ(path, &pbuf);
+    const fd = try std.posix.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    defer _ = linux.close(fd);
+
+    var raw: [4096]u8 = undefined;
+    var count: usize = 0;
+    while (true) {
+        const rc = linux.getdents64(fd, &raw, raw.len);
+        const rc_s: isize = signed(rc);
+        if (rc_s <= 0) break;
+        const got: usize = @intCast(rc_s);
+        var off: usize = 0;
+        while (off < got) {
+            // `linux.dirent64` 的 d_name 是柔性数组，手工按偏移取。
+            const ent: *align(1) const linux.dirent64 = @ptrCast(raw[off..].ptr);
+            const rec_len: usize = ent.reclen;
+            if (rec_len == 0 or off + rec_len > got) break;
+            const name_ptr = raw[off + @offsetOf(linux.dirent64, "name") .. off + rec_len];
+            const name = std.mem.sliceTo(name_ptr, 0);
+            if (!std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..")) {
+                if (count >= buf.len) return count; // 缓冲满，截断
+                if (name.len <= buf[count].name.len) {
+                    @memcpy(buf[count].name[0..name.len], name);
+                    buf[count].len = name.len;
+                    buf[count].is_dir = ent.type == linux.DT.DIR;
+                    count += 1;
+                }
+            }
+            off += rec_len;
+        }
+    }
+    _ = p;
+    return count;
+}
+
+/// `listDir` 的条目。名字定长，避免调用方管内存；超长名字被跳过
+/// （`NAME_MAX` 通常 255，这里给 256）。
+pub const DirEntry = struct {
+    name: [256]u8 = undefined,
+    len: usize = 0,
+    is_dir: bool = false,
+
+    pub fn slice(self: *const DirEntry) []const u8 {
+        return self.name[0..self.len];
+    }
+};
 
 pub fn deleteFile(path: []const u8) void {
     var buf: [1024]u8 = undefined;

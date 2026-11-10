@@ -456,6 +456,37 @@ fn vtTruncateFile(userdata: ?*anyopaque, path: []const u8, size: u64) anyerror!v
     return truncateFile(path, size);
 }
 
+fn vtMakeDir(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
+    _ = userdata;
+    return makeDir(path, mode);
+}
+
+fn vtRemoveDir(userdata: ?*anyopaque, path: []const u8) anyerror!void {
+    _ = userdata;
+    return removeDir(path);
+}
+
+fn vtRename(userdata: ?*anyopaque, old_path: []const u8, new_path: []const u8) anyerror!void {
+    _ = userdata;
+    return rename(old_path, new_path);
+}
+
+fn vtSymLink(userdata: ?*anyopaque, target: []const u8, link_path: []const u8) anyerror!void {
+    _ = userdata;
+    return symLink(target, link_path);
+}
+
+fn vtStatPath(userdata: ?*anyopaque, path: []const u8) anyerror!root.Stat {
+    _ = userdata;
+    const st = try stat(path);
+    return .{ .kind = @fromBackingInt(@intCast(@backingInt(st.kind))), .size = st.size, .mtime_ms = st.mtime_ms };
+}
+
+fn vtListDir(userdata: ?*anyopaque, path: []const u8, buf: []root.DirEntry) anyerror!usize {
+    _ = userdata;
+    return listDir(path, @ptrCast(buf));
+}
+
 fn vtDeleteFile(userdata: ?*anyopaque, path: []const u8) anyerror!void {
     _ = userdata;
     deleteFile(path);
@@ -477,6 +508,12 @@ const vtable_storage: root.VTable = .{
     .appendFile = vtAppendFile,
     .truncateFile = vtTruncateFile,
     .deleteFile = vtDeleteFile,
+    .makeDir = vtMakeDir,
+    .removeDir = vtRemoveDir,
+    .rename = vtRename,
+    .symLink = vtSymLink,
+    .statPath = vtStatPath,
+    .listDir = vtListDir,
     .associate = vtAssociate,
     .recv = vtRecv,
     .send = vtSend,
@@ -751,6 +788,131 @@ pub fn writeFileAll(path: []const u8, bytes: []const u8) !void {
         if (n < 0) return error.WriteFailed;
         off += @intCast(n);
     }
+}
+
+// ---- 目录与元数据 ---------------------------------------------------------
+
+pub const FileKind = enum { file, directory, sym_link, other };
+
+pub const Stat = struct {
+    kind: FileKind,
+    size: u64,
+    /// 最后修改时间（Unix 毫秒）；0 表示内核未回填。
+    mtime_ms: i64,
+};
+
+/// 创建目录（含所有缺失的父目录，等价 `mkdir -p`）。
+pub fn makeDir(path: []const u8, mode: u32) !void {
+    if (path.len == 0) return error.InvalidPath;
+    var buf: [1024]u8 = undefined;
+    var i: usize = 0;
+    while (i <= path.len) : (i += 1) {
+        if (i != path.len and path[i] != '/') continue;
+        if (i == 0) continue;
+        const z = try zpath(path[0..i], &buf);
+        if (c.mkdir(z.ptr, @intCast(mode)) != 0) {
+            if (std.c._errno().* == @backingInt(std.c.E.EXIST)) continue;
+            return error.MakeDirFailed;
+        }
+    }
+    return;
+}
+
+pub fn removeDir(path: []const u8) !void {
+    var buf: [1024]u8 = undefined;
+    const z = try zpath(path, &buf);
+    if (c.rmdir(z.ptr) == 0) return;
+    return switch (std.c._errno().*) {
+        @backingInt(std.c.E.NOTEMPTY) => error.DirNotEmpty,
+        @backingInt(std.c.E.NOENT) => error.FileNotFound,
+        else => error.RemoveDirFailed,
+    };
+}
+
+pub fn rename(old_path: []const u8, new_path: []const u8) !void {
+    var obuf: [1024]u8 = undefined;
+    var nbuf: [1024]u8 = undefined;
+    const o = try zpath(old_path, &obuf);
+    const n = try zpath(new_path, &nbuf);
+    if (c.rename(o.ptr, n.ptr) == 0) return;
+    return switch (std.c._errno().*) {
+        @backingInt(std.c.E.XDEV) => error.CrossDevice,
+        @backingInt(std.c.E.NOENT) => error.FileNotFound,
+        else => error.RenameFailed,
+    };
+}
+
+pub fn symLink(target: []const u8, link_path: []const u8) !void {
+    var tbuf: [1024]u8 = undefined;
+    var lbuf: [1024]u8 = undefined;
+    const t = try zpath(target, &tbuf);
+    const l = try zpath(link_path, &lbuf);
+    if (c.symlink(t.ptr, l.ptr) == 0) return;
+    return switch (std.c._errno().*) {
+        @backingInt(std.c.E.EXIST) => error.PathAlreadyExists,
+        else => error.SymLinkFailed,
+    };
+}
+
+/// 取路径元数据。`c.stat` 跟随符号链接（与 `stat(1)` 一致）。
+pub fn stat(path: []const u8) !Stat {
+    var buf: [1024]u8 = undefined;
+    const z = try zpath(path, &buf);
+    var st: c.Stat = undefined;
+    if (c.stat(z.ptr, &st) != 0) {
+        return switch (std.c._errno().*) {
+            @backingInt(std.c.E.NOENT) => error.FileNotFound,
+            else => error.StatFailed,
+        };
+    }
+    const fmt: u32 = @intCast(st.mode & c.S.IFMT);
+    const kind: FileKind = if (fmt == c.S.IFREG)
+        .file
+    else if (fmt == c.S.IFDIR)
+        .directory
+    else if (fmt == c.S.IFLNK)
+        .sym_link
+    else
+        .other;
+    const mt = st.mtime();
+    return .{
+        .kind = kind,
+        .size = @intCast(st.size),
+        .mtime_ms = @as(i64, @intCast(mt.sec)) * 1000 + @divTrunc(@as(i64, @intCast(mt.nsec)), 1_000_000),
+    };
+}
+
+pub const DirEntry = struct {
+    name: [256]u8 = undefined,
+    len: usize = 0,
+    is_dir: bool = false,
+
+    pub fn slice(self: *const DirEntry) []const u8 {
+        return self.name[0..self.len];
+    }
+};
+
+/// 列目录项，返回条目数（超出 `buf` 时截断）。不排序、不含 `.` 与 `..`。
+pub fn listDir(path: []const u8, buf: []DirEntry) !usize {
+    var zbuf: [1024]u8 = undefined;
+    const z = try zpath(path, &zbuf);
+    const d = c.opendir(z.ptr) orelse return error.OpenFailed;
+    defer _ = c.closedir(d);
+
+    var count: usize = 0;
+    while (c.readdir(d)) |ent| {
+        // Darwin 用 `namlen`，FreeBSD 用 `name` 直到 NUL；两者都按 NUL 截断更稳。
+        const name = std.mem.sliceTo(&ent.name, 0);
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        if (count >= buf.len) return count;
+        if (name.len <= buf[count].name.len) {
+            @memcpy(buf[count].name[0..name.len], name);
+            buf[count].len = name.len;
+            buf[count].is_dir = ent.type == c.DT.DIR;
+            count += 1;
+        }
+    }
+    return count;
 }
 
 pub fn deleteFile(path: []const u8) void {

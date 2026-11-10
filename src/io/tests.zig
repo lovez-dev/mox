@@ -1301,3 +1301,161 @@ test "WatchFd 在管道可读时回调并回填 read 方向" {
     try std.testing.expect(Ctx.got.read);
     try std.testing.expect(!Ctx.got.write);
 }
+
+// ===== 目录与元数据 =====
+//
+// 这些是 `Work` 池里的阻塞调用，四个平台各有实现。测试只用临时目录，
+// 每个用例自建自清，互不干扰。
+
+/// 在系统临时目录下造一个唯一子目录，返回完整路径。调用方负责删。
+fn tmpDir(buf: []u8, tag: []const u8) ![]const u8 {
+    // 0.17 移除了 `std.time.milliTimestamp`；用后端已有的单调时钟辅助。
+    const stamp = platform.tickCount();
+    return std.fmt.bufPrint(buf, "{s}{c}mox_{s}_{d}", .{
+        if (builtin.os.tag == .windows) "" else "/tmp/",
+        if (builtin.os.tag == .windows) '\\' else '/',
+        tag,
+        @as(u64, @intCast(@mod(stamp, 1_000_000_000))),
+    });
+}
+
+test "makeDir 递归创建、stat 识别为目录、removeDir 删掉" {
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const base = try tmpDir(&pbuf, "mkdir");
+    defer l.removeDir(base) catch {};
+
+    // 中间两级都不存在，验证 mkdir -p 语义。
+    var deepbuf: [600]u8 = undefined;
+    const deep = try std.fmt.bufPrint(&deepbuf, "{s}{c}a{c}b", .{
+        base,
+        if (builtin.os.tag == .windows) '\\' else '/',
+        if (builtin.os.tag == .windows) '\\' else '/',
+    });
+
+    try l.makeDir(deep, 0o755);
+
+    const st = try l.statPath(deep);
+    try std.testing.expectEqual(root.FileKind.directory, st.kind);
+
+    // 重复创建不报错（幂等）。
+    try l.makeDir(deep, 0o755);
+
+    try l.removeDir(deep);
+    try std.testing.expectError(error.FileNotFound, l.statPath(deep));
+}
+
+test "removeDir 对非空目录报 DirNotEmpty" {
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "rmnonempty");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var fbuf: [600]u8 = undefined;
+    const file = try std.fmt.bufPrint(&fbuf, "{s}{c}f.txt", .{
+        dir,
+        if (builtin.os.tag == .windows) '\\' else '/',
+    });
+    try l.writeFileAll(file, "x");
+    defer l.deleteFile(file);
+
+    try std.testing.expectError(error.DirNotEmpty, l.removeDir(dir));
+}
+
+test "rename 移动文件，原路径消失、新路径可读" {
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "rename");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    const sep = if (builtin.os.tag == .windows) '\\' else '/';
+    var abuf: [600]u8 = undefined;
+    var bbuf: [600]u8 = undefined;
+    const from = try std.fmt.bufPrint(&abuf, "{s}{c}from.txt", .{ dir, sep });
+    const to = try std.fmt.bufPrint(&bbuf, "{s}{c}to.txt", .{ dir, sep });
+
+    try l.writeFileAll(from, "payload");
+
+    try l.rename(from, to);
+
+    try std.testing.expectError(error.FileNotFound, l.statPath(from));
+    const st = try l.statPath(to);
+    try std.testing.expectEqual(root.FileKind.file, st.kind);
+    try std.testing.expectEqual(@as(u64, 7), st.size);
+
+    l.deleteFile(to);
+}
+
+test "stat 报告文件大小与 mtime，listDir 列出条目" {
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "stat");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    const sep = if (builtin.os.tag == .windows) '\\' else '/';
+    var f1buf: [600]u8 = undefined;
+    var f2buf: [600]u8 = undefined;
+    const f1 = try std.fmt.bufPrint(&f1buf, "{s}{c}one.txt", .{ dir, sep });
+    const f2 = try std.fmt.bufPrint(&f2buf, "{s}{c}two.txt", .{ dir, sep });
+    try l.writeFileAll(f1, "12345");
+    try l.writeFileAll(f2, "ab");
+    defer l.deleteFile(f1);
+    defer l.deleteFile(f2);
+
+    const st = try l.statPath(f1);
+    try std.testing.expectEqual(@as(u64, 5), st.size);
+    // mtime 必须是个合理的近期时间；0 说明平台层没回填。
+    try std.testing.expect(st.mtime_ms > 1_600_000_000_000);
+
+    var entries: [16]root.DirEntry = undefined;
+    const n = try l.listDir(dir, &entries);
+    try std.testing.expectEqual(@as(usize, 2), n);
+
+    var found_one = false;
+    var found_two = false;
+    for (entries[0..n]) |*e| {
+        if (std.mem.eql(u8, e.slice(), "one.txt")) found_one = true;
+        if (std.mem.eql(u8, e.slice(), "two.txt")) found_two = true;
+        try std.testing.expect(!e.is_dir);
+    }
+    try std.testing.expect(found_one and found_two);
+}
+
+test "symLink 创建链接，stat 跟随到目标文件" {
+    // Windows 的符号链接需要管理员权限或开发者模式，普通 CI 上会失败。
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "symlink");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var tbuf: [600]u8 = undefined;
+    var lbuf: [600]u8 = undefined;
+    const target = try std.fmt.bufPrint(&tbuf, "{s}/target.txt", .{dir});
+    const link = try std.fmt.bufPrint(&lbuf, "{s}/link.txt", .{dir});
+    try l.writeFileAll(target, "hello");
+    defer l.deleteFile(target);
+
+    try l.symLink(target, link);
+    defer l.deleteFile(link);
+
+    // `stat` 跟随链接，看到的是目标文件的属性。
+    const st = try l.statPath(link);
+    try std.testing.expectEqual(root.FileKind.file, st.kind);
+    try std.testing.expectEqual(@as(u64, 5), st.size);
+}

@@ -95,6 +95,30 @@ pub const Io = struct {
         return table.get(T, id);
     }
 };
+/// 文件类型。与各平台 `S.IFMT` / `FILE_ATTRIBUTE_DIRECTORY` 的常用子集对齐，
+/// 够静态服务判断「是不是普通文件」用。
+pub const FileKind = enum { file, directory, sym_link, other };
+
+/// 路径元数据。`mtime_ms` 是 Unix 毫秒，便于直接做 `If-Modified-Since`。
+/// 拿不到时置 0（调用方据此认为「未知」，而不是假装 1970）。
+pub const Stat = struct {
+    kind: FileKind,
+    size: u64,
+    mtime_ms: i64,
+};
+
+/// 目录条目。名字定长，避免调用方管内存；超长名字被跳过
+/// （`NAME_MAX` 通常 255，这里给 256）。
+pub const DirEntry = struct {
+    name: [256]u8 = undefined,
+    len: usize = 0,
+    is_dir: bool = false,
+
+    pub fn slice(self: *const DirEntry) []const u8 {
+        return self.name[0..self.len];
+    }
+};
+
 pub const VTable = struct {
     /// 释放后端资源（`userdata` 指向的状态），只调一次。
     deinit: *const fn (userdata: ?*anyopaque) void,
@@ -133,6 +157,18 @@ pub const VTable = struct {
     /// 删除文件（`Work` 池线程）。平台层实现返回 `void`，**所有**失败
     /// （文件不存在、权限不足等）都被吞掉，因此这个槽位不会产生错误。
     deleteFile: *const fn (userdata: ?*anyopaque, path: []const u8) anyerror!void,
+    /// 创建目录（含缺失父目录，等价 `mkdir -p`）。`Work` 池线程。
+    makeDir: *const fn (userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void,
+    /// 删除**空**目录。非空时报 `error.DirNotEmpty`，不递归。
+    removeDir: *const fn (userdata: ?*anyopaque, path: []const u8) anyerror!void,
+    /// 重命名 / 移动。跨设备报 `error.CrossDevice`，不退化成复制+删除。
+    rename: *const fn (userdata: ?*anyopaque, old_path: []const u8, new_path: []const u8) anyerror!void,
+    /// 创建符号链接。
+    symLink: *const fn (userdata: ?*anyopaque, target: []const u8, link_path: []const u8) anyerror!void,
+    /// 取路径元数据（跟随符号链接）。
+    statPath: *const fn (userdata: ?*anyopaque, path: []const u8) anyerror!Stat,
+    /// 列目录项。`buf` 由调用方提供，返回条目数（超出时截断）。
+    listDir: *const fn (userdata: ?*anyopaque, path: []const u8, buf: []DirEntry) anyerror!usize,
     /// 把套接字的完成包路由到本后端（Windows 上同时为监听套接字启用 `AcceptEx`）。
     associate: *const fn (userdata: ?*anyopaque, socket: Handle, key: usize) anyerror!void,
     /// 发起一次重叠接收。返回 `null` 表示尚未完成，稍后由 `wait` 投递。

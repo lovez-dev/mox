@@ -148,6 +148,38 @@ fn vtFileSize(userdata: ?*anyopaque, path: []const u8) anyerror!u64 {
     return uring.fileSize(path);
 }
 
+fn vtMakeDir(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
+    _ = userdata;
+    return uring.makeDir(path, mode);
+}
+
+fn vtRemoveDir(userdata: ?*anyopaque, path: []const u8) anyerror!void {
+    _ = userdata;
+    return uring.removeDir(path);
+}
+
+fn vtRename(userdata: ?*anyopaque, old_path: []const u8, new_path: []const u8) anyerror!void {
+    _ = userdata;
+    return uring.rename(old_path, new_path);
+}
+
+fn vtSymLink(userdata: ?*anyopaque, target: []const u8, link_path: []const u8) anyerror!void {
+    _ = userdata;
+    return uring.symLink(target, link_path);
+}
+
+fn vtStatPath(userdata: ?*anyopaque, path: []const u8) anyerror!root.Stat {
+    _ = userdata;
+    const st = try uring.stat(path);
+    return .{ .kind = @fromBackingInt(@intCast(@backingInt(st.kind))), .size = st.size, .mtime_ms = st.mtime_ms };
+}
+
+fn vtListDir(userdata: ?*anyopaque, path: []const u8, buf: []root.DirEntry) anyerror!usize {
+    _ = userdata;
+    // 两个后端的 `DirEntry` 布局一致（同样的 name/len/is_dir），直接按内存复用。
+    return uring.listDir(path, @ptrCast(buf));
+}
+
 fn vtReadFileInto(userdata: ?*anyopaque, path: []const u8, buf: []u8) anyerror!usize {
     _ = userdata;
     return uring.readFileInto(path, buf);
@@ -477,6 +509,12 @@ const vtable_storage: root.VTable = .{
     .appendFile = vtAppendFile,
     .truncateFile = vtTruncateFile,
     .deleteFile = vtDeleteFile,
+    .makeDir = vtMakeDir,
+    .removeDir = vtRemoveDir,
+    .rename = vtRename,
+    .symLink = vtSymLink,
+    .statPath = vtStatPath,
+    .listDir = vtListDir,
     .associate = vtAssociate,
     .recv = vtRecv,
     .send = vtSend,

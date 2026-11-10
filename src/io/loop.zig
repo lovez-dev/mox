@@ -430,6 +430,46 @@ pub const Loop = struct {
         return self.io.vtable.fileSize(self.io.userdata, path);
     }
 
+    // ---- 目录与元数据（阻塞调用，在 `Work` 池线程里跑才不卡循环） ----------
+    //
+    // 这些是**同步**入口：直接调平台层，会阻塞当前线程。放在 `Loop` 上是为了
+    // 让 `Work` 节点内部能拿到同一个 `io`；用户代码在循环线程里直接调用会卡住
+    // 整个循环，异步场景请用 `MakeDir` / `RemoveDir` 等节点。
+
+    pub fn makeDir(self: *Loop, path: []const u8, mode: u32) !void {
+        return self.io.vtable.makeDir(self.io.userdata, path, mode);
+    }
+
+    pub fn removeDir(self: *Loop, path: []const u8) !void {
+        return self.io.vtable.removeDir(self.io.userdata, path);
+    }
+
+    pub fn rename(self: *Loop, old_path: []const u8, new_path: []const u8) !void {
+        return self.io.vtable.rename(self.io.userdata, old_path, new_path);
+    }
+
+    pub fn symLink(self: *Loop, target: []const u8, link_path: []const u8) !void {
+        return self.io.vtable.symLink(self.io.userdata, target, link_path);
+    }
+
+    pub fn statPath(self: *Loop, path: []const u8) !root.Stat {
+        return self.io.vtable.statPath(self.io.userdata, path);
+    }
+
+    pub fn listDir(self: *Loop, path: []const u8, buf: []root.DirEntry) !usize {
+        return self.io.vtable.listDir(self.io.userdata, path, buf);
+    }
+
+    /// 同步整文件写入（阻塞）。`WriteFile` 节点内部也走这条路。
+    pub fn writeFileAll(self: *Loop, path: []const u8, bytes: []const u8) !void {
+        return self.io.vtable.writeFileAll(self.io.userdata, path, bytes);
+    }
+
+    /// 同步删除文件（阻塞）。平台层吞掉所有失败，因此这里不会报错。
+    pub fn deleteFile(self: *Loop, path: []const u8) void {
+        self.io.vtable.deleteFile(self.io.userdata, path) catch {};
+    }
+
     // ---- 内部实现 ---------------------------------------------------------
 
     fn invoke(self: *Loop, c: *Completion) void {

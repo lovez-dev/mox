@@ -203,6 +203,11 @@ const c = struct {
         alertable: windows.BOOL,
     ) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+    extern "kernel32" fn GetFileTime(h: HANDLE, creation: ?*windows.FILETIME, access: ?*windows.FILETIME, write: ?*windows.FILETIME) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn CreateSymbolicLinkW(link: [*]const u16, target: [*]const u16, flags: u32) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn FindFirstFileW(name: [*]const u16, data: *WIN32_FIND_DATAW) callconv(.winapi) HANDLE;
+    extern "kernel32" fn FindNextFileW(h: HANDLE, data: *WIN32_FIND_DATAW) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn FindClose(h: HANDLE) callconv(.winapi) windows.BOOL;
 };
 
 var started: std.atomic.Value(bool) = .init(false);
@@ -982,6 +987,37 @@ fn vtTruncateFile(userdata: ?*anyopaque, path: []const u8, size: u64) anyerror!v
     return truncateFile(path, size);
 }
 
+fn vtMakeDir(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
+    _ = userdata;
+    return makeDir(path, mode);
+}
+
+fn vtRemoveDir(userdata: ?*anyopaque, path: []const u8) anyerror!void {
+    _ = userdata;
+    return removeDir(path);
+}
+
+fn vtRename(userdata: ?*anyopaque, old_path: []const u8, new_path: []const u8) anyerror!void {
+    _ = userdata;
+    return rename(old_path, new_path);
+}
+
+fn vtSymLink(userdata: ?*anyopaque, target: []const u8, link_path: []const u8) anyerror!void {
+    _ = userdata;
+    return symLink(target, link_path);
+}
+
+fn vtStatPath(userdata: ?*anyopaque, path: []const u8) anyerror!root.Stat {
+    _ = userdata;
+    const st = try stat(path);
+    return .{ .kind = @fromBackingInt(@intCast(@backingInt(st.kind))), .size = st.size, .mtime_ms = st.mtime_ms };
+}
+
+fn vtListDir(userdata: ?*anyopaque, path: []const u8, buf: []root.DirEntry) anyerror!usize {
+    _ = userdata;
+    return listDir(path, @ptrCast(buf));
+}
+
 fn vtDeleteFile(userdata: ?*anyopaque, path: []const u8) anyerror!void {
     _ = userdata;
     deleteFile(path);
@@ -1003,6 +1039,12 @@ const vtable_storage: root.VTable = .{
     .appendFile = vtAppendFile,
     .truncateFile = vtTruncateFile,
     .deleteFile = vtDeleteFile,
+    .makeDir = vtMakeDir,
+    .removeDir = vtRemoveDir,
+    .rename = vtRename,
+    .symLink = vtSymLink,
+    .statPath = vtStatPath,
+    .listDir = vtListDir,
     .associate = vtAssociate,
     .recv = vtRecv,
     .send = vtSend,
@@ -1029,6 +1071,22 @@ pub fn create(alloc: std.mem.Allocator) !root.Io {
 
 // ---- 扁平文件 I/O（在 `Work` 池线程中执行） --------------------------------
 
+/// `WIN32_FIND_DATAW` 在 std 的 windows 绑定里没有，按 SDK 定义自行声明。
+/// 布局必须与 SDK 完全一致（`FindFirstFileW` 会按它写内存），所以用
+/// `extern struct` 且字段顺序一个都不能少。
+const WIN32_FIND_DATAW = extern struct {
+    dwFileAttributes: u32,
+    ftCreationTime: windows.FILETIME,
+    ftLastAccessTime: windows.FILETIME,
+    ftLastWriteTime: windows.FILETIME,
+    nFileSizeHigh: u32,
+    nFileSizeLow: u32,
+    dwReserved0: u32,
+    dwReserved1: u32,
+    cFileName: [260]u16,
+    cAlternateFileName: [14]u16,
+};
+
 const fl32 = struct {
     extern "kernel32" fn CreateFileW(
         name: [*]const u16,
@@ -1042,6 +1100,16 @@ const fl32 = struct {
     extern "kernel32" fn ReadFile(h: HANDLE, buf: [*]u8, to_read: u32, read: *u32, ov: ?*anyopaque) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn WriteFile(h: HANDLE, buf: [*]const u8, to_write: u32, written: *u32, ov: ?*anyopaque) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn GetFileSizeEx(h: HANDLE, size: *i64) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn CreateSymbolicLinkW(link: [*]const u16, target: [*]const u16, flags: u32) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn GetFileTime(h: HANDLE, creation: ?*windows.FILETIME, access: ?*windows.FILETIME, write: ?*windows.FILETIME) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn FindFirstFileW(name: [*]const u16, data: *WIN32_FIND_DATAW) callconv(.winapi) HANDLE;
+    extern "kernel32" fn FindNextFileW(h: HANDLE, data: *WIN32_FIND_DATAW) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn FindClose(h: HANDLE) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn CreateDirectoryW(name: [*]const u16, sa: ?*anyopaque) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn RemoveDirectoryW(name: [*]const u16) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn MoveFileExW(old: [*]const u16, new: [*]const u16, flags: u32) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn GetFileAttributesW(name: [*]const u16) callconv(.winapi) u32;
+    extern "kernel32" fn GetLastError() callconv(.winapi) u32;
     extern "kernel32" fn DeleteFileW(name: [*]const u16) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn SetFilePointerEx(
         h: HANDLE,
@@ -1061,6 +1129,12 @@ const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 const OPEN_ALWAYS: u32 = 4;
 const FILE_BEGIN: u32 = 0;
 const FILE_END: u32 = 2;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+const MOVEFILE_REPLACE_EXISTING: u32 = 0x00000001;
+const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFFFFFF;
+const ERROR_ALREADY_EXISTS: u32 = 183;
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_PATH_NOT_FOUND: u32 = 3;
 
 fn invalidHandle() HANDLE {
     return @ptrFromInt(std.math.maxInt(usize));
@@ -1071,6 +1145,154 @@ fn widePath(path: []const u8, buf: []u16) anyerror![:0]const u16 {
     const n = std.unicode.utf8ToUtf16Le(buf[0..path.len], path) catch return error.InvalidPath;
     buf[n] = 0;
     return buf[0..n :0];
+}
+
+// ---- 目录与元数据（在 `Work` 池线程中执行） ------------------------------
+
+pub const FileKind = enum { file, directory, sym_link, other };
+
+pub const Stat = struct {
+    kind: FileKind,
+    size: u64,
+    /// 最后修改时间（Unix 毫秒）；0 表示拿不到。
+    mtime_ms: i64,
+};
+
+/// 创建目录（含所有缺失的父目录，等价 `mkdir -p`）。
+/// Windows 没有 mode 概念，`mode` 参数被忽略，保留只为与 POSIX 同签名。
+pub fn makeDir(path: []const u8, mode: u32) anyerror!void {
+    _ = mode;
+    if (path.len == 0) return error.InvalidPath;
+    var buf: [1024]u16 = undefined;
+    var i: usize = 0;
+    // 逐级创建。Windows 路径分隔符两种都认，这里按 '/' 与 '\' 切分。
+    while (i <= path.len) : (i += 1) {
+        if (i != path.len and path[i] != '/' and path[i] != '\\') continue;
+        // 跳过盘符本身（`C:`）与根（`C:\`）。
+        if (i == 0) continue;
+        if (i == 2 and path.len >= 2 and path[1] == ':') continue;
+        const z = try widePath(path[0..i], &buf);
+        if (!fl32.CreateDirectoryW(z.ptr, null).toBool()) {
+            const e = fl32.GetLastError();
+            if (e != ERROR_ALREADY_EXISTS) return error.MakeDirFailed;
+        }
+    }
+    return;
+}
+
+pub fn removeDir(path: []const u8) anyerror!void {
+    var buf: [1024]u16 = undefined;
+    const z = try widePath(path, &buf);
+    if (fl32.RemoveDirectoryW(z.ptr).toBool()) return;
+    // 非空目录在 Windows 上就是 ERROR_DIR_NOT_EMPTY(145)。
+    if (fl32.GetLastError() == 145) return error.DirNotEmpty;
+    return error.RemoveDirFailed;
+}
+
+pub fn rename(old_path: []const u8, new_path: []const u8) anyerror!void {
+    var obuf: [1024]u16 = undefined;
+    var nbuf: [1024]u16 = undefined;
+    const o = try widePath(old_path, &obuf);
+    const n = try widePath(new_path, &nbuf);
+    // `MOVEFILE_REPLACE_EXISTING` 让语义与 POSIX `rename(2)` 对齐
+    // （目标已存在时覆盖，而不是失败）。
+    if (!fl32.MoveFileExW(o.ptr, n.ptr, MOVEFILE_REPLACE_EXISTING).toBool()) {
+        return switch (fl32.GetLastError()) {
+            ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND => error.FileNotFound,
+            else => error.RenameFailed,
+        };
+    }
+}
+
+/// Windows 的符号链接需要管理员权限或开发者模式，失败时如实上报。
+pub fn symLink(target: []const u8, link_path: []const u8) anyerror!void {
+    var tbuf: [1024]u16 = undefined;
+    var lbuf: [1024]u16 = undefined;
+    const t = try widePath(target, &tbuf);
+    const l = try widePath(link_path, &lbuf);
+    if (!fl32.CreateSymbolicLinkW(l.ptr, t.ptr, 0).toBool()) return error.SymLinkFailed;
+}
+
+pub fn stat(path: []const u8) anyerror!Stat {
+    var buf: [1024]u16 = undefined;
+    const z = try widePath(path, &buf);
+    const attrs = fl32.GetFileAttributesW(z.ptr);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        return switch (fl32.GetLastError()) {
+            ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND => error.FileNotFound,
+            else => error.StatFailed,
+        };
+    }
+    const is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
+    // 大小与 mtime 要从文件句柄拿；目录不必开句柄。
+    var size: u64 = 0;
+    var mtime_ms: i64 = 0;
+    if (!is_dir) {
+        const h = fl32.CreateFileW(z.ptr, GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
+        if (h != invalidHandle()) {
+            defer _ = c.CloseHandle(h);
+            var sz: i64 = 0;
+            if (fl32.GetFileSizeEx(h, &sz).toBool()) size = @intCast(sz);
+            var ft: windows.FILETIME = undefined;
+            if (fl32.GetFileTime(h, null, null, &ft).toBool()) {
+                // FILETIME 是 1601 起的 100ns 计数；转 Unix 毫秒要减去 1601→1970 的偏移。
+                const ticks: u64 = (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+                const epoch_diff: u64 = 116_444_736_000_000_000;
+                if (ticks > epoch_diff) {
+                    mtime_ms = @intCast((ticks - epoch_diff) / 10_000);
+                }
+            }
+        }
+    }
+    return .{
+        .kind = if (is_dir) .directory else .file,
+        .size = size,
+        .mtime_ms = mtime_ms,
+    };
+}
+
+pub const DirEntry = struct {
+    name: [256]u8 = undefined,
+    len: usize = 0,
+    is_dir: bool = false,
+
+    pub fn slice(self: *const DirEntry) []const u8 {
+        return self.name[0..self.len];
+    }
+};
+
+/// 列目录项，返回条目数（超出 `buf` 时截断）。不排序、不含 `.` 与 `..`。
+pub fn listDir(path: []const u8, buf: []DirEntry) anyerror!usize {
+    var zbuf: [1024]u16 = undefined;
+    // 用 `path\*` 通配；`FindFirstFileW` 是 std 未绑定的，同样自声明。
+    var joined: [1100]u8 = undefined;
+    if (path.len + 3 > joined.len) return error.NameTooLong;
+    @memcpy(joined[0..path.len], path);
+    @memcpy(joined[path.len..][0..2], "\\*");
+    const z = try widePath(joined[0 .. path.len + 2], &zbuf);
+
+    var data: WIN32_FIND_DATAW = undefined;
+    const h = fl32.FindFirstFileW(z.ptr, &data);
+    if (h == invalidHandle()) return 0; // 空目录或不存在
+    defer _ = fl32.FindClose(h);
+
+    var count: usize = 0;
+    while (true) {
+        const name_u16 = std.mem.sliceTo(&data.cFileName, 0);
+        if (!std.mem.eql(u16, name_u16, &.{'.'}) and !std.mem.eql(u16, name_u16, &.{ '.', '.' })) {
+            if (count >= buf.len) return count;
+            var utf8: [256]u8 = undefined;
+            const n = std.unicode.utf16LeToUtf8(&utf8, name_u16) catch 0;
+            if (n > 0 and n <= buf[count].name.len) {
+                @memcpy(buf[count].name[0..n], utf8[0..n]);
+                buf[count].len = n;
+                buf[count].is_dir = data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+                count += 1;
+            }
+        }
+        if (!fl32.FindNextFileW(h, &data).toBool()) break;
+    }
+    return count;
 }
 
 pub fn fileSize(path: []const u8) anyerror!u64 {
