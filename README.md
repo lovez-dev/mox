@@ -253,7 +253,7 @@ exe.root_module.addImport("mox_io", dep.module("mox_io"));
 |---|---|---|
 | Linux io_uring | 常见 | `send` 在缓冲满时明确短写；回归测试在 WSL 上稳定触发 |
 | Windows IOCP | 少见 | `WSASend` 会把整块缓冲挂进内核发送队列，通常一次性完成，流控留在内核 |
-| kqueue | 常见 | 与 POSIX 语义一致（运行时尚未验证） |
+| kqueue | 常见 | 与 POSIX 语义一致；后端已在 macOS CI 跑通全量测试，短写本身未单独实测 |
 
 回归测试 `server.test.响应发生部分写入时续发剩余字节，不静默丢弃` 用 32 MB
 载荷加一个先读 4 KB 再停 200 ms 的慢读者逼出短写。几 KB 的响应在回环上会被
@@ -383,9 +383,9 @@ CI（`.github/workflows/test.yml`）分两块：
   示例构建、真包依赖验证、三把性能尺子，并交叉编译校验另一架构的目标。
   Linux 格会先打印 `/proc/sys/kernel/io_uring_disabled`，便于在托管 runner
   禁用 io_uring 时区分代码问题与环境问题。
-- `macos` job 保留 Unix 覆盖，但**不跑 `zig build test`**：kqueue 运行时行为
-  尚未验证，把它当门禁只会产生无法判断的假红。以后在 Darwin/BSD 上确认过
-  运行时，再把全量测试步骤加回来。
+- `macos` job 在真实 macOS arm64 runner 上跑 kqueue 全量测试。每条 io
+  测试独立编译、独立 20 秒看门狗，逐条报告挂死/失败及其断言输出，避免
+  一条卡住吞掉其余结果；另做示例构建、真包依赖验证与 x86_64 交叉编译校验。
 
 ## 说明
 

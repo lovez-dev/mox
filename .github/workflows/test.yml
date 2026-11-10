@@ -130,7 +130,7 @@ jobs:
         run: zig test src/io/io.zig -target ${{ matrix.cross }} --test-no-exec
 
   macos:
-    name: macOS arm64（kqueue，运行时待验证）
+    name: macOS arm64（kqueue 运行时）
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -166,8 +166,8 @@ jobs:
           zig version
           uname -m
 
-      # kqueue 后端此前从未在任何机器上运行过，这里首次让它真跑。
-      # 若失败，说明发现了真实缺陷而非环境噪音 —— 这正是要买的信息。
+      # kqueue 已通过 macOS CI 运行时验证。逐条隔离是为了让任何回归都能
+      # 直接定位到具体测试，而不是只留下一个「整体超时」。
       - name: mox + mox_io 全量测试（kqueue 运行时）
         shell: bash
         run: |
