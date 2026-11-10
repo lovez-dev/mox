@@ -153,6 +153,11 @@ fn vtReadFileInto(userdata: ?*anyopaque, path: []const u8, buf: []u8) anyerror!u
     return uring.readFileInto(path, buf);
 }
 
+fn vtWriteFileAll(userdata: ?*anyopaque, path: []const u8, bytes: []const u8) anyerror!void {
+    _ = userdata;
+    return uring.writeFileAll(path, bytes);
+}
+
 fn vtAssociate(userdata: ?*anyopaque, socket: Handle, key: usize) anyerror!void {
     _ = userdata;
     _ = socket;
@@ -416,6 +421,7 @@ const vtable_storage: root.VTable = .{
     .listen = vtListen,
     .fileSize = vtFileSize,
     .readFileInto = vtReadFileInto,
+    .writeFileAll = vtWriteFileAll,
     .associate = vtAssociate,
     .recv = vtRecv,
     .send = vtSend,

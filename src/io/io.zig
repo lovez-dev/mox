@@ -120,6 +120,9 @@ pub const VTable = struct {
     /// 在 `Work` 池线程里阻塞读文件。文件没有可移植的原生异步接口，
     /// 这是所有后端共用的兜底；通过 `Io` 值调用，不依赖 `*Loop`。
     readFileInto: *const fn (userdata: ?*anyopaque, path: []const u8, buf: []u8) anyerror!usize,
+    /// 在 `Work` 池线程里阻塞整文件写入（覆盖既有内容）。与 `readFileInto`
+    /// 同样是所有后端共用的兜底：没有可移植的原生异步写接口。
+    writeFileAll: *const fn (userdata: ?*anyopaque, path: []const u8, bytes: []const u8) anyerror!void,
     /// 把套接字的完成包路由到本后端（Windows 上同时为监听套接字启用 `AcceptEx`）。
     associate: *const fn (userdata: ?*anyopaque, socket: Handle, key: usize) anyerror!void,
     /// 发起一次重叠接收。返回 `null` 表示尚未完成，稍后由 `wait` 投递。
@@ -210,6 +213,7 @@ pub const Work = completion_mod.Work;
 pub const Loop = loop_mod.Loop;
 
 pub const ReadFile = @import("file.zig").ReadFile;
+pub const WriteFile = @import("file.zig").WriteFile;
 
 /// 编译期选定的本目标后端。新增后端 = 写一个导出 `create(allocator) !Io`
 /// 的文件，再在这里加一个分支。

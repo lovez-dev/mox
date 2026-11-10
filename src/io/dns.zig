@@ -20,7 +20,6 @@ const Handle = root.Handle;
 /// 能力 ID：与 UDP 完全不同的名字，验证稀疏表能容纳多个能力。
 pub const id = root.cap("mox.io.dns.v1");
 
-
 /// 注册描述符。DNS 本身建立在 UDP 能力上，这里只用一个静态标记证明
 /// 能力表能同时容纳多个 ID、且查询路径对第二个能力同样有效。
 pub const Descriptor = struct {
@@ -32,7 +31,11 @@ pub const descriptor = Descriptor{ .version = 1 };
 pub const max_addresses = 8;
 
 pub const Answer = struct {
-    addresses: [max_addresses]IpAddress = undefined,
+    /// 未使用的槽位保持「合法但无意义」的 `0.0.0.0:0`，而不是 `undefined`。
+    /// 解析路径只写前 `count` 个，但 `Answer` 可能被整体拷贝、哈希或序列化；
+    /// 读未初始化内存是 UB，显式零值让这些操作有确定行为。
+    /// （实测 `{any}` 打印 `undefined` 槽位并不会 panic，这里纯粹是消除 UB。）
+    addresses: [max_addresses]IpAddress = @splat(.{ .ip4 = .{ .bytes = @splat(0), .port = 0 } }),
     count: usize = 0,
 
     pub fn slice(self: *const Answer) []const IpAddress {

@@ -153,4 +153,3 @@ pub const Work = struct {
         return .{ .func = func };
     }
 };
-

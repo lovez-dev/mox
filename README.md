@@ -210,6 +210,14 @@ benchmark，API 也不兼容；在建立 zio 适配器与共同负载之前，�
 Work 唤醒、异步 connect、ONESHOT 重挂、后端选择），因此无论 CI runner 是否
 启用 io_uring，epoll 路径都真实执行而不是只做编译校验。
 
+回落路径已在真实禁用的内核上端到端验证过：在 WSL 里把
+`/proc/sys/kernel/io_uring_disabled` 写成 `1` 后重跑，`io_uring_setup` 返回
+`SetupFailed`，`platform.create()` 改选 `epoll`，全量测试在纯 epoll 路径下
+**46/46 全绿**。`backends/uring.zig` 里那几条后端专属测试在此时会读取
+`create` 的失败原因，遇到 `SetupFailed` 就**跳过而不是失败**——这类失败由
+环境造成，不该记在 mox 头上；其它错误仍旧照常抛出。把 sysctl 改回 `0`
+之后这 5 条会重新真正执行并通过，两个方向都验证过。
+
 ## 新增一个后端
 
 写一个导出 `create(allocator) !Io` 的文件，填满 `mox_io.VTable` 的全部字段，
@@ -219,9 +227,15 @@ Work 唤醒、异步 connect、ONESHOT 重挂、后端选择），因此无论 C
 
 ## 可选能力
 
-新能力（UDP / DNS / 进程 / 信号 / select / group）通过 `Io.capability`
-查询可选能力表接入，用 `mox_io.cap("名字")` 编译期算出 ID；新增能力不改变
-主 `VTable` 布局，也不打断 TCP / timer 热路径。未提供的能力返回 `null`。
+新能力通过 `Io.capability` 查询可选能力表接入，用 `mox_io.cap("名字")`
+编译期算出 ID；新增能力不改变主 `VTable` 布局，也不打断 TCP / timer 热路径。
+未注册的能力返回 `null`。
+
+`src/io/udp.zig` 与 `src/io/dns.zig` 是这套机制的**两个已落地实例**，也同时
+是扩展模板：加第三个能力只需「一个 `cap("...")` 常量 + 一张函数表 + 一个
+节点类型」，`VTable` 与 `Loop` 都不动。**注意**：进程、信号、select、group
+等都只是在设计上被这套机制覆盖，**并未实现**，能力表当前只有 UDP 与 DNS
+两项。
 
 UDP 已作为第一个能力落地（`src/io/udp.zig`）：`Udp.get(loop.io)` 取句柄，
 `Udp.Recv` / `Udp.Send` 优先走后端原生异步数据报（细节见下文「UDP 与 DNS」
@@ -490,7 +504,11 @@ try mox.serveWith(.{ .gpa = gpa, .address = addr, .routes = routes }, mountAll);
 
 - 代码注释统一使用中文。
 - 不使用 `std.Io` 的异步运行时句柄；`std.Io.net.IpAddress` 仅作为地址值类型出现在接口签名里。
-- 文件读取通过 `Work` 池在后台线程阻塞执行，完成回调回到循环线程。
+- 文件读写都通过 `Work` 池在后台线程阻塞执行，完成回调回到循环线程。
+  `ReadFile`（缓冲区由调用方提供，命中 `memory_fs` 时只做一次 memcpy）与
+  `WriteFile`（整文件覆盖写，`VTable.writeFileAll` 是所有后端共用的兜底，
+  没有可移植的原生异步写接口）形状对称，都是内嵌 `Work` 节点的零分配结构。
+  两者都不在 `Loop` 上开便捷入口，用法是 `xxx.init(...)` + `loop.add(&xxx.work.c)`。
 
 ## 许可证
 

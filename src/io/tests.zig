@@ -16,6 +16,7 @@ const Work = root.Work;
 const Handle = root.Handle;
 const INVALID_HANDLE = root.INVALID_HANDLE;
 const ReadFile = root.ReadFile;
+const WriteFile = root.WriteFile;
 const platform = root.platform;
 fn testLoop() !Loop {
     return Loop.init(try platform.create(std.testing.allocator));
@@ -745,4 +746,68 @@ test "drainRetired 超时可观测：永不回来的取消项记一次超时且�
     // 超时必须被记下来，而不是静默返回；对象也仍然没有被 dispose。
     try std.testing.expectEqual(@as(usize, 1), loop.retired_timeouts);
     try std.testing.expectEqual(@as(usize, 1), loop.retired.items.len);
+}
+
+// WriteFile 与 ReadFile 对称：都内嵌 Work 节点、回调落在循环线程。
+// 这里写一个临时文件再读回来，端到端验证字节真的落盘。
+test "WriteFile 通过 Work 池写文件，可被 ReadFile 读回" {
+    var l = Loop.init(try platform.create(std.testing.allocator));
+    defer l.deinit();
+
+    const path = "zig-cache-mox-writefile-test.txt";
+    defer platform.deleteFile(path);
+
+    const Ctx = struct {
+        var ok = false;
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            ok = true;
+            loop.stop();
+        }
+    };
+
+    const body = "written-through-work-pool";
+    var wf = WriteFile.init(l.io, path, body);
+    wf.work.c.callback = &Ctx.cb;
+    l.add(&wf.work.c);
+    try l.run();
+
+    try std.testing.expect(Ctx.ok);
+    try std.testing.expectEqual(body.len, try wf.getResult());
+
+    // 读回来确认不是只返回了长度。
+    var buf: [64]u8 = undefined;
+    var rf = ReadFile.init(l.io, path, &buf, null);
+    rf.work.c.callback = &Ctx.cb;
+    l.add(&rf.work.c);
+    try l.run();
+    try std.testing.expectEqualStrings(body, try rf.getResult());
+}
+
+// 失败路径必须把池线程里的错误带回回调，而不是静默成功。
+test "WriteFile 写入失败时把错误交给回调" {
+    var l = Loop.init(try platform.create(std.testing.allocator));
+    defer l.deinit();
+
+    const Ctx = struct {
+        var ok = false;
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            ok = true;
+            loop.stop();
+        }
+    };
+
+    var wf = WriteFile.init(l.io, "不存在的目录/无法创建.txt", "x");
+    wf.work.c.callback = &Ctx.cb;
+    l.add(&wf.work.c);
+    try l.run();
+
+    try std.testing.expect(Ctx.ok);
+    // 各后端的底层错误名不同（Windows RequestFailed、POSIX OpenFailed 等），
+    // 这里只断言「失败被带回回调」，不绑定具体错误值。
+    if (wf.getResult()) |n| {
+        std.debug.print("期望失败，却写入了 {d} 字节\n", .{n});
+        return error.TestUnexpectedResult;
+    } else |_| {}
 }

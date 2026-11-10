@@ -100,6 +100,38 @@ pub const ReadFile = struct {
     }
 };
 
+/// 整文件写入。没有异步后端入口（平台层 `writeFileAll` 是同步辅助函数），
+/// 因此固定走 `Work` 池：池线程做阻塞的 open/write/close，回调落在循环线程。
+/// 与 `ReadFile` 对称，`Work` 节点内嵌，零额外分配。
+pub const WriteFile = struct {
+    work: Work,
+    io: Io,
+    path: []const u8,
+    bytes: []const u8,
+    written: usize = 0,
+    err: ?anyerror = null,
+
+    /// `bytes` 由调用方持有，必须活到回调触发为止（本结构不复制内容）。
+    pub fn init(io: Io, path: []const u8, bytes: []const u8) WriteFile {
+        return .{ .work = Work.init(run), .io = io, .path = path, .bytes = bytes };
+    }
+
+    fn run(w: *Work) void {
+        const self: *WriteFile = @fieldParentPtr("work", w);
+        self.io.vtable.writeFileAll(self.io.userdata, self.path, self.bytes) catch |e| {
+            self.err = e;
+            return;
+        };
+        self.written = self.bytes.len;
+    }
+
+    /// 成功后返回实际写入的字节数；失败时返回池线程里捕获的错误。
+    pub fn getResult(self: *const WriteFile) !usize {
+        if (self.err) |e| return e;
+        return self.written;
+    }
+};
+
 test "MemoryFs 查找与覆盖" {
     var fs = MemoryFs.init(std.testing.allocator);
     defer fs.deinit();

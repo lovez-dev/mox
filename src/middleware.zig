@@ -41,7 +41,7 @@ pub fn logging(comptime next: Handler) Handler {
             std.log.info("{s} {s} -> {d}", .{
                 @tagName(ctx.request.method),
                 ctx.request.target,
-                @intFromEnum(response.status),
+                @backingInt(response.status),
             });
             return response;
         }

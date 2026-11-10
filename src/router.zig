@@ -5,8 +5,6 @@ const Handler = @import("types.zig").Handler;
 pub const Params = @import("types.zig").Params;
 pub const Route = @import("types.zig").Route;
 
-
-
 const Entry = struct { method: std.http.Method, handler: Handler };
 
 const Node = struct {

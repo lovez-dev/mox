@@ -432,6 +432,11 @@ fn vtReadFileInto(userdata: ?*anyopaque, path: []const u8, buf: []u8) anyerror!u
     return readFileInto(path, buf);
 }
 
+fn vtWriteFileAll(userdata: ?*anyopaque, path: []const u8, bytes: []const u8) anyerror!void {
+    _ = userdata;
+    return writeFileAll(path, bytes);
+}
+
 const vtable_storage: root.VTable = .{
     .deinit = vtDeinit,
     .now = vtNow,
@@ -443,6 +448,7 @@ const vtable_storage: root.VTable = .{
     .listen = vtListen,
     .fileSize = vtFileSize,
     .readFileInto = vtReadFileInto,
+    .writeFileAll = vtWriteFileAll,
     .associate = vtAssociate,
     .recv = vtRecv,
     .send = vtSend,
@@ -674,8 +680,21 @@ pub fn deleteFile(path: []const u8) void {
 
 // ---- 测试（在 Linux 运行；已在 WSL 验证） ----------------------------------
 
+/// 这些测试只验 io_uring 后端本身，必须真的用到内核的 io_uring。
+/// 在 `io_uring_disabled=1` 或旧内核上 `create` 会失败——那不是 mox 的
+/// 缺陷，而是环境不支持，此时跳过。其它错误仍然照常抛出。
+fn testLoop() !?root.Loop {
+    const io_value = create(std.testing.allocator) catch |e| switch (e) {
+        error.SetupFailed => return null,
+        else => return e,
+    };
+    return root.Loop.init(io_value);
+}
+
 test "io_uring: a timer fires through the loop" {
-    var l = root.Loop.init(try create(std.testing.allocator));
+    const maybe_loop = try testLoop();
+    if (maybe_loop == null) return; // 本机没有 io_uring，跳过
+    var l = maybe_loop.?;
     defer l.deinit();
 
     const Ctx = struct {
@@ -694,7 +713,9 @@ test "io_uring: a timer fires through the loop" {
 }
 
 test "io_uring: accept, receive and send through the loop" {
-    var l = root.Loop.init(try create(std.testing.allocator));
+    const maybe_loop = try testLoop();
+    if (maybe_loop == null) return; // 本机没有 io_uring，跳过
+    var l = maybe_loop.?;
     defer l.deinit();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
@@ -753,7 +774,9 @@ test "io_uring: accept, receive and send through the loop" {
 }
 
 test "io_uring: a Work item runs on the pool and completes on the loop" {
-    var l = root.Loop.init(try create(std.testing.allocator));
+    const maybe_loop = try testLoop();
+    if (maybe_loop == null) return; // 本机没有 io_uring，跳过
+    var l = maybe_loop.?;
     defer l.deinit();
 
     const Item = struct { work: root.Work, value: u32 = 0 };
@@ -779,7 +802,9 @@ test "io_uring: a Work item runs on the pool and completes on the loop" {
 }
 
 test "io_uring: an async connect completes through the loop" {
-    var l = root.Loop.init(try create(std.testing.allocator));
+    const maybe_loop = try testLoop();
+    if (maybe_loop == null) return; // 本机没有 io_uring，跳过
+    var l = maybe_loop.?;
     defer l.deinit();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
@@ -823,7 +848,9 @@ test "io_uring: an async connect completes through the loop" {
 }
 
 test "io_uring: ReadFile reads a file off the loop thread" {
-    var l = root.Loop.init(try create(std.testing.allocator));
+    const maybe_loop = try testLoop();
+    if (maybe_loop == null) return; // 本机没有 io_uring，跳过
+    var l = maybe_loop.?;
     defer l.deinit();
 
     const path = "zig-cache-mox-uring-readfile.txt";

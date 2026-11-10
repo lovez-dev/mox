@@ -136,7 +136,7 @@ fn reason(status: std.http.Status) []const u8 {
 /// 本次 body 的尺寸来准备 `buf`。
 pub fn serialize(resp: Response, keep_alive: bool, buf: []u8) error{NoSpaceLeft}![]const u8 {
     return std.fmt.bufPrint(buf, "HTTP/1.1 {d} {s}\r\ncontent-type: {s}\r\ncontent-length: {d}\r\nconnection: {s}\r\n\r\n{s}", .{
-        @intFromEnum(resp.status),
+        @backingInt(resp.status),
         reason(resp.status),
         resp.content_type,
         resp.body.len,

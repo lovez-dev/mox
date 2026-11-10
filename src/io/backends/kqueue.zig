@@ -406,6 +406,11 @@ fn vtReadFileInto(userdata: ?*anyopaque, path: []const u8, buf: []u8) anyerror!u
     return readFileInto(path, buf);
 }
 
+fn vtWriteFileAll(userdata: ?*anyopaque, path: []const u8, bytes: []const u8) anyerror!void {
+    _ = userdata;
+    return writeFileAll(path, bytes);
+}
+
 const vtable_storage: root.VTable = .{
     .deinit = vtDeinit,
     .now = vtNow,
@@ -417,6 +422,7 @@ const vtable_storage: root.VTable = .{
     .listen = vtListen,
     .fileSize = vtFileSize,
     .readFileInto = vtReadFileInto,
+    .writeFileAll = vtWriteFileAll,
     .associate = vtAssociate,
     .recv = vtRecv,
     .send = vtSend,
