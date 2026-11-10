@@ -3,6 +3,7 @@
 //! 从 `loop.zig` / `io.zig` 移出，统一由 `io.zig` 聚合。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const net = std.Io.net;
 const root = @import("io.zig");
 
@@ -20,6 +21,8 @@ const WriteFile = root.WriteFile;
 const TruncateFile = root.TruncateFile;
 const DeleteFile = root.DeleteFile;
 const platform = root.platform;
+const Process = root.Process;
+const ProcessWait = root.ProcessWait;
 fn testLoop() !Loop {
     return Loop.init(try platform.create(std.testing.allocator));
 }
@@ -1055,4 +1058,97 @@ test "DeleteFile 删除文件且重复删除不报错" {
     if (rf.getResult()) |_| {
         return error.TestUnexpectedResult;
     } else |_| {}
+}
+
+// 子进程：同步 spawn 后异步等退出，退出码应被带回回调。
+test "Process 启动子进程并异步等退出" {
+    var loop = try testLoop();
+    defer loop.deinit();
+
+    const Ctx = struct {
+        var done = false;
+        fn cb(l: *Loop, c: *Completion) void {
+            _ = c;
+            done = true;
+            l.stop();
+        }
+    };
+
+    var proc = try Process.spawn(.{
+        .allocator = std.heap.page_allocator,
+        .argv = if (builtin.os.tag == .windows)
+            &.{ "cmd.exe", "/c", "exit 7" }
+        else
+            &.{ "/bin/sh", "-c", "exit 7" },
+        .create_no_window = true,
+    });
+    defer if (proc.alive) proc.kill();
+
+    var wait = ProcessWait.init(&proc);
+    wait.work.c.callback = &Ctx.cb;
+    loop.add(&wait.work.c);
+    try loop.run();
+
+    try std.testing.expect(Ctx.done);
+    const term = try wait.getResult();
+    try std.testing.expectEqual(@as(?u8, 7), term.code());
+}
+
+// 子进程：stdio 重定向到管道后可读到子进程输出（`Stdio.pipe` 路径可用）。
+test "Process 可通过管道读取子进程输出" {
+    var loop = try testLoop();
+    defer loop.deinit();
+
+    var proc = try Process.spawn(.{
+        .allocator = std.heap.page_allocator,
+        .argv = if (builtin.os.tag == .windows)
+            &.{ "cmd.exe", "/c", "echo hello-child" }
+        else
+            &.{ "/bin/sh", "-c", "echo hello-child" },
+        .stdout = .pipe,
+        .create_no_window = true,
+    });
+    defer if (proc.alive) proc.kill();
+
+    // 读完 stdout 再等退出，避免子进程因管道写满而阻塞。
+    var buf: [128]u8 = undefined;
+    const n = if (builtin.os.tag == .windows)
+        try readAllWindows(proc.stdoutFd().?, &buf)
+    else
+        try readAllPosix(proc.stdoutFd().?, &buf);
+    const term = try proc.waitSync();
+    try std.testing.expect(term.success());
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "hello-child") != null);
+}
+
+fn readAllPosix(fd: anytype, buf: []u8) !usize {
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = std.posix.read(fd, buf[total..]) catch |e| {
+            if (e == error.WouldBlock) continue;
+            return e;
+        };
+        if (n == 0) break;
+        total += n;
+    }
+    return total;
+}
+
+// `ReadFile` 不在 std 的 kernel32 绑定里，按 mox 一贯做法自行声明。
+const kernelReadFile = @extern(
+    *const fn (
+        h: std.os.windows.HANDLE,
+        buf: [*]u8,
+        len: std.os.windows.DWORD,
+        got: *std.os.windows.DWORD,
+        overlapped: ?*anyopaque,
+    ) callconv(.winapi) std.os.windows.BOOL,
+    .{ .name = "ReadFile", .library_name = "kernel32" },
+);
+
+fn readAllWindows(handle: anytype, buf: []u8) !usize {
+    const h: std.os.windows.HANDLE = @ptrFromInt(handle);
+    var got: std.os.windows.DWORD = 0;
+    if (!kernelReadFile(h, buf.ptr, @intCast(buf.len), &got, null).toBool()) return error.ReadFailed;
+    return got;
 }

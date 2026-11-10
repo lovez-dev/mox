@@ -241,6 +241,12 @@ pub const platform = switch (builtin.os.tag) {
 pub const udp = @import("udp.zig");
 pub const dns = @import("dns.zig");
 
+/// 子进程能力：`spawn`（同步）+ `Wait`（异步等退出，走 `Work` 池）+ `killGroup`。
+/// 手写平台层（POSIX fork/exec/waitpid、Windows CreateProcessW），不借 `std.Io`；详见 `process.zig`。
+pub const process = @import("process.zig");
+pub const Process = process.Process;
+pub const ProcessWait = process.Wait;
+
 const udp_storage = udp.VTable{
     .create = struct {
         fn f(userdata: ?*anyopaque, address: std.Io.net.IpAddress) anyerror!Handle {

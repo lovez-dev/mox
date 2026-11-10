@@ -234,8 +234,8 @@ Work 唤醒、异步 connect、ONESHOT 重挂、后端选择），因此无论 C
 `src/io/udp.zig` 与 `src/io/dns.zig` 是这套机制的**两个已落地实例**，也同时
 是扩展模板：加第三个能力只需「一个 `cap("...")` 常量 + 一张函数表 + 一个
 节点类型」，`VTable` 与 `Loop` 都不动。**注意**：进程、信号、select、group
-等都只是在设计上被这套机制覆盖，**并未实现**，能力表当前只有 UDP 与 DNS
-两项。
+等都只是在设计上被这套机制覆盖；**进程（spawn / 异步等退出 / 进程组）已落地**，
+见下文「子进程」一节；信号与 select 仍未实现，能力表当前是 UDP 与 DNS 两项。
 
 UDP 已作为第一个能力落地（`src/io/udp.zig`）：`Udp.get(loop.io)` 取句柄，
 `Udp.Recv` / `Udp.Send` 优先走后端原生异步数据报（细节见下文「UDP 与 DNS」
@@ -276,6 +276,54 @@ loop.add(&req.work.c);
 `getResult()` 读到 `DeadlineExceeded`。也没有「同一操作挂多个 watchdog」的语义，
 重复调用 `watchdog` 会先撤销上一个。
 
+
+## 子进程
+
+`src/io/process.zig` 是**手写平台层**，不借 `std.Io`：POSIX 用 `fork` +
+`execve` + `waitpid`，Windows 用 `CreateProcessW` + `WaitForSingleObject` +
+`TerminateProcess`。标准库只当 syscall / kernel32 绑定用，和 epoll / kqueue /
+IOCP 三个后端的做法一致。
+
+```zig
+var p = try mox_io.Process.spawn(.{
+    .allocator = allocator,
+    .argv = &.{ "/bin/sh", "-c", "echo hi; exit 7" },
+    .stdout = .pipe,            // 也可 .inherit / .ignore / .fd(fd)
+    .cwd = "/tmp",              // null = 继承
+    .new_group = true,          // 建新进程组，配合 killGroup
+});
+
+// 同步等退出（阻塞调用线程）
+const term = try p.waitSync();
+_ = term.code();               // ?u8，非 .exited 时为 null
+_ = term.success();            // 仅 .exited 且码为 0
+
+// 或者异步等：Wait 节点占一个 Work 池线程，回调回到循环线程
+var wait = mox_io.ProcessWait.init(&p);
+wait.work.c.callback = myCb;
+loop.add(&wait.work.c);
+// … 回调里：wait.getResult()
+
+p.kill();                      // 强制终止并回收
+try p.killGroup(15);           // 向整个进程组发 SIGTERM
+```
+
+语义要点：
+
+- **`spawn` 是同步的**，`wait` 才是异步的。fork/exec 与 `CreateProcessW` 在调用
+  线程里跑完；`Wait` 节点的阻塞 `waitpid` / `WaitForSingleObject` 在 `Work` 池
+  线程里，和文件 I/O 同一权衡（默认 4 个池线程）。
+- **exec 失败如何回传**：POSIX 上 fork 成功但 exec 失败时，子进程把 errno 写进
+  一根 `CLOEXEC` 管道后 `_exit(127)`；父进程读到 EOF 即成功、读到 4 字节即失败。
+  父进程**必须在阻塞读之前关掉自己的写端**，否则永远等不到 EOF。
+- **Linux 不链 libc**：Linux 的 POSIX 路径走 `std.os.linux` 裸 syscall。原因是一旦
+  链上 libc，`std.Thread.spawn` 会改走 `pthread_create`，而 `Work` 池给线程设了
+  256 KiB 栈，glibc 会以 `EINVAL` 拒绝，std 把它映射成 `unreachable` 直接 panic。
+  环境变量因此从 `/proc/self/environ` 读，而不是 `environ`。
+- **Windows 组终止用作业对象**：`new_group = true` 时会建一个 Job Object 并把子进程
+  放进去，`killGroup` 走 `TerminateJobObject`，能连带杀掉子进程再派生的进程。
+- **`deleteFile` 式的诚实**：`killGroup` 在 POSIX 上要求子进程确实是组长（`new_group
+  = true`），否则 `kill(-pid)` 会失败并返回 `error.KillFailed`。
 ## 作为包被依赖
 
 仓库根有 `build.zig.zon`，包名 `mox`，最低 Zig 版本 `0.17.1`。外部项目
@@ -431,8 +479,8 @@ macOS arm64 kqueue 均在 CI 中跑全量测试。
 
 | 目标 | 架构 | 状态 |
 |---|---|---|
-| Windows（IOCP） | x86_64 / arm64 | 全量测试、真包依赖、性能尺子均在 CI 中运行 |
-| Linux（io_uring + epoll） | x86_64 / arm64 | 同上；`zig build test` 同时跑 epoll 专属测试（44/44），WSL 开发机亦实跑 |
+| Windows（IOCP） | x86_64 / arm64 | 全量测试、真包依赖、性能尺子均在 CI 中运行；子进程四场景本地实跑 |
+| Linux（io_uring + epoll） | x86_64 / arm64 | 同上；`zig build test` 同时跑 epoll 专属测试，WSL 开发机实跑 56/56（含子进程） |
 | macOS（kqueue） | arm64 | CI 真跑全量 kqueue 运行时测试，逐条隔离 + 20 秒看门狗 |
 
 BSD 不在覆盖范围内。
