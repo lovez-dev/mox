@@ -181,46 +181,61 @@ jobs:
           set +e
           log=/tmp/kqueue-test.log
           : >"$log"
-          # 两步：先 `zig build test` 管住两个模块的汇总结果，再单独
-          # 编译 io 测试二进制逐条跑 —— `--summary all` 只给汇总，
-          # 挂死时看不出是哪条测试，逐条进度才是定位依据。
-          zig build test --summary all >"$log" 2>&1 &
+          # 这次要分离「编译」与「运行」：上一轮 306s 全被看门狗吃掉，
+          # 但本地交叉编译只要 3s，所以必须知道到底卡在哪一段。
+          # 这样只要看输出里的耗时就能定性，不需要读日志。
+          secs() { echo "$(($(date +%s) - $1))"; }
+
+          # ---- 段 1：纯编译（不运行）----------------------------------
+          t0=$(date +%s)
+          zig test src/io/io.zig --test-no-exec -femit-bin=/tmp/io-test >"$log" 2>&1
+          cbuild=$?
+          csecs=$(secs "$t0")
+          echo "== 段1 编译 io 测试二进制：rc=$cbuild 耗时=${csecs}s =="
+
+          # ---- 段 2：只跑已编译的二进制（逐条进度在这里）---------------
+          t0=$(date +%s)
+          /tmp/io-test >"$log" 2>&1 &
           runner=$!
-          ( sleep 180; kill -9 "$runner" 2>/dev/null ) &
+          ( sleep 120; kill -9 "$runner" 2>/dev/null ) &
           watchdog=$!
           wait "$runner"
           rc=$?
           kill "$watchdog" 2>/dev/null
           wait "$watchdog" 2>/dev/null
           if [ "$rc" -eq 137 ]; then rc=124; fi
-          echo "zig build test rc=$rc"
-          tail -40 "$log"
+          rsecs=$(secs "$t0")
+          echo "== 段2 运行 io 测试：rc=$rc 耗时=${rsecs}s =="
+          tail -30 "$log"
 
-          # 逐条进度（测试二进制自己打印 `N/M 模块.test.名字...`）。
-          echo "== io 测试逐条进度 =="
-          zig test src/io/io.zig --test-no-exec -femit-bin=/tmp/io-test >/dev/null 2>&1
-          /tmp/io-test >"$log" 2>&1 &
+          # ---- 段 3：mox 模块测试（独立二进制，独立计时）---------------
+          t0=$(date +%s)
+          zig build test --summary all >/tmp/mox-build.log 2>&1 &
           runner=$!
           ( sleep 120; kill -9 "$runner" 2>/dev/null ) &
           watchdog=$!
           wait "$runner"
-          rc2=$?
+          rb=$?
           kill "$watchdog" 2>/dev/null
           wait "$watchdog" 2>/dev/null
-          if [ "$rc2" -eq 137 ]; then rc2=124; fi
-          echo "io 逐条 rc=$rc2"
-          tail -20 "$log"
-          if [ "$rc" -eq 0 ] && [ "$rc2" -ne 0 ]; then rc="$rc2"; fi
+          if [ "$rb" -eq 137 ]; then rb=124; fi
+          bsecs=$(secs "$t0")
+          echo "== 段3 zig build test：rc=$rb 耗时=${bsecs}s =="
+
           {
-            echo "### kqueue 全量测试诊断（zig build test=$rc, io 逐条=$rc2）"
+            echo "### kqueue 诊断：编译=${csecs}s(rc=$cbuild) 运行=${rsecs}s(rc=$rc) build=${bsecs}s(rc=$rb)"
             echo '```'
-            tail -45 "$log"
+            tail -30 "$log"
             echo '```'
           } >>"$GITHUB_STEP_SUMMARY"
-          # 只认 io 逐条日志里的进度行，那才是「挂在哪一条」的答案。
-          if [ "$rc" -ne 0 ]; then
-            last=$(grep -oE '[0-9]+/[0-9]+ [^.]*\.test\.[^.]+' "$log" | tail -1)
-            echo "::error::kqueue 失败或超时（zig build test=$rc, io 逐条=$rc2）；最后启动的测试: ${last:-未知}"
+
+          # 逐条进度行直接吐到 step 输出里（无论成败），注解作为备份通道。
+          last=$(grep -oE '[0-9]+/[0-9]+ [^.]*\.test\.[^.]+' "$log" | tail -1)
+          echo "ordering: compile=${csecs}s run=${rsecs}s build=${bsecs}s"
+          echo "last-started-test: ${last:-none}"
+          if [ "$rc" -ne 0 ] || [ "$rb" -ne 0 ] || [ "$cbuild" -ne 0 ]; then
+            echo "::error::kqueue 诊断 编译=${csecs}s(rc=$cbuild) 运行=${rsecs}s(rc=$rc) build=${bsecs}s(rc=$rb)；最后启动的测试: ${last:-未知}"
+            rc=1
           fi
           exit "$rc"
 
