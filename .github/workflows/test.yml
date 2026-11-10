@@ -43,10 +43,50 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 不用第三方 setup action：mlugg/setup-zig 已迁往 Codeberg，在 GitHub
+      # 上不可用；社区 action 对 arm64 runner 的兼容性也不保证。直接取官方
+      # 发布包，按 OS/架构选 URL，六种组合的命名规则是统一的。
       - name: 安装 Zig 0.17.1
-        uses: mlugg/setup-zig@v1
+        shell: bash
+        run: |
+          set -euo pipefail
+          os="${{ runner.os }}"     # Linux / Windows / macOS
+          arch="${{ runner.arch }}" # X64 / ARM64
+          case "$os-$arch" in
+            Linux-X64)     plat=x86_64-linux;   ext=tar.xz ;;
+            Linux-ARM64)   plat=aarch64-linux;  ext=tar.xz ;;
+            macOS-X64)     plat=x86_64-macos;   ext=tar.xz ;;
+            macOS-ARM64)   plat=aarch64-macos;  ext=tar.xz ;;
+            Windows-X64)   plat=x86_64-windows; ext=zip ;;
+            Windows-ARM64) plat=aarch64-windows; ext=zip ;;
+            *) echo "无对应的 Zig 发布包: $os-$arch"; exit 1 ;;
+          esac
+          url="https://ziglang.org/download/0.17.1/zig-${plat}-0.17.1.${ext}"
+          echo "下载 $url"
+          curl -fsSL --retry 3 -o zig-pkg "$url"
+          if [ "$ext" = "zip" ]; then
+            # tar 解不了 zip（实测），所以 unzip 是唯一路径；缺失就明确报错。
+            command -v unzip >/dev/null || { echo "缺少 unzip，无法解压 Windows 版 Zig"; exit 1; }
+            unzip -q zig-pkg
+          else
+            tar -xf zig-pkg
+          fi
+          # 解压出的目录名就是 zig-<plat>-0.17.1，把它放进 PATH。
+          echo "$PWD/zig-${plat}-0.17.1" >> "$GITHUB_PATH"
+          "$PWD/zig-${plat}-0.17.1/zig" version
+
+      # 缓存两样东西：本地 .zig-cache（构建产物）与全局缓存（std 编译结果）。
+      # 矩阵各格缓存键必须区分平台，否则会互相污染。
+      - name: 缓存 Zig 构建产物
+        uses: actions/cache@v4
         with:
-          version: 0.17.1
+          path: |
+            .zig-cache
+            ~/.cache/zig
+            ~/AppData/Local/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-${{ runner.os }}-${{ runner.arch }}-
 
       - name: 版本与架构核对
         run: |
@@ -88,11 +128,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 同 runtime job：不用已迁走的社区 action，直接取官方发布包。
       - name: 安装 Zig 0.17.1
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.17.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.arch }}" in
+            ARM64) plat=aarch64-macos ;;
+            X64)   plat=x86_64-macos ;;
+            *) echo "无对应的 Zig 发布包: ${{ runner.arch }}"; exit 1 ;;
+          esac
+          url="https://ziglang.org/download/0.17.1/zig-${plat}-0.17.1.tar.xz"
+          echo "下载 $url"
+          curl -fsSL --retry 3 -o zig-pkg "$url"
+          tar -xf zig-pkg
+          echo "$PWD/zig-${plat}-0.17.1" >> "$GITHUB_PATH"
+          "$PWD/zig-${plat}-0.17.1/zig" version
 
+      - name: 缓存 Zig 构建产物
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-${{ runner.os }}-${{ runner.arch }}-
       - name: 版本与架构核对
         run: |
           zig version
