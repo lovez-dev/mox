@@ -1202,6 +1202,47 @@ test "Signal 订阅 USR1 后 self-pipe 收到通知" {
 
 // ===== 任意 fd 就绪监视（`WatchFd`）=====
 //
+// 跨平台管道辅助：Linux 不链 libc（见 README「子进程」一节）必须走裸 syscall，
+// macOS/BSD 始终链 libSystem 则用 `std.c`。写成函数而不是内联，是为了让两个
+// 测试共用同一份、且平台分派只出现在一处。
+
+const Pipe = struct {
+    fds: [2]i32,
+
+    fn open() !Pipe {
+        var fds: [2]i32 = undefined;
+        if (builtin.os.tag == .linux) {
+            const rc = std.os.linux.pipe2(&fds, .{ .CLOEXEC = true });
+            if (@as(isize, @bitCast(rc)) < 0) return error.PipeFailed;
+        } else {
+            // macOS 上没有 `pipe2` 的可用绑定，退回 `pipe` + 事后设 CLOEXEC。
+            if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+            for (fds) |fd| _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
+        }
+        return .{ .fds = fds };
+    }
+
+    fn close(self: Pipe) void {
+        for (self.fds) |fd| {
+            if (builtin.os.tag == .linux) {
+                _ = std.os.linux.close(@intCast(fd));
+            } else {
+                _ = std.c.close(fd);
+            }
+        }
+    }
+
+    fn writeByte(self: Pipe, b: u8) !void {
+        const buf = [1]u8{b};
+        const n: isize = if (builtin.os.tag == .linux)
+            @bitCast(std.os.linux.write(@intCast(self.fds[1]), &buf, 1))
+        else
+            std.c.write(self.fds[1], &buf, 1);
+        if (n != 1) return error.WriteFailed;
+    }
+};
+
+//
 // 只在 POSIX 上跑：Windows 的 IOCP 是完成模型，`watchFd` 槽位为 `null`，
 // 调用方拿 `error.Unsupported`——那条路径由第一条测试覆盖。
 
@@ -1231,13 +1272,8 @@ test "WatchFd 在管道可读时回调并回填 read 方向" {
     var loop = try testLoop();
     defer loop.deinit();
 
-    // Linux 不链 libc（见 README「子进程」一节），管道走裸 syscall。
-    var fds: [2]i32 = undefined;
-    const lx = std.os.linux;
-    const rc = lx.pipe2(&fds, .{ .CLOEXEC = true });
-    try std.testing.expect(@as(isize, @bitCast(rc)) >= 0);
-    defer _ = lx.close(@intCast(fds[0]));
-    defer _ = lx.close(@intCast(fds[1]));
+    const pipe = try Pipe.open();
+    defer pipe.close();
 
     const Ctx = struct {
         var done = false;
@@ -1250,7 +1286,7 @@ test "WatchFd 在管道可读时回调并回填 read 方向" {
         }
     };
 
-    var w = root.WatchFd.init(@intCast(fds[0]), .{ .read = true });
+    var w = root.WatchFd.init(@intCast(pipe.fds[0]), .{ .read = true });
     var wd = Timer.init(5000);
     w.c.callback = &Ctx.cb;
     loop.add(&w.c);
@@ -1258,8 +1294,7 @@ test "WatchFd 在管道可读时回调并回填 read 方向" {
     loop.watchdog(&w.c, &wd, 5000);
 
     // 从另一头写入，触发可读。
-    const msg = "x";
-    try std.testing.expectEqual(@as(isize, 1), @as(isize, @bitCast(lx.write(@intCast(fds[1]), msg, 1))));
+    try pipe.writeByte('x');
 
     try loop.run();
     try std.testing.expect(Ctx.done);
