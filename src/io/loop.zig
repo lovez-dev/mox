@@ -221,6 +221,21 @@ pub const Loop = struct {
                 self.pushReady(c);
             },
 
+            .watch_fd => {
+                const w: *root.WatchFd = @fieldParentPtr("c", c);
+                const vtable_fn = self.io.vtable.watchFd orelse {
+                    c.err = error.Unsupported;
+                    self.pushReady(c);
+                    return;
+                };
+                const r = vtable_fn(self.io.userdata, w.fd, w.want, &c.ov) catch |e| {
+                    c.err = e;
+                    self.pushReady(c);
+                    return;
+                };
+                if (r) |_| self.pushReady(c); // 立即就绪；否则等后端投递
+            },
+
             .udp_recv, .udp_send => {
                 // 这两种操作由 `Udp` 自己向后端提交（它同时持有能力表和节点
                 // 布局，不必反过来让 Loop 认识 UDP 节点）。回落到线程池时，
@@ -273,6 +288,10 @@ pub const Loop = struct {
             const a: *NetAccept = @fieldParentPtr("c", c);
             if (ref.new_handle != INVALID_HANDLE) a.accept_socket = ref.new_handle;
             self.io.vtable.updateAccept(self.io.userdata, a.listen, a.accept_socket);
+        }
+        if (c.op == .watch_fd and c.err == null) {
+            const w: *root.WatchFd = @fieldParentPtr("c", c);
+            w.ready = root.Ready.fromBits(@truncate(ref.bytes));
         }
         if (c.op == .net_connect and c.err == null) {
             const a: *NetConnect = @fieldParentPtr("c", c);

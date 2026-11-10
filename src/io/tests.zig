@@ -1199,3 +1199,70 @@ test "Signal 订阅 USR1 后 self-pipe 收到通知" {
     // 看门狗到点会先把节点标成超时；有信号到达才算真通过。
     try std.testing.expectEqual(@as(u8, root.Signals.USR1), try s.getResult());
 }
+
+// ===== 任意 fd 就绪监视（`WatchFd`）=====
+//
+// 只在 POSIX 上跑：Windows 的 IOCP 是完成模型，`watchFd` 槽位为 `null`，
+// 调用方拿 `error.Unsupported`——那条路径由第一条测试覆盖。
+
+test "WatchFd 在 Windows 上返回 Unsupported" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var loop = try testLoop();
+    defer loop.deinit();
+
+    const Ctx = struct {
+        var saw_unsupported = false;
+        fn cb(l: *Loop, c: *Completion) void {
+            // `c.err` 是 `?anyerror`；显式取出再比，避免类型推断歧义。
+            if (c.err) |e| saw_unsupported = (e == error.Unsupported);
+            l.stop();
+        }
+    };
+    var w = root.WatchFd.init(@intCast(0), .{ .read = true });
+    w.c.callback = &Ctx.cb;
+    loop.add(&w.c);
+    try loop.run();
+    try std.testing.expect(Ctx.saw_unsupported);
+}
+
+test "WatchFd 在管道可读时回调并回填 read 方向" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var loop = try testLoop();
+    defer loop.deinit();
+
+    // Linux 不链 libc（见 README「子进程」一节），管道走裸 syscall。
+    var fds: [2]i32 = undefined;
+    const lx = std.os.linux;
+    const rc = lx.pipe2(&fds, .{ .CLOEXEC = true });
+    try std.testing.expect(@as(isize, @bitCast(rc)) >= 0);
+    defer _ = lx.close(@intCast(fds[0]));
+    defer _ = lx.close(@intCast(fds[1]));
+
+    const Ctx = struct {
+        var done = false;
+        var got: root.Ready = .{};
+        fn cb(l: *Loop, c: *Completion) void {
+            const w: *root.WatchFd = @fieldParentPtr("c", c);
+            got = w.ready;
+            done = true;
+            l.stop();
+        }
+    };
+
+    var w = root.WatchFd.init(@intCast(fds[0]), .{ .read = true });
+    var wd = Timer.init(5000);
+    w.c.callback = &Ctx.cb;
+    loop.add(&w.c);
+    // 看门狗：管道没写可读端永远不就绪，`run` 会挂死。
+    loop.watchdog(&w.c, &wd, 5000);
+
+    // 从另一头写入，触发可读。
+    const msg = "x";
+    try std.testing.expectEqual(@as(isize, 1), @as(isize, @bitCast(lx.write(@intCast(fds[1]), msg, 1))));
+
+    try loop.run();
+    try std.testing.expect(Ctx.done);
+    try std.testing.expect(Ctx.got.read);
+    try std.testing.expect(!Ctx.got.write);
+}

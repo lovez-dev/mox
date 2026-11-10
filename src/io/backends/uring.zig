@@ -376,13 +376,42 @@ fn reapCq(state: *State, refs: []root.Ref) usize {
 fn fillRef(cqe: *const linux.io_uring_cqe) root.Ref {
     const tagged = cqe.user_data;
     const is_accept = tagged & 1 != 0;
+    const is_watch = tagged & 2 != 0;
     const res = cqe.res;
+    var bytes: usize = if (res >= 0) @intCast(res) else 0;
+    if (is_watch and res >= 0) {
+        // `POLL_ADD` 的 `res` 是 poll 掩码，与 `Ready` 位布局不同，必须翻译。
+        var r: root.Ready = .{};
+        if (res & std.posix.POLL.IN != 0) r.read = true;
+        if (res & std.posix.POLL.OUT != 0) r.write = true;
+        if (res & std.posix.POLL.ERR != 0) r.failed = true;
+        if (res & std.posix.POLL.HUP != 0) r.hangup = true;
+        if (!r.any()) r.failed = true;
+        bytes = r.bits();
+    }
     return .{
-        .scratch = @ptrFromInt(tagged & ~@as(u64, 1)),
-        .bytes = if (res >= 0) @intCast(res) else 0,
+        .scratch = @ptrFromInt(tagged & ~@as(u64, 3)),
+        .bytes = bytes,
         .failed = res < 0,
         .new_handle = if (is_accept and res >= 0) @intCast(res) else root.INVALID_HANDLE,
     };
+}
+
+fn vtWatchFd(userdata: ?*anyopaque, fd: Handle, want: root.Ready, scratch: *root.Scratch) anyerror!?void {
+    const state = stateOf(userdata);
+    var mask: u32 = 0;
+    if (want.read) mask |= std.posix.POLL.IN;
+    if (want.write) mask |= std.posix.POLL.OUT;
+    if (mask == 0) return error.NothingToWatch;
+    const sqe = getSqe(state);
+    // `POLL_ADD` 是「就绪即完成」的 SQE，天然符合 `WatchFd` 的一次性语义。
+    // CQE 的 `res` 就是就绪掩码（`POLL.IN` / `POLL.OUT` / `POLL.ERR` / `POLL.HUP`），
+    // 正好在 `fillRef` 里作为 `bytes` 回传，与 epoll / kqueue 形状一致。
+    sqe.prep_poll_add(fdOf(fd), mask);
+    // bit0 已被 accept 占用；watch 用 bit1 标记，`fillRef` 据此把 POLL 掩码
+    // 翻译成 `Ready` 位布局（两者数值不同，不能直接透传）。
+    sqe.user_data = @intFromPtr(scratch) | 2;
+    return null;
 }
 
 fn vtNotify(userdata: ?*anyopaque) void {
@@ -485,6 +514,7 @@ const vtable_storage: root.VTable = .{
     .connect = vtConnect,
     .updateConnect = vtUpdateConnect,
     .cancel = vtCancel,
+    .watchFd = vtWatchFd,
     .close = vtClose,
     .waitBatch = vtWaitBatch,
     .notify = vtNotify,

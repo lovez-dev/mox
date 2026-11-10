@@ -20,7 +20,7 @@ const net = std.Io.net;
 const Handle = root.Handle;
 const INVALID_HANDLE = root.INVALID_HANDLE;
 
-const Kind = enum { recv, send, accept, connect, udp_recv, udp_send };
+const Kind = enum { recv, send, accept, connect, udp_recv, udp_send, watch };
 
 /// `EVFILT_USER` 唤醒源的 ident。固定值即可，只要不与真实 fd 冲突；
 /// 真实 fd 从 3 起，用 1 是安全的。
@@ -114,6 +114,24 @@ fn vtAssociate(userdata: ?*anyopaque, socket: Handle, key: usize) anyerror!void 
     _ = userdata;
     _ = socket;
     _ = key;
+}
+
+fn vtWatchFd(userdata: ?*anyopaque, fd: Handle, want: root.Ready, scratch: *root.Scratch) anyerror!?void {
+    const state = stateOf(userdata);
+    const ident: usize = @intCast(fdOf(fd));
+    if (!want.read and !want.write) return error.NothingToWatch;
+    // kqueue 一个 kevent 只能盯一个 filter，可读可写要挂两条。
+    // 这里只挂第一条，完成时 `complete` 会按 filter 匹配；同时要两个方向的
+    // 调用方应当用两个 `WatchFd` 节点。
+    const filter: i16 = if (want.read) c.EVFILT.READ else c.EVFILT.WRITE;
+    try state.pending.append(state.alloc, .{
+        .ident = ident,
+        .filter = filter,
+        .kind = .watch,
+        .scratch = scratch,
+    });
+    try evAdd(state, ident, filter, c.EV.ONESHOT);
+    return null;
 }
 
 fn vtRecv(userdata: ?*anyopaque, socket: Handle, buffer: []u8, scratch: *root.Scratch) anyerror!?usize {
@@ -300,12 +318,12 @@ fn complete(state: *State, ev: c.Kevent) ?root.Ref {
         const p = state.pending.items[i];
         if (p.ident != ev.ident or p.filter != ev.filter) continue;
         _ = state.pending.orderedRemove(i);
-        return finishOne(state, p);
+        return finishOne(state, p, ev.flags);
     }
     return null;
 }
 
-fn finishOne(state: *State, p: Pending) root.Ref {
+fn finishOne(state: *State, p: Pending, ev_flags: u16) root.Ref {
     var res: isize = 0;
     switch (p.kind) {
         .recv => res = c.recv(fdOf(p.ident), p.buf.ptr, p.buf.len, 0),
@@ -316,6 +334,18 @@ fn finishOne(state: *State, p: Pending) root.Ref {
             var len: c.socklen_t = @sizeOf(c_int);
             _ = c.getsockopt(fdOf(p.ident), c.SOL.SOCKET, c.SO.ERROR, &err, &len);
             res = if (err == 0) 0 else -err;
+        },
+        .watch => {
+            // 不代收数据，只回填方向。`EVFILT.READ` 就绪 = 可读，
+            // `EV_EOF` 表示对端关闭（此时读会拿到 0 字节）。
+            var r: root.Ready = .{};
+            if (p.filter == c.EVFILT.READ) r.read = true;
+            if (p.filter == c.EVFILT.WRITE) r.write = true;
+            if (ev_flags & c.EV.EOF != 0) r.hangup = true;
+            if (ev_flags & c.EV.ERROR != 0) r.failed = true;
+            if (!r.any()) r.failed = true;
+            // 就绪位经 `Ref.bytes` 回传，由 Loop 统一翻译（见 VTable 注释）。
+            res = @intCast(r.bits());
         },
         .udp_recv => {
             var len: c.socklen_t = @intCast(p.from.len);
@@ -457,6 +487,7 @@ const vtable_storage: root.VTable = .{
     .connect = vtConnect,
     .updateConnect = vtUpdateConnect,
     .cancel = vtCancel,
+    .watchFd = vtWatchFd,
     .close = vtClose,
     .waitBatch = vtWaitBatch,
     .notify = vtNotify,

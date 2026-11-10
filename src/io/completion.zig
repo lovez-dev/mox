@@ -23,6 +23,7 @@ pub const Op = enum {
     net_connect,
     udp_recv,
     udp_send,
+    watch_fd,
     work,
 };
 
@@ -57,6 +58,55 @@ pub const Completion = struct {
     /// 非空时：本操作正常完成会撤销它；它先到点则取消本操作。
     /// 双向链接（配合 `Timer.target`）让撤销是 O(1)、无需额外分配。
     timeout: ?*Completion = null,
+};
+
+/// 就绪方向。`watchFd` 用它在回调里告诉调用方「哪个方向就绪了」。
+///
+/// 用位标志而不是枚举，是因为同一个 fd 可能同时可读可写；调用方一次就能
+/// 拿到全部信息，不必猜。
+pub const Ready = packed struct(u8) {
+    read: bool = false,
+    write: bool = false,
+    /// 对端已关闭 / 出错。多数平台会与 read 同时置位，调用方读一次拿到 EOF。
+    /// 不叫 `error`：那是 Zig 关键字，字段名不能用它。
+    failed: bool = false,
+    hangup: bool = false,
+    _pad: u4 = 0,
+
+    pub fn bits(self: Ready) u8 {
+        return @bitCast(self);
+    }
+
+    pub fn fromBits(v: u8) Ready {
+        return @bitCast(v);
+    }
+
+    /// 任意方向就绪（`error` / `hangup` 也算，否则调用方会永远等下去）。
+    pub fn any(self: Ready) bool {
+        return self.read or self.write or self.failed or self.hangup;
+    }
+};
+
+/// 把任意 fd（管道、串口、stdin）挂进事件循环等就绪。
+///
+/// 与 `NetRecv` / `NetSend` 的区别：那两个**替你收发**并回填字节数，本节点
+/// 只**通知就绪**，数据仍由调用方自己 `read` / `write`。适合 mox 不认识其
+/// 语义的 fd。
+///
+/// 一次性语义：回调触发后这次 watch 就失效，要再等必须重新 `loop.add`。
+/// 这与后端普遍使用的 ONESHOT / EV_ONESHOT 一致，也避免同一个 fd 被重复
+/// 通知淹没循环。
+pub const WatchFd = struct {
+    c: Completion = .{ .op = .watch_fd },
+    fd: Handle,
+    /// 想等哪个方向。
+    want: Ready,
+    /// 回填：实际就绪的方向。回调里读。
+    ready: Ready = .{},
+
+    pub fn init(fd: Handle, want: Ready) WatchFd {
+        return .{ .fd = fd, .want = want };
+    }
 };
 
 pub const Timer = struct {

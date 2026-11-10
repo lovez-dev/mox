@@ -22,7 +22,7 @@ const INVALID_HANDLE = root.INVALID_HANDLE;
 /// 未取完的留在 `state.events` 里，下一次 `waitBatch` 优先消费。
 const MAX_EVENTS = 64;
 
-const Kind = enum { recv, send, accept, connect, udp_recv, udp_send };
+const Kind = enum { recv, send, accept, connect, udp_recv, udp_send, watch };
 
 const Pending = struct {
     fd: i32,
@@ -182,6 +182,24 @@ fn vtAssociate(userdata: ?*anyopaque, socket: Handle, key: usize) anyerror!void 
     _ = userdata;
     _ = socket;
     _ = key;
+}
+
+fn vtWatchFd(userdata: ?*anyopaque, fd: Handle, want: root.Ready, scratch: *root.Scratch) anyerror!?void {
+    const state = stateOf(userdata);
+    const raw = fdOf(fd);
+    var events: u32 = 0;
+    if (want.read) events |= linux.EPOLL.IN;
+    if (want.write) events |= linux.EPOLL.OUT;
+    if (events == 0) return error.NothingToWatch;
+    try state.pending.append(state.alloc, .{
+        .fd = raw,
+        .events = events,
+        // ONESHOT 由 `arm` 统一加；这里关心 ERR/HUP 也会被 `complete` 接受。
+        .kind = .watch,
+        .scratch = scratch,
+    });
+    try arm(state, raw, events);
+    return null;
 }
 
 fn vtRecv(userdata: ?*anyopaque, socket: Handle, buffer: []u8, scratch: *root.Scratch) anyerror!?usize {
@@ -375,12 +393,12 @@ fn complete(state: *State, ev: linux.epoll_event) ?root.Ref {
         // 只消费与就绪方向匹配的待办；方向不符的留给后续事件。
         if (ev.events & p.events == 0 and ev.events & (linux.EPOLL.ERR | linux.EPOLL.HUP) == 0) continue;
         _ = state.pending.orderedRemove(i);
-        return finishOne(state, p);
+        return finishOne(state, p, ev.events);
     }
     return null;
 }
 
-fn finishOne(state: *State, p: Pending) root.Ref {
+fn finishOne(state: *State, p: Pending, ev_events: u32) root.Ref {
     var res: isize = 0;
     switch (p.kind) {
         // std 的 linux 层没有裸 recv/send；用 recvfrom/sendto 配空地址等价实现。
@@ -403,6 +421,19 @@ fn finishOne(state: *State, p: Pending) root.Ref {
                 @ptrCast(@alignCast(p.from.ptr)),
                 &len,
             ));
+        },
+        .watch => {
+            // 不代收数据，只把内核给的方向位翻成 `Ready` 回填给调用方。
+            var r: root.Ready = .{};
+            if (ev_events & linux.EPOLL.IN != 0) r.read = true;
+            if (ev_events & linux.EPOLL.OUT != 0) r.write = true;
+            if (ev_events & linux.EPOLL.ERR != 0) r.failed = true;
+            if (ev_events & linux.EPOLL.HUP != 0) r.hangup = true;
+            // 方向全空时至少置 `error`，避免调用方拿到一个「什么都没发生」
+            // 的完成包后无限重挂。
+            if (!r.any()) r.failed = true;
+            // 就绪位经 `Ref.bytes` 回传，由 Loop 统一翻译（见 VTable 注释）。
+            res = @intCast(r.bits());
         },
         .udp_send => {
             res = @bitCast(linux.sendto(
@@ -456,6 +487,7 @@ const vtable_storage: root.VTable = .{
     .connect = vtConnect,
     .updateConnect = vtUpdateConnect,
     .cancel = vtCancel,
+    .watchFd = vtWatchFd,
     .close = vtClose,
     .waitBatch = vtWaitBatch,
     .notify = vtNotify,
@@ -729,4 +761,39 @@ test "epoll: 同一 fd 连续 recv，ONESHOT 重挂不丢事件" {
     try std.testing.expectEqual(@as(usize, 2), Ctx.rounds);
     try std.testing.expectEqual(@as(usize, 6), Ctx.total);
     uring.closeSocket(Ctx.accepted);
+}
+
+test "epoll: WatchFd 监视管道可读" {
+    var l = root.Loop.init(try create(std.testing.allocator));
+    defer l.deinit();
+
+    var fds: [2]i32 = undefined;
+    const rc = linux.pipe2(&fds, .{ .CLOEXEC = true });
+    try std.testing.expect(@as(isize, @bitCast(rc)) >= 0);
+    defer _ = linux.close(@intCast(fds[0]));
+    defer _ = linux.close(@intCast(fds[1]));
+
+    const Ctx = struct {
+        var done = false;
+        var got: root.Ready = .{};
+        fn cb(lp: *root.Loop, c: *root.Completion) void {
+            const w: *root.WatchFd = @fieldParentPtr("c", c);
+            got = w.ready;
+            done = true;
+            lp.stop();
+        }
+    };
+
+    var w = root.WatchFd.init(@intCast(fds[0]), .{ .read = true });
+    var wd = root.Timer.init(5000);
+    w.c.callback = &Ctx.cb;
+    l.add(&w.c);
+    l.watchdog(&w.c, &wd, 5000);
+
+    try std.testing.expectEqual(@as(isize, 1), @as(isize, @bitCast(linux.write(@intCast(fds[1]), "x", 1))));
+
+    try l.run();
+    try std.testing.expect(Ctx.done);
+    try std.testing.expect(Ctx.got.read);
+    try std.testing.expect(!Ctx.got.write);
 }

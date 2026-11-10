@@ -237,18 +237,20 @@ Work 唤醒、异步 connect、ONESHOT 重挂、后端选择），因此无论 C
 是扩展模板：加第三个能力只需「一个 `cap("...")` 常量 + 一张函数表 + 一个
 节点类型」，`VTable` 与 `Loop` 都不动。**注意**：进程、信号、select、group
 等都只是在设计上被这套机制覆盖；**进程（spawn / 异步等退出 / 进程组）已落地**，
-见下文「子进程」一节；**信号订阅已落地**，见「信号」一节。`select` 明确不做
-（理由见下）；能力表当前是 UDP 与 DNS 两项。
+见下文「子进程」一节；**信号订阅已落地**，见「信号」一节；**任意 fd 就绪监视
+已落地**（`WatchFd`），见「任意 fd 就绪监视」一节。`select` 明确不做（理由见下）；
+能力表当前是 UDP 与 DNS 两项。
 
-### 为什么不做 `select`
+### 为什么不做 `select`，而是 `WatchFd`
 
 `select` 是 `poll` 的受限前身：`FD_SETSIZE` 通常只有 1024，且每次调用都要重传
 整个 fd 集合。更重要的是，mox 的每个后端**本身就是**事件循环——Linux 走
 `epoll_wait` / `io_uring`，macOS 走 `kevent`，Windows 走
 `GetQueuedCompletionStatus`。在事件循环之上再套一层 `select`，等于把已有的
-能力重新实现一遍，而且只能覆盖 1024 个 fd。真要「把任意 fd 挂进循环等可读」，
-正确形状是跨后端统一的 `Loop.watchFd`，而不是 `select`。**目前不提供**，等
-真实用例出现再设计。
+能力重新实现一遍，而且只覆盖 1024 个 fd。
+
+「把任意 fd 挂进循环等可读」这个真需求，正确形状是跨后端统一的 `WatchFd`，
+已落地（见下文「任意 fd 就绪监视」）。
 
 UDP 已作为第一个能力落地（`src/io/udp.zig`）：`Udp.get(loop.io)` 取句柄，
 `Udp.Recv` / `Udp.Send` 优先走后端原生异步数据报（细节见下文「UDP 与 DNS」
@@ -337,6 +339,30 @@ try p.killGroup(15);           // 向整个进程组发 SIGTERM
   放进去，`killGroup` 走 `TerminateJobObject`，能连带杀掉子进程再派生的进程。
 - **`deleteFile` 式的诚实**：`killGroup` 在 POSIX 上要求子进程确实是组长（`new_group
   = true`），否则 `kill(-pid)` 会失败并返回 `error.KillFailed`。
+
+## 任意 fd 就绪监视（`WatchFd`）
+
+管道、串口、`stdin` 这类 mox 不认识语义的 fd，用 `WatchFd` 挂进事件循环：
+
+```zig
+var w = mox_io.WatchFd.init(pipe_read_fd, .{ .read = true });
+w.c.callback = myCb;               // 回调里读 w.ready
+loop.add(&w.c);
+```
+
+与 `NetRecv` / `NetSend` 的分工：那两个**替你收发**并回填字节数；`WatchFd`
+只**通知方向**，数据仍由调用方自己 `read` / `write`。
+
+- **一次性语义**：回调触发后这次 watch 失效，要再等必须重新 `loop.add`。
+  与后端的 ONESHOT / `EV.ONESHOT` / `POLL_ADD` 天然一致。
+- **`Ready` 用位标志**：`read` / `write` / `failed` / `hangup` 可能同时置位，
+  一次就能拿到全部信息。（字段不叫 `error`——那是 Zig 关键字。）
+- **就绪位经 `Ref.bytes` 回传**，由 `Loop` 统一翻译进 `WatchFd.ready`。这样
+  三个后端不必知道节点布局，形状完全一致。
+- **kqueue 一次只盯一个方向**：可读可写要挂两个 `WatchFd` 节点。
+- **Windows 返回 `error.Unsupported`**：IOCP 是完成模型，没有「等就绪」这
+  回事。硬实现要另起 `WSAPoll` 线程桥接，那等于在 IOCP 里塞第二条事件循环，
+  比 `select` 更糟。这是刻意的能力缺口，不是遗漏。
 
 ## 信号
 
@@ -530,7 +556,7 @@ macOS arm64 kqueue 均在 CI 中跑全量测试。
 | 目标 | 架构 | 状态 |
 |---|---|---|
 | Windows（IOCP） | x86_64 / arm64 | 全量测试、真包依赖、性能尺子均在 CI 中运行；子进程四场景本地实跑；`Signal` 明确返回 `Unsupported` |
-| Linux（io_uring + epoll） | x86_64 / arm64 | 同上；`zig build test` 同时跑 epoll 专属测试，WSL 开发机实跑 57/58（含子进程与信号） |
+| Linux（io_uring + epoll） | x86_64 / arm64 | 同上；`zig build test` 同时跑 epoll 专属测试，WSL 开发机实跑 59/61（含子进程、信号与 WatchFd；uring 与 epoll 双后端各跑一遍） |
 | macOS（kqueue） | arm64 | CI 真跑全量 kqueue 运行时测试，逐条隔离 + 20 秒看门狗 |
 
 BSD 不在覆盖范围内。

@@ -192,6 +192,16 @@ pub const VTable = struct {
     /// 循环收到后会因 `cancelled` 标志直接丢弃，不回调。
     cancel: *const fn (userdata: ?*anyopaque, socket: Handle, scratch: *Scratch) void,
 
+    /// 挂一个任意 fd 等就绪。回调**只通知方向**，不代收数据（见 `WatchFd`）。
+    ///
+    /// 就绪位经 `Ref.bytes` 回传（`Ready.bits()`），由 `Loop` 统一翻译进
+    /// `WatchFd.ready` —— 后端不必知道节点布局，三个后端形状一致。
+    ///
+    /// 整槽为 `?` 是为了 Windows 能置 `null`：IOCP 是完成模型，没有「等就绪」
+    /// 这回事，硬实现要另起 `WSAPoll` 线程，等于塞第二条事件循环。为 `null`
+    /// 时调用方拿到 `error.Unsupported`。
+    watchFd: ?*const fn (userdata: ?*anyopaque, fd: Handle, want: Ready, scratch: *Scratch) anyerror!?void = null,
+
     /// 关闭套接字。
     close: *const fn (userdata: ?*anyopaque, socket: Handle) void,
 
@@ -211,6 +221,8 @@ const completion_mod = @import("completion.zig");
 const loop_mod = @import("loop.zig");
 
 pub const Completion = completion_mod.Completion;
+pub const Ready = completion_mod.Ready;
+pub const WatchFd = completion_mod.WatchFd;
 pub const Callback = completion_mod.Callback;
 pub const Op = completion_mod.Op;
 pub const Timer = completion_mod.Timer;
