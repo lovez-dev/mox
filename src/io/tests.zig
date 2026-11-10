@@ -1459,3 +1459,108 @@ test "symLink 创建链接，stat 跟随到目标文件" {
     try std.testing.expectEqual(root.FileKind.file, st.kind);
     try std.testing.expectEqual(@as(u64, 5), st.size);
 }
+
+// ===== Unix domain socket =====
+//
+// Windows 不支持（IOCP 后端整组槽位为 `null`），那条路径由第一条测试覆盖。
+
+test "Unix socket 在 Windows 上返回 Unsupported" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var l = try testLoop();
+    defer l.deinit();
+    try std.testing.expectError(error.Unsupported, l.createUnixSocket());
+}
+
+test "Unix socket 可 bind、listen、accept、收发数据" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "uds");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    // 路径必须短：`Scratch` 只有 64 字节，UDS sockaddr 结构头占 2 字节。
+    var spath_buf: [80]u8 = undefined;
+    const sock_path = try std.fmt.bufPrint(&spath_buf, "{s}/s.sock", .{dir});
+    if (sock_path.len > 60) return error.SkipZigTest; // 临时目录路径太长，跳过
+    defer l.deleteFile(sock_path);
+
+    const listener = try l.createUnixSocket();
+    defer l.close(listener);
+    try l.bindUnix(listener, sock_path);
+    try l.listen(listener, 8);
+
+    const Ctx = struct {
+        var total: usize = 0;
+        var buf: [16]u8 = undefined;
+        var recv: root.NetRecv = undefined;
+        var accepted: Handle = INVALID_HANDLE;
+
+        fn onAccept(lp: *Loop, c: *Completion) void {
+            const a: *root.NetAccept = @fieldParentPtr("c", c);
+            accepted = a.getResult() catch {
+                lp.stop();
+                return;
+            };
+            recv = root.NetRecv.init(accepted, &buf);
+            recv.c.callback = &onRecv;
+            lp.add(&recv.c);
+        }
+        fn onRecv(lp: *Loop, c: *Completion) void {
+            const r: *root.NetRecv = @fieldParentPtr("c", c);
+            total = r.getResult() catch 0;
+            lp.stop();
+        }
+    };
+
+    // `NetAccept` 要求一个与监听同族、尚未绑定的 socket 作为接收容器
+    // （与 TCP 的用法一致；io_uring/kqueue 上内核会填它）。
+    const accept_sock = try l.createUnixSocket();
+    defer l.close(accept_sock);
+    var accept = root.NetAccept.init(listener, accept_sock);
+    var wd = Timer.init(5000);
+    accept.c.callback = &Ctx.onAccept;
+    l.add(&accept.c);
+    l.watchdog(&accept.c, &wd, 5000);
+
+    // 客户端在另一线程连上来写一行。
+    const Client = struct {
+        fn run(path: []const u8) void {
+            // 客户端只用阻塞辅助函数，不碰事件循环。Linux 不链 libc，
+            // 所以按平台分派（与 `Pipe` 辅助同一套理由）。
+            if (builtin.os.tag == .linux) {
+                const lx = std.os.linux;
+                const fd = lx.socket(lx.AF.UNIX, lx.SOCK.STREAM, 0);
+                const fd_s: isize = @bitCast(fd);
+                if (fd_s < 0) return;
+                defer _ = lx.close(@intCast(fd_s));
+                var sa: lx.sockaddr.un = undefined;
+                @memset(std.mem.asBytes(&sa), 0);
+                sa.family = lx.AF.UNIX;
+                @memcpy(sa.path[0..path.len], path);
+                const len: lx.socklen_t = @intCast(@offsetOf(lx.sockaddr.un, "path") + path.len + 1);
+                if (@as(isize, @bitCast(lx.connect(@intCast(fd_s), @ptrCast(&sa), len))) != 0) return;
+                _ = lx.write(@intCast(fd_s), "hi", 2);
+            } else {
+                const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+                if (fd < 0) return;
+                defer _ = std.c.close(fd);
+                var sa: std.c.sockaddr.un = undefined;
+                @memset(std.mem.asBytes(&sa), 0);
+                sa.family = std.c.AF.UNIX;
+                @memcpy(sa.path[0..path.len], path);
+                sa.len = @intCast(@offsetOf(std.c.sockaddr.un, "path") + path.len + 1);
+                if (std.c.connect(fd, @ptrCast(&sa), sa.len) != 0) return;
+                _ = std.c.write(fd, "hi", 2);
+            }
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Client.run, .{sock_path});
+    defer t.join();
+
+    try l.run();
+    try std.testing.expectEqual(@as(usize, 2), Ctx.total);
+}

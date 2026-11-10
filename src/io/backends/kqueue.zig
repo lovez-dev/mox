@@ -378,6 +378,53 @@ fn finishOne(state: *State, p: Pending, ev_flags: u16) root.Ref {
     return state.ref;
 }
 
+// ---- Unix domain socket ---------------------------------------------------
+
+/// 把路径编成 `sockaddr_un`（BSD 带 `len` 字段）。返回长度。
+fn buildUnixSockaddr(path: []const u8, storage: *c.sockaddr.un) !c.socklen_t {
+    if (path.len == 0) return error.InvalidPath;
+    if (path.len >= storage.path.len) return error.NameTooLong;
+    storage.family = c.AF.UNIX;
+    @memcpy(storage.path[0..path.len], path);
+    storage.path[path.len] = 0;
+    // BSD 的 `sun_len` 由调用方填，内核会校验。
+    storage.len = @intCast(@offsetOf(c.sockaddr.un, "path") + path.len + 1);
+    return @intCast(@offsetOf(c.sockaddr.un, "path") + path.len + 1);
+}
+
+fn vtCreateUnix(userdata: ?*anyopaque) anyerror!root.Handle {
+    _ = userdata;
+    return createSocket(@intCast(c.AF.UNIX), @intCast(c.SOCK.STREAM), 0);
+}
+
+fn vtBindUnix(userdata: ?*anyopaque, socket: root.Handle, path: []const u8) anyerror!void {
+    _ = userdata;
+    var sa: c.sockaddr.un = undefined;
+    const len = try buildUnixSockaddr(path, &sa);
+    if (c.bind(fdOf(socket), @ptrCast(&sa), len) != 0) {
+        return switch (std.c._errno().*) {
+            @backingInt(c.E.ADDRINUSE) => error.PathAlreadyExists,
+            else => error.BindFailed,
+        };
+    }
+}
+
+fn vtConnectUnix(userdata: ?*anyopaque, socket: root.Handle, path: []const u8, scratch: *root.Scratch) anyerror!?void {
+    _ = userdata;
+    var sa: c.sockaddr.un = undefined;
+    const len = try buildUnixSockaddr(path, &sa);
+    // 与 uring 一致：`sockaddr_un` 必须活到内核读完，塞进 `Scratch`。
+    if (len > @sizeOf(root.Scratch)) return error.NameTooLong;
+    @memcpy(std.mem.asBytes(scratch)[0..len], std.mem.asBytes(&sa)[0..len]);
+    // kqueue 后端没有异步 connect 的 SQE 可用，直接调阻塞 connect 后由
+    // `evAdd` 注册写就绪；非阻塞 socket 上 connect 会返回 EINPROGRESS，
+    // 这是「已发起」而非失败。
+    const rc = c.connect(fdOf(socket), @ptrCast(@alignCast(scratch)), len);
+    if (rc == 0) return {}; // 立即连上（本机 UDS 常见）
+    if (std.c._errno().* == @backingInt(c.E.INPROGRESS)) return null;
+    return error.ConnectFailed;
+}
+
 fn vtNotify(userdata: ?*anyopaque) void {
     const state = stateOf(userdata);
     var change = [_]c.Kevent{.{
@@ -525,6 +572,9 @@ const vtable_storage: root.VTable = .{
     .updateConnect = vtUpdateConnect,
     .cancel = vtCancel,
     .watchFd = vtWatchFd,
+    .createUnix = vtCreateUnix,
+    .bindUnix = vtBindUnix,
+    .connectUnix = vtConnectUnix,
     .close = vtClose,
     .waitBatch = vtWaitBatch,
     .notify = vtNotify,

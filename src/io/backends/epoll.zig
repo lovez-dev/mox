@@ -216,6 +216,32 @@ fn vtAssociate(userdata: ?*anyopaque, socket: Handle, key: usize) anyerror!void 
     _ = key;
 }
 
+fn vtCreateUnix(userdata: ?*anyopaque) anyerror!root.Handle {
+    _ = userdata;
+    return uring.vtCreateUnix(null);
+}
+
+fn vtBindUnix(userdata: ?*anyopaque, socket: root.Handle, path: []const u8) anyerror!void {
+    _ = userdata;
+    return uring.vtBindUnix(null, socket, path);
+}
+
+/// epoll 是就绪模型，没有「异步 connect」：非阻塞 `connect` 返回 EINPROGRESS
+/// 后要等 `EPOLL.OUT`，由调用方通过 `WatchFd` 或 `NetConnect` 语义处理。
+/// 这里直接做非阻塞 connect，立即连上（本机 UDS 常见）就返回，否则返回 null。
+fn vtConnectUnix(userdata: ?*anyopaque, socket: root.Handle, path: []const u8, scratch: *root.Scratch) anyerror!?void {
+    _ = userdata;
+    var sa: linux.sockaddr.un = undefined;
+    const len = try uring.buildUnixSockaddrPub(path, &sa);
+    if (len > @sizeOf(root.Scratch)) return error.NameTooLong;
+    @memcpy(std.mem.asBytes(scratch)[0..len], std.mem.asBytes(&sa)[0..len]);
+    const rc = linux.connect(fdOf(socket), @ptrCast(@alignCast(scratch)), len);
+    const rc_s = signed(rc);
+    if (rc_s == 0) return {};
+    if (rc_s == -@as(isize, @backingInt(linux.E.INPROGRESS))) return null;
+    return error.ConnectFailed;
+}
+
 fn vtWatchFd(userdata: ?*anyopaque, fd: Handle, want: root.Ready, scratch: *root.Scratch) anyerror!?void {
     const state = stateOf(userdata);
     const raw = fdOf(fd);
@@ -526,6 +552,9 @@ const vtable_storage: root.VTable = .{
     .updateConnect = vtUpdateConnect,
     .cancel = vtCancel,
     .watchFd = vtWatchFd,
+    .createUnix = vtCreateUnix,
+    .bindUnix = vtBindUnix,
+    .connectUnix = vtConnectUnix,
     .close = vtClose,
     .waitBatch = vtWaitBatch,
     .notify = vtNotify,

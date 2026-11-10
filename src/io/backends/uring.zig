@@ -414,6 +414,61 @@ fn vtWatchFd(userdata: ?*anyopaque, fd: Handle, want: root.Ready, scratch: *root
     return null;
 }
 
+// ---- Unix domain socket ---------------------------------------------------
+
+/// 把路径编成 `sockaddr_un`。返回长度（含 NUL，内核要求）。
+/// 路径超长（`sun_path` 108 字节）直接报错，不截断——截断会连到别的 socket。
+pub fn buildUnixSockaddrPub(path: []const u8, storage: *linux.sockaddr.un) !linux.socklen_t {
+    return buildUnixSockaddr(path, storage);
+}
+
+fn buildUnixSockaddr(path: []const u8, storage: *linux.sockaddr.un) !linux.socklen_t {
+    // 留一个字节给 NUL。
+    if (path.len >= storage.path.len) return error.NameTooLong;
+    if (path.len == 0) return error.InvalidPath;
+    storage.family = linux.AF.UNIX;
+    @memcpy(storage.path[0..path.len], path);
+    storage.path[path.len] = 0;
+    // 长度按「结构头 + 路径 + NUL」算，不传整个 108 字节，否则内核会读到
+    // 缓冲区里的垃圾字节。
+    return @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + 1);
+}
+
+pub fn vtCreateUnix(userdata: ?*anyopaque) anyerror!root.Handle {
+    _ = userdata;
+    return createSocket(linux.AF.UNIX, linux.SOCK.STREAM, 0);
+}
+
+pub fn vtBindUnix(userdata: ?*anyopaque, socket: root.Handle, path: []const u8) anyerror!void {
+    _ = userdata;
+    var sa: linux.sockaddr.un = undefined;
+    const len = try buildUnixSockaddr(path, &sa);
+    const rc_s = signed(linux.bind(fdOf(socket), @ptrCast(&sa), len));
+    if (rc_s < 0) {
+        if (rc_s == -@as(isize, @backingInt(linux.E.ADDRINUSE))) return error.PathAlreadyExists;
+        return error.BindFailed;
+    }
+}
+
+pub fn vtConnectUnix(userdata: ?*anyopaque, socket: root.Handle, path: []const u8, scratch: *root.Scratch) anyerror!?void {
+    const state = stateOf(userdata);
+    var sa: linux.sockaddr.un = undefined;
+    const len = try buildUnixSockaddr(path, &sa);
+    // UDS 的 `sockaddr_un` 必须活到内核读完，不能放栈上。`Scratch` 只有
+    // 64 字节，扣掉结构头（2 字节 family）后路径上限约 62 字节。
+    //
+    // 这是**刻意的限制**而不是疏忽：要支持更长的路径得给 `UnixConnect`
+    // 节点加一块专用缓冲（像 `UdpRecv.hdr` 那样），代价是节点变大。当前
+    // 62 字节覆盖 `/tmp/xxx.sock`、`/var/run/xxx.sock` 这类常见路径；超出
+    // 时明确报 `NameTooLong`，而不是悄悄截断连到别的 socket。
+    if (len > @sizeOf(root.Scratch)) return error.NameTooLong;
+    @memcpy(std.mem.asBytes(scratch)[0..len], std.mem.asBytes(&sa)[0..len]);
+    const sqe = getSqe(state);
+    sqe.prep_connect(fdOf(socket), @ptrCast(@alignCast(scratch)), len);
+    sqe.user_data = @intFromPtr(scratch);
+    return null;
+}
+
 fn vtNotify(userdata: ?*anyopaque) void {
     const state = stateOf(userdata);
     var one: u64 = 1;
@@ -552,6 +607,9 @@ const vtable_storage: root.VTable = .{
     .updateConnect = vtUpdateConnect,
     .cancel = vtCancel,
     .watchFd = vtWatchFd,
+    .createUnix = vtCreateUnix,
+    .bindUnix = vtBindUnix,
+    .connectUnix = vtConnectUnix,
     .close = vtClose,
     .waitBatch = vtWaitBatch,
     .notify = vtNotify,

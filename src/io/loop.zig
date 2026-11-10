@@ -380,6 +380,25 @@ pub const Loop = struct {
         try self.io.vtable.associate(self.io.userdata, socket, key);
     }
 
+    /// 建一个 Unix domain socket（`AF_UNIX` + `SOCK_STREAM`）。
+    /// 后端不支持时（Windows）返回 `error.Unsupported`。
+    pub fn createUnixSocket(self: *Loop) !Handle {
+        const f = self.io.vtable.createUnix orelse return error.Unsupported;
+        return f(self.io.userdata);
+    }
+
+    /// 把 UDS 绑到文件系统路径。路径已存在时返回 `error.PathAlreadyExists`。
+    pub fn bindUnix(self: *Loop, socket: Handle, path: []const u8) !void {
+        const f = self.io.vtable.bindUnix orelse return error.Unsupported;
+        return f(self.io.userdata, socket, path);
+    }
+
+    /// 连到 UDS。不支持时返回 `error.Unsupported`。
+    pub fn connectUnix(self: *Loop, socket: Handle, path: []const u8, scratch: *Scratch) !void {
+        const f = self.io.vtable.connectUnix orelse return error.Unsupported;
+        _ = try f(self.io.userdata, socket, path, scratch);
+    }
+
     /// 创建一个与 `address` 同族、可用于重叠 I/O 的 TCP 套接字。
     pub fn createSocket(self: *Loop, address: std.Io.net.IpAddress) !Handle {
         return self.io.vtable.createSocket(self.io.userdata, address);

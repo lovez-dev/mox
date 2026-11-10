@@ -238,6 +238,24 @@ pub const VTable = struct {
     /// 时调用方拿到 `error.Unsupported`。
     watchFd: ?*const fn (userdata: ?*anyopaque, fd: Handle, want: Ready, scratch: *Scratch) anyerror!?void = null,
 
+    // ---- Unix domain socket（可选：Windows 上整组为 `null`） -------------
+    //
+    // UDS 的地址是文件系统路径，与 `IpAddress` 完全不同的类型，所以不复用
+    // `createSocket` / `bind` / `connect` 三个槽位，而是单开一组。可选是为了
+    // 让不支持的后端（Windows）整组置 `null`，调用方拿 `error.Unsupported`
+    // 降级，而不是被迫实现一个假动作。
+    //
+    // 收发复用 `recv` / `send` / `accept`：连接建立后它们与 TCP 同形。
+
+    /// 建一个 `AF_UNIX` / `SOCK_STREAM` 套接字。
+    createUnix: ?*const fn (userdata: ?*anyopaque) anyerror!Handle = null,
+    /// 把 UDS 绑到文件系统路径。路径已存在时后端应报 `error.PathAlreadyExists`
+    /// （调用方通常先 `deleteFile` 清掉残留的 socket 文件）。
+    bindUnix: ?*const fn (userdata: ?*anyopaque, socket: Handle, path: []const u8) anyerror!void = null,
+    /// 异步连到 UDS。返回 `null` 表示尚未完成，完成经 `wait` 投递
+    /// （与 TCP 的 `connect` 同语义）。
+    connectUnix: ?*const fn (userdata: ?*anyopaque, socket: Handle, path: []const u8, scratch: *Scratch) anyerror!?void = null,
+
     /// 关闭套接字。
     close: *const fn (userdata: ?*anyopaque, socket: Handle) void,
 
