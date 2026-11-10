@@ -169,7 +169,60 @@ jobs:
       # kqueue 后端此前从未在任何机器上运行过，这里首次让它真跑。
       # 若失败，说明发现了真实缺陷而非环境噪音 —— 这正是要买的信息。
       - name: mox + mox_io 全量测试（kqueue 运行时）
-        run: zig build test --summary all
+        shell: bash
+        run: |
+          # 带 180 秒看门狗：kqueue 是首次真跑，万一某个测试挂死，
+          # 光有一个「超时」失败没有任何定位价值。这里把最后启动的
+          # 测试名写成注解（公开仓库可通过 check-runs API 读回），
+          # 同时把尾部日志写进 job summary（公开可读）。
+          #
+          # 只用 bash 原生能力：不依赖 python3 / timeout（GNU coreutils
+          # 在 macOS runner 上不保证存在）。
+          set +e
+          log=/tmp/kqueue-test.log
+          : >"$log"
+          # 两步：先 `zig build test` 管住两个模块的汇总结果，再单独
+          # 编译 io 测试二进制逐条跑 —— `--summary all` 只给汇总，
+          # 挂死时看不出是哪条测试，逐条进度才是定位依据。
+          zig build test --summary all >"$log" 2>&1 &
+          runner=$!
+          ( sleep 180; kill -9 "$runner" 2>/dev/null ) &
+          watchdog=$!
+          wait "$runner"
+          rc=$?
+          kill "$watchdog" 2>/dev/null
+          wait "$watchdog" 2>/dev/null
+          if [ "$rc" -eq 137 ]; then rc=124; fi
+          echo "zig build test rc=$rc"
+          tail -40 "$log"
+
+          # 逐条进度（测试二进制自己打印 `N/M 模块.test.名字...`）。
+          echo "== io 测试逐条进度 =="
+          zig test src/io/io.zig --test-no-exec -femit-bin=/tmp/io-test >/dev/null 2>&1
+          /tmp/io-test >"$log" 2>&1 &
+          runner=$!
+          ( sleep 120; kill -9 "$runner" 2>/dev/null ) &
+          watchdog=$!
+          wait "$runner"
+          rc2=$?
+          kill "$watchdog" 2>/dev/null
+          wait "$watchdog" 2>/dev/null
+          if [ "$rc2" -eq 137 ]; then rc2=124; fi
+          echo "io 逐条 rc=$rc2"
+          tail -20 "$log"
+          if [ "$rc" -eq 0 ] && [ "$rc2" -ne 0 ]; then rc="$rc2"; fi
+          {
+            echo "### kqueue 全量测试诊断（zig build test=$rc, io 逐条=$rc2）"
+            echo '```'
+            tail -45 "$log"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+          # 只认 io 逐条日志里的进度行，那才是「挂在哪一条」的答案。
+          if [ "$rc" -ne 0 ]; then
+            last=$(grep -oE '[0-9]+/[0-9]+ [^.]*\.test\.[^.]+' "$log" | tail -1)
+            echo "::error::kqueue 失败或超时（zig build test=$rc, io 逐条=$rc2）；最后启动的测试: ${last:-未知}"
+          fi
+          exit "$rc"
 
       - name: 单独跑 io 模块根测试
         run: zig test src/io/io.zig

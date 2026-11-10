@@ -24,6 +24,10 @@ const INVALID_HANDLE = root.INVALID_HANDLE;
 
 const Kind = enum { recv, send, accept, connect, udp_recv, udp_send };
 
+/// `EVFILT_USER` 唤醒源的 ident。固定值即可，只要不与真实 fd 冲突；
+/// 真实 fd 从 3 起，用 1 是安全的。
+const NOTIFY_IDENT = 1;
+
 const Pending = struct {
     ident: usize,
     filter: i16,
@@ -341,9 +345,11 @@ fn finishOne(state: *State, p: Pending) root.Ref {
 fn vtNotify(userdata: ?*anyopaque) void {
     const state = stateOf(userdata);
     var change = [_]c.Kevent{.{
-        .ident = 1,
+        .ident = NOTIFY_IDENT,
         .filter = c.EVFILT.USER,
-        .flags = c.EV.ADD | c.EV.CLEAR,
+        // 该过滤器已在 `create` 里 EV.ADD 过，这里只触发；再带 EV.ADD 会
+        // 以 EEXIST 失败，唤醒就丢了。
+        .flags = c.EV.CLEAR,
         .fflags = c.NOTE.TRIGGER,
         .data = 0,
         .udata = 0,
@@ -426,6 +432,18 @@ pub fn create(alloc: std.mem.Allocator) !root.Io {
     const kq = c.kqueue();
     if (kq < 0) return error.KqueueFailed;
     state.* = .{ .alloc = alloc, .kq = kq };
+    // 必须先在这个 kq 上注册 `EVFILT_USER`，`vtNotify` 才能用它唤醒
+    // `waitBatch`。没有这一步，notify 会以 ENOENT 失败且被丢弃 —— 跨线程
+    // `submit` 与 `Work` 完成就再也叫不醒循环，表现为整个进程挂死。
+    var reg = [_]c.Kevent{.{
+        .ident = NOTIFY_IDENT,
+        .filter = c.EVFILT.USER,
+        .flags = c.EV.ADD | c.EV.CLEAR,
+        .fflags = 0,
+        .data = 0,
+        .udata = 0,
+    }};
+    if (c.kevent(kq, &reg, 1, undefined, 0, null) < 0) return error.KqueueFailed;
     return .{ .userdata = state, .vtable = &vtable_storage };
 }
 
