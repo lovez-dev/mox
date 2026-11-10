@@ -24,6 +24,8 @@ pub const Op = enum {
     udp_recv,
     udp_send,
     watch_fd,
+    file_read,
+    file_write,
     work,
 };
 
@@ -106,6 +108,54 @@ pub const WatchFd = struct {
 
     pub fn init(fd: Handle, want: Ready) WatchFd {
         return .{ .fd = fd, .want = want };
+    }
+};
+
+/// io_uring 原生异步文件读。**只在 io_uring 后端可用**（其它后端
+/// `vtable.readFileAsync` 为 `null`，调用方应回落 `ReadFile` 的 `Work` 版本）。
+///
+/// 内部把 openat → read → close 三条 SQE 链起来（`IOSQE_IO_LINK`），一次
+/// 提交、一次完成。中间 fd 由内核在链内传递，不经过用户态。
+pub const ReadFileAsync = struct {
+    c: Completion = .{ .op = .file_read },
+    path: []const u8,
+    buf: []u8,
+    /// 起始偏移；0 表示从头读。
+    offset: u64 = 0,
+    /// 回填：实际读到的字节数。
+    len: usize = 0,
+
+    /// `path` 必须 NUL 结尾（`openat` 的 SQE 直接读这块内存），且活到
+    /// 回调触发为止。用 `initZ` 从普通切片复制到节点自带的缓冲更省心。
+    pub fn init(path: [:0]const u8, buf: []u8) ReadFileAsync {
+        return .{ .path = path, .buf = buf };
+    }
+
+    pub fn initAt(path: [:0]const u8, offset: u64, buf: []u8) ReadFileAsync {
+        return .{ .path = path, .buf = buf, .offset = offset };
+    }
+
+    pub fn getResult(self: *const ReadFileAsync) ![]const u8 {
+        if (self.c.err) |e| return e;
+        return self.buf[0..self.len];
+    }
+};
+
+/// io_uring 原生异步文件写（覆盖既有内容）。同 `ReadFileAsync`，仅 io_uring。
+pub const WriteFileAsync = struct {
+    c: Completion = .{ .op = .file_write },
+    path: []const u8,
+    bytes: []const u8,
+    offset: u64 = 0,
+    written: usize = 0,
+
+    pub fn init(path: [:0]const u8, bytes: []const u8) WriteFileAsync {
+        return .{ .path = path, .bytes = bytes };
+    }
+
+    pub fn getResult(self: *const WriteFileAsync) !usize {
+        if (self.c.err) |e| return e;
+        return self.written;
     }
 };
 

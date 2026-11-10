@@ -256,6 +256,16 @@ pub const VTable = struct {
     /// （与 TCP 的 `connect` 同语义）。
     connectUnix: ?*const fn (userdata: ?*anyopaque, socket: Handle, path: []const u8, scratch: *Scratch) anyerror!?void = null,
 
+    // ---- 原生异步文件 I/O（可选：只有 io_uring 提供） --------------------
+    //
+    // 其它后端为 `null`，调用方回落到 `ReadFile` / `WriteFile` 的 `Work` 版本。
+    // 这是「有则更好、无则照常」的能力，不是必需的。
+
+    /// 发起异步读文件：`path` 必须 NUL 结尾且活到完成。
+    readFileAsync: ?*const fn (userdata: ?*anyopaque, path: [*:0]const u8, offset: u64, buf: []u8, scratch: *Scratch) anyerror!?void = null,
+    /// 发起异步写文件（覆盖）。
+    writeFileAsync: ?*const fn (userdata: ?*anyopaque, path: [*:0]const u8, offset: u64, bytes: []const u8, scratch: *Scratch) anyerror!?void = null,
+
     /// 关闭套接字。
     close: *const fn (userdata: ?*anyopaque, socket: Handle) void,
 
@@ -276,6 +286,8 @@ const loop_mod = @import("loop.zig");
 
 pub const Completion = completion_mod.Completion;
 pub const Ready = completion_mod.Ready;
+pub const ReadFileAsync = completion_mod.ReadFileAsync;
+pub const WriteFileAsync = completion_mod.WriteFileAsync;
 pub const WatchFd = completion_mod.WatchFd;
 pub const Callback = completion_mod.Callback;
 pub const Op = completion_mod.Op;

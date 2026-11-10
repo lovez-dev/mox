@@ -221,6 +221,36 @@ pub const Loop = struct {
                 self.pushReady(c);
             },
 
+            .file_read => {
+                const f: *root.ReadFileAsync = @fieldParentPtr("c", c);
+                const vf = self.io.vtable.readFileAsync orelse {
+                    c.err = error.Unsupported;
+                    self.pushReady(c);
+                    return;
+                };
+                const r = vf(self.io.userdata, @ptrCast(f.path.ptr), f.offset, f.buf, &c.ov) catch |e| {
+                    c.err = e;
+                    self.pushReady(c);
+                    return;
+                };
+                if (r) |_| self.pushReady(c);
+            },
+
+            .file_write => {
+                const f: *root.WriteFileAsync = @fieldParentPtr("c", c);
+                const vf = self.io.vtable.writeFileAsync orelse {
+                    c.err = error.Unsupported;
+                    self.pushReady(c);
+                    return;
+                };
+                const r = vf(self.io.userdata, @ptrCast(f.path.ptr), f.offset, f.bytes, &c.ov) catch |e| {
+                    c.err = e;
+                    self.pushReady(c);
+                    return;
+                };
+                if (r) |_| self.pushReady(c);
+            },
+
             .watch_fd => {
                 const w: *root.WatchFd = @fieldParentPtr("c", c);
                 const vtable_fn = self.io.vtable.watchFd orelse {
@@ -288,6 +318,14 @@ pub const Loop = struct {
             const a: *NetAccept = @fieldParentPtr("c", c);
             if (ref.new_handle != INVALID_HANDLE) a.accept_socket = ref.new_handle;
             self.io.vtable.updateAccept(self.io.userdata, a.listen, a.accept_socket);
+        }
+        if (c.op == .file_read and c.err == null) {
+            const f: *root.ReadFileAsync = @fieldParentPtr("c", c);
+            f.len = ref.bytes;
+        }
+        if (c.op == .file_write and c.err == null) {
+            const f: *root.WriteFileAsync = @fieldParentPtr("c", c);
+            f.written = ref.bytes;
         }
         if (c.op == .watch_fd and c.err == null) {
             const w: *root.WatchFd = @fieldParentPtr("c", c);

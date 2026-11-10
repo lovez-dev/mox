@@ -365,6 +365,11 @@ fn reapCq(state: *State, refs: []root.Ref) usize {
     while (n < refs.len) {
         const cqe = peekCqe(state) orelse break;
         if (cqe.user_data != 0) {
+            // 文件 I/O 完成：同步关掉 openat 开的 fd（纳秒级，不必异步）。
+            if (cqe.user_data & FILE_TAG != 0) {
+                const sp: *root.Scratch = @ptrFromInt(cqe.user_data & ~@as(u64, 7));
+                _ = linux.close(takeFd(sp));
+            }
             refs[n] = fillRef(cqe);
             n += 1;
         }
@@ -377,6 +382,7 @@ fn fillRef(cqe: *const linux.io_uring_cqe) root.Ref {
     const tagged = cqe.user_data;
     const is_accept = tagged & 1 != 0;
     const is_watch = tagged & 2 != 0;
+    // 文件 I/O 的 `res` 直接就是读写字节数，不需要像 `POLL_ADD` 那样翻译。
     const res = cqe.res;
     var bytes: usize = if (res >= 0) @intCast(res) else 0;
     if (is_watch and res >= 0) {
@@ -390,7 +396,7 @@ fn fillRef(cqe: *const linux.io_uring_cqe) root.Ref {
         bytes = r.bits();
     }
     return .{
-        .scratch = @ptrFromInt(tagged & ~@as(u64, 3)),
+        .scratch = @ptrFromInt(tagged & ~@as(u64, 7)),
         .bytes = bytes,
         .failed = res < 0,
         .new_handle = if (is_accept and res >= 0) @intCast(res) else root.INVALID_HANDLE,
@@ -466,6 +472,88 @@ pub fn vtConnectUnix(userdata: ?*anyopaque, socket: root.Handle, path: []const u
     const sqe = getSqe(state);
     sqe.prep_connect(fdOf(socket), @ptrCast(@alignCast(scratch)), len);
     sqe.user_data = @intFromPtr(scratch);
+    return null;
+}
+
+// ---- 原生异步文件 I/O（io_uring 独有） ------------------------------------
+//
+// 设计取舍：`openat` 与 `close` 同步做，只有 `read` / `write` 异步。
+//
+// 为什么 openat 不异步？io_uring 的 `IOSQE_IO_LINK` **不会**把前一条的返回值
+// 传给后一条的 fd 字段——fd 必须是提交时已知的具体值。（曾按「链内传递」
+// 实现，read 拿 -1 直接失败，实测证伪。）
+//
+// 为什么 close 不链在 read 后面？实测链式 close 的 CQE 回 `-125`
+// （ECANCELED），fd 反而泄漏。`open` / `close` 都是元数据操作，纳秒到微秒级，
+// 留在同步侧没有可观测代价；真正慢的是 read/write 的数据传输，那部分是真异步。
+//
+// fd 的去向：提交时把 fd 写进 `Scratch` 的前 4 字节（`Scratch` 只在这一处用
+// 前 4 字节，TCP/UDP 路径用整块装 sockaddr，互不干扰），reap 时按标记位取出
+// 并同步 close。
+
+/// 文件 I/O 的 CQE 标记位（bit2）。TCP accept 用 bit0、WatchFd 用 bit1。
+const FILE_TAG: u64 = 4;
+
+/// 同步 `openat`，失败翻译成 `error`。
+fn openSync(path: [*:0]const u8, flags: linux.O, mode: linux.mode_t) !linux.fd_t {
+    const rc = linux.openat(linux.AT.FDCWD, path, flags, mode);
+    const rc_s = signed(rc);
+    if (rc_s < 0) return switch (-rc_s) {
+        @backingInt(linux.E.NOENT) => error.FileNotFound,
+        @backingInt(linux.E.ACCES) => error.AccessDenied,
+        @backingInt(linux.E.ISDIR) => error.IsDir,
+        @backingInt(linux.E.NAMETOOLONG) => error.NameTooLong,
+        else => error.OpenFailed,
+    };
+    return @intCast(rc_s);
+}
+
+/// 把 fd 记进 `Scratch` 前 4 字节，供 reap 时同步 close。
+fn stashFd(scratch: *root.Scratch, fd: linux.fd_t) void {
+    std.mem.writeInt(u32, scratch.bytes[0..4], @bitCast(fd), .little);
+}
+
+fn takeFd(scratch: *root.Scratch) linux.fd_t {
+    return @bitCast(std.mem.readInt(u32, scratch.bytes[0..4], .little));
+}
+
+fn vtReadFileAsync(
+    userdata: ?*anyopaque,
+    path: [*:0]const u8,
+    offset: u64,
+    buf: []u8,
+    scratch: *root.Scratch,
+) anyerror!?void {
+    const state = stateOf(userdata);
+    const fd = try openSync(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    errdefer _ = linux.close(fd);
+    stashFd(scratch, fd);
+
+    const sqe = getSqe(state);
+    sqe.prep_read(fd, buf, offset);
+    sqe.user_data = @intFromPtr(scratch) | FILE_TAG;
+    return null;
+}
+
+fn vtWriteFileAsync(
+    userdata: ?*anyopaque,
+    path: [*:0]const u8,
+    offset: u64,
+    bytes: []const u8,
+    scratch: *root.Scratch,
+) anyerror!?void {
+    const state = stateOf(userdata);
+    const fd = try openSync(
+        path,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true },
+        0o644,
+    );
+    errdefer _ = linux.close(fd);
+    stashFd(scratch, fd);
+
+    const sqe = getSqe(state);
+    sqe.prep_write(fd, bytes, offset);
+    sqe.user_data = @intFromPtr(scratch) | FILE_TAG;
     return null;
 }
 
@@ -607,6 +695,8 @@ const vtable_storage: root.VTable = .{
     .updateConnect = vtUpdateConnect,
     .cancel = vtCancel,
     .watchFd = vtWatchFd,
+    .readFileAsync = vtReadFileAsync,
+    .writeFileAsync = vtWriteFileAsync,
     .createUnix = vtCreateUnix,
     .bindUnix = vtBindUnix,
     .connectUnix = vtConnectUnix,

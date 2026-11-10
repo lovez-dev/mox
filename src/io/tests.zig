@@ -1564,3 +1564,260 @@ test "Unix socket 可 bind、listen、accept、收发数据" {
     try l.run();
     try std.testing.expectEqual(@as(usize, 2), Ctx.total);
 }
+
+// ===== io_uring 原生异步文件 I/O =====
+//
+// 只有 io_uring 提供；其它后端 `readFileAsync` 为 `null`，节点返回
+// `error.Unsupported`，调用方应回落 `ReadFile`（Work 版）。
+
+test "ReadFileAsync 在非 io_uring 后端返回 Unsupported" {
+    var l = try testLoop();
+    defer l.deinit();
+    if (l.io.vtable.readFileAsync != null) return error.SkipZigTest;
+
+    const Ctx = struct {
+        var saw = false;
+        fn cb(lp: *Loop, c: *Completion) void {
+            if (c.err) |e| saw = (e == error.Unsupported);
+            lp.stop();
+        }
+    };
+    var buf: [16]u8 = undefined;
+    var f = root.ReadFileAsync.init("/nonexistent", &buf);
+    f.c.callback = &Ctx.cb;
+    l.add(&f.c);
+    try l.run();
+    try std.testing.expect(Ctx.saw);
+}
+
+test "ReadFileAsync 异步读文件并与阻塞版内容一致" {
+    var l = try testLoop();
+    defer l.deinit();
+    if (l.io.vtable.readFileAsync == null) return error.SkipZigTest;
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "afile");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var fbuf: [600]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&fbuf, "{s}/a.txt", .{dir});
+    defer l.deleteFile(fpath);
+
+    const payload = "async-file-io";
+    try l.writeFileAll(fpath, payload);
+
+    // `openat` 的 SQE 直接读这块内存，必须 NUL 结尾。
+    var zpath_buf: [700]u8 = undefined;
+    @memcpy(zpath_buf[0..fpath.len], fpath);
+    zpath_buf[fpath.len] = 0;
+    const zpath: [:0]const u8 = zpath_buf[0..fpath.len :0];
+
+    const Ctx = struct {
+        var done = false;
+        fn cb(lp: *Loop, c: *Completion) void {
+            _ = c;
+            done = true;
+            lp.stop();
+        }
+    };
+
+    var buf: [64]u8 = undefined;
+    var f = root.ReadFileAsync.init(zpath, &buf);
+    var wd = Timer.init(5000);
+    f.c.callback = &Ctx.cb;
+    l.add(&f.c);
+    l.watchdog(&f.c, &wd, 5000);
+
+    try l.run();
+    try std.testing.expect(Ctx.done);
+    const got = try f.getResult();
+    try std.testing.expectEqualStrings(payload, got);
+}
+
+test "WriteFileAsync 异步写文件后阻塞读回一致" {
+    var l = try testLoop();
+    defer l.deinit();
+    if (l.io.vtable.writeFileAsync == null) return error.SkipZigTest;
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "awrite");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var fbuf: [600]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&fbuf, "{s}/w.txt", .{dir});
+    defer l.deleteFile(fpath);
+
+    var zpath_buf: [700]u8 = undefined;
+    @memcpy(zpath_buf[0..fpath.len], fpath);
+    zpath_buf[fpath.len] = 0;
+    const zpath: [:0]const u8 = zpath_buf[0..fpath.len :0];
+
+    const Ctx = struct {
+        var done = false;
+        fn cb(lp: *Loop, c: *Completion) void {
+            _ = c;
+            done = true;
+            lp.stop();
+        }
+    };
+
+    const payload = "written-async";
+    var f = root.WriteFileAsync.init(zpath, payload);
+    var wd = Timer.init(5000);
+    f.c.callback = &Ctx.cb;
+    l.add(&f.c);
+    l.watchdog(&f.c, &wd, 5000);
+
+    try l.run();
+    try std.testing.expect(Ctx.done);
+    try std.testing.expectEqual(@as(usize, payload.len), try f.getResult());
+
+    // 用阻塞版读回，确认真的落到磁盘。
+    const st = try l.statPath(fpath);
+    try std.testing.expectEqual(@as(u64, payload.len), st.size);
+}
+
+test "ReadFileAsync 循环读不泄漏 fd（close 真的执行了）" {
+    var l = try testLoop();
+    defer l.deinit();
+    if (l.io.vtable.readFileAsync == null) return error.SkipZigTest;
+    // 只有 Linux 能便宜地数 /proc/self/fd。
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "fdleak");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var fbuf: [600]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&fbuf, "{s}/f.txt", .{dir});
+    defer l.deleteFile(fpath);
+    try l.writeFileAll(fpath, "abc");
+
+    var zpath_buf: [700]u8 = undefined;
+    @memcpy(zpath_buf[0..fpath.len], fpath);
+    zpath_buf[fpath.len] = 0;
+    const zpath: [:0]const u8 = zpath_buf[0..fpath.len :0];
+
+    const Ctx = struct {
+        var done = false;
+        fn cb(lp: *Loop, c: *Completion) void {
+            _ = c;
+            done = true;
+            lp.stop();
+        }
+    };
+
+    const before = countOpenFds();
+
+    // 20 次足够暴露泄漏：每次漏一个 fd，20 次后 /proc/self/fd 明显变多。
+    // （默认 ulimit 通常是 1024，直接循环 200 次反而可能撞上限。）
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        Ctx.done = false;
+        var buf: [16]u8 = undefined;
+        var f = root.ReadFileAsync.init(zpath, &buf);
+        var wd = Timer.init(5000);
+        f.c.callback = &Ctx.cb;
+        l.add(&f.c);
+        l.watchdog(&f.c, &wd, 5000);
+        try l.run();
+        try std.testing.expect(Ctx.done);
+        try std.testing.expectEqualStrings("abc", try f.getResult());
+    }
+
+    const after = countOpenFds();
+    // 允许 ±2 的抖动（loop 自身可能开 eventfd 等）。
+    try std.testing.expect(after <= before + 2);
+}
+
+/// 数 `/proc/self/fd` 里的条目。仅 Linux。
+fn countOpenFds() usize {
+    const lx = std.os.linux;
+    const fd = lx.open("/proc/self/fd", .{ .DIRECTORY = true, .CLOEXEC = true }, 0);
+    const fd_s: isize = @bitCast(fd);
+    if (fd_s < 0) return 0;
+    defer _ = lx.close(@intCast(fd_s));
+
+    var buf: [2048]u8 = undefined;
+    var n: usize = 0;
+    while (true) {
+        const rc = lx.getdents64(@intCast(fd_s), &buf, buf.len);
+        const rc_s: isize = @bitCast(rc);
+        if (rc_s <= 0) break;
+        var off: usize = 0;
+        while (off < @as(usize, @intCast(rc_s))) {
+            const d: *align(1) lx.dirent64 = @ptrCast(buf[off..].ptr);
+            n += 1;
+            off += d.reclen;
+        }
+    }
+    return n;
+}
+
+test "ReadFileAsync 对不存在的文件报 FileNotFound" {
+    var l = try testLoop();
+    defer l.deinit();
+    if (l.io.vtable.readFileAsync == null) return error.SkipZigTest;
+
+    const Ctx = struct {
+        var got: ?anyerror = null;
+        fn cb(lp: *Loop, c: *Completion) void {
+            _ = c;
+            lp.stop();
+        }
+    };
+
+    var buf: [16]u8 = undefined;
+    var f = root.ReadFileAsync.init("/tmp/mox_definitely_not_here_12345", &buf);
+    f.c.callback = &Ctx.cb;
+    l.add(&f.c);
+    try l.run();
+    // openat 失败发生在提交阶段，`c.err` 直接被填。
+    try std.testing.expect(f.c.err != null);
+    _ = Ctx.got;
+}
+
+test "ReadFileAsync 的 offset 生效（从中间读）" {
+    var l = try testLoop();
+    defer l.deinit();
+    if (l.io.vtable.readFileAsync == null) return error.SkipZigTest;
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "aoff");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var fbuf: [600]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&fbuf, "{s}/o.txt", .{dir});
+    defer l.deleteFile(fpath);
+    try l.writeFileAll(fpath, "0123456789");
+
+    var zpath_buf: [700]u8 = undefined;
+    @memcpy(zpath_buf[0..fpath.len], fpath);
+    zpath_buf[fpath.len] = 0;
+    const zpath: [:0]const u8 = zpath_buf[0..fpath.len :0];
+
+    const Ctx = struct {
+        var done = false;
+        fn cb(lp: *Loop, c: *Completion) void {
+            _ = c;
+            done = true;
+            lp.stop();
+        }
+    };
+
+    var buf: [8]u8 = undefined;
+    var f = root.ReadFileAsync.initAt(zpath, 3, &buf);
+    var wd = Timer.init(5000);
+    f.c.callback = &Ctx.cb;
+    l.add(&f.c);
+    l.watchdog(&f.c, &wd, 5000);
+
+    try l.run();
+    try std.testing.expect(Ctx.done);
+    // offset=3 起读 8 字节 → "3456789"（只剩 7 字节）。
+    try std.testing.expectEqualStrings("3456789", try f.getResult());
+}
