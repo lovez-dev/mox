@@ -246,6 +246,11 @@ pub const dns = @import("dns.zig");
 pub const process = @import("process.zig");
 pub const Process = process.Process;
 pub const ProcessWait = process.Wait;
+/// 信号订阅：POSIX self-pipe + `Work` 线程阻塞读；Windows 返回 `error.Unsupported`。
+/// `Loop.init` 已把 `SIGPIPE` 设为 `SIG_IGN`，不要再用本模块订阅它。详见 `signal.zig`。
+pub const signal = @import("signal.zig");
+pub const Signal = signal.Signal;
+pub const Signals = signal.Signals;
 
 const udp_storage = udp.VTable{
     .create = struct {

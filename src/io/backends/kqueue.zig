@@ -535,6 +535,10 @@ fn setNonblock(h: Handle) void {
 pub fn createSocket(domain: c_uint, kind: c_uint, protocol: c_uint) !Handle {
     const fd = c.socket(domain, kind, protocol);
     if (fd < 0) return error.SocketFailed;
+    // BSD 没有 `MSG_NOSIGNAL`，抑制 SIGPIPE 靠 socket 级的 `SO_NOSIGPIPE`。
+    // 在创建处一次设好，`send` 的所有路径（异步与阻塞）就都覆盖了。
+    var on: c_int = 1;
+    _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.NOSIGPIPE, &on, @sizeOf(c_int));
     return @intCast(fd);
 }
 

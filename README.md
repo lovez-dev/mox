@@ -132,6 +132,8 @@ src/
     pool.zig        `Work` 线程池
     udp.zig         UDP 可选能力
     dns.zig         DNS 可选能力（建立在 UDP 之上）
+    process.zig     子进程：spawn / 异步等退出 / 进程组
+    signal.zig      信号订阅：self-pipe + Work 线程
     backends/
       windows.zig   IOCP + 手写 Winsock 层
       uring.zig     io_uring 环
@@ -235,7 +237,18 @@ Work 唤醒、异步 connect、ONESHOT 重挂、后端选择），因此无论 C
 是扩展模板：加第三个能力只需「一个 `cap("...")` 常量 + 一张函数表 + 一个
 节点类型」，`VTable` 与 `Loop` 都不动。**注意**：进程、信号、select、group
 等都只是在设计上被这套机制覆盖；**进程（spawn / 异步等退出 / 进程组）已落地**，
-见下文「子进程」一节；信号与 select 仍未实现，能力表当前是 UDP 与 DNS 两项。
+见下文「子进程」一节；**信号订阅已落地**，见「信号」一节。`select` 明确不做
+（理由见下）；能力表当前是 UDP 与 DNS 两项。
+
+### 为什么不做 `select`
+
+`select` 是 `poll` 的受限前身：`FD_SETSIZE` 通常只有 1024，且每次调用都要重传
+整个 fd 集合。更重要的是，mox 的每个后端**本身就是**事件循环——Linux 走
+`epoll_wait` / `io_uring`，macOS 走 `kevent`，Windows 走
+`GetQueuedCompletionStatus`。在事件循环之上再套一层 `select`，等于把已有的
+能力重新实现一遍，而且只能覆盖 1024 个 fd。真要「把任意 fd 挂进循环等可读」，
+正确形状是跨后端统一的 `Loop.watchFd`，而不是 `select`。**目前不提供**，等
+真实用例出现再设计。
 
 UDP 已作为第一个能力落地（`src/io/udp.zig`）：`Udp.get(loop.io)` 取句柄，
 `Udp.Recv` / `Udp.Send` 优先走后端原生异步数据报（细节见下文「UDP 与 DNS」
@@ -324,6 +337,43 @@ try p.killGroup(15);           // 向整个进程组发 SIGTERM
   放进去，`killGroup` 走 `TerminateJobObject`，能连带杀掉子进程再派生的进程。
 - **`deleteFile` 式的诚实**：`killGroup` 在 POSIX 上要求子进程确实是组长（`new_group
   = true`），否则 `kill(-pid)` 会失败并返回 `error.KillFailed`。
+
+## 信号
+
+`src/io/signal.zig`。信号不能「异步等」，只能阻塞等，因此 `Signal` 内嵌一个
+`Work` 节点，由池线程阻塞在 self-pipe 读端；信号到达时处理器写入一个字节，
+读端返回，回调回到循环线程。
+
+```zig
+var s = try mox_io.Signal.init(mox_io.Signals.TERM);
+defer s.deinit();
+s.work.c.callback = myCb;          // 回调里 s.getResult() 拿到信号编号
+loop.add(&s.work.c);
+```
+
+- **self-pipe 而非 `sigwait` / `signalfd`**：`sigwait` 要求信号先被 `pthread_sigmask`
+  屏蔽，而屏蔽必须在**所有线程**上生效，否则信号可能投递到别的线程、池线程永远
+  等不到；`signalfd` 是 Linux 专有。self-pipe 用「异步信号安全的 `write`」把信号
+  转成 fd 可读，全 POSIX 通用。
+- **处理器只做 `write`**，不碰堆内存——异步信号安全。
+- **每种信号同一时刻只支持一个订阅**（`sigaction` 是进程级单值）。
+- **Windows 返回 `error.Unsupported`**：Windows 没有 POSIX 信号语义，硬凑没有意义。
+- **不要订阅 `SIGPIPE`**：`Loop.init` 已经把它设为 `SIG_IGN`，永远不会走到订阅端。
+
+### `SIGPIPE`：两道防线
+
+写一个对端已关闭的 socket 时，内核默认投递 `SIGPIPE`，**直接把整个进程杀掉**。
+这不是边缘情况：浏览器取消请求、用户关页面、网络闪断都会触发。实测确认（向半
+关闭连接反复写，第二次写即死），因此设了两道防线：
+
+1. **每处发送带标志**：Linux 的 `send` SQE 与 `sendBlocking` 都带 `MSG_NOSIGNAL`；
+   BSD 没有这个标志，改为在 `createSocket` 时设 socket 级 `SO_NOSIGPIPE`，一次
+   覆盖该 socket 的所有发送路径。
+2. **进程级兜底**：`Loop.init` 调用一次 `sigaction(SIGPIPE, SIG_IGN)`，让任何漏掉
+   的写路径（标准库内部、第三方代码、写已关闭的管道）都只得到 `EPIPE` 错误。
+
+两道防线都有变异测试证明有效：撤掉 `MSG_NOSIGNAL` 后进程被信号杀死；只靠
+`SIG_IGN` 时裸 `write` 能拿到 `EPIPE` 并存活。
 ## 作为包被依赖
 
 仓库根有 `build.zig.zon`，包名 `mox`，最低 Zig 版本 `0.17.1`。外部项目
@@ -479,8 +529,8 @@ macOS arm64 kqueue 均在 CI 中跑全量测试。
 
 | 目标 | 架构 | 状态 |
 |---|---|---|
-| Windows（IOCP） | x86_64 / arm64 | 全量测试、真包依赖、性能尺子均在 CI 中运行；子进程四场景本地实跑 |
-| Linux（io_uring + epoll） | x86_64 / arm64 | 同上；`zig build test` 同时跑 epoll 专属测试，WSL 开发机实跑 56/56（含子进程） |
+| Windows（IOCP） | x86_64 / arm64 | 全量测试、真包依赖、性能尺子均在 CI 中运行；子进程四场景本地实跑；`Signal` 明确返回 `Unsupported` |
+| Linux（io_uring + epoll） | x86_64 / arm64 | 同上；`zig build test` 同时跑 epoll 专属测试，WSL 开发机实跑 57/58（含子进程与信号） |
 | macOS（kqueue） | arm64 | CI 真跑全量 kqueue 运行时测试，逐条隔离 + 20 秒看门狗 |
 
 BSD 不在覆盖范围内。

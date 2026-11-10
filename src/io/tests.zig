@@ -1152,3 +1152,50 @@ fn readAllWindows(handle: anytype, buf: []u8) !usize {
     if (!kernelReadFile(h, buf.ptr, @intCast(buf.len), &got, null).toBool()) return error.ReadFailed;
     return got;
 }
+
+// ===== 信号订阅 =====
+//
+// 只在 POSIX 上跑；Windows 的 `Signal.init` 直接返回 `error.Unsupported`，
+// 那条路径由下面第一条测试覆盖。
+
+test "Signal 在 Windows 上明确返回 Unsupported" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const r = root.Signal.init(root.Signals.USR1);
+    try std.testing.expectError(error.Unsupported, r);
+}
+
+test "Signal 订阅 USR1 后 self-pipe 收到通知" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var s = try root.Signal.init(root.Signals.USR1);
+    defer s.deinit();
+
+    const Ctx = struct {
+        var done = false;
+        fn cb(lp: *Loop, c: *Completion) void {
+            _ = c;
+            done = true;
+            lp.stop();
+        }
+    };
+    var wd = Timer.init(5000);
+    s.work.c.callback = &Ctx.cb;
+    l.add(&s.work.c);
+    // 看门狗：若 self-pipe 没被写入，池线程永远阻塞在读端，`run` 会挂死。
+    // 有它在，变异（处理器不写 pipe）表现为明确的超时失败而非 CI 卡住。
+    l.watchdog(&s.work.c, &wd, 5000);
+
+    // 给自己发信号，处理器写 self-pipe，池线程读端返回。
+    const pid = if (builtin.os.tag == .linux)
+        @as(i32, @intCast(std.os.linux.getpid()))
+    else
+        std.c.getpid();
+    try std.testing.expect(root.signal.raiseForTest(pid, root.Signals.USR1));
+
+    try l.run();
+    try std.testing.expect(Ctx.done);
+    // 看门狗到点会先把节点标成超时；有信号到达才算真通过。
+    try std.testing.expectEqual(@as(u8, root.Signals.USR1), try s.getResult());
+}

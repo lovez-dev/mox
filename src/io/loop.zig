@@ -15,6 +15,42 @@ const Scratch = root.Scratch;
 const Ref = root.Ref;
 const Handle = root.Handle;
 const INVALID_HANDLE = root.INVALID_HANDLE;
+
+/// 全局忽略 `SIGPIPE`。
+///
+/// 后端已经在每处发送上加了 `MSG_NOSIGNAL`（Linux）与 `SO_NOSIGPIPE`（BSD），
+/// 这里是**第二道防线**：任何漏掉的写路径（标准库内部、第三方代码、写已关闭的
+/// 管道）都只会得到 `EPIPE` 错误，而不是让整个进程被信号杀掉。
+///
+/// 只在第一次 `Loop` 初始化时设置；`SIG_IGN` 是进程级设置，重复设无害。
+fn ignoreSigpipeOnce() void {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .windows) return;
+    const S = struct {
+        var done = std.atomic.Value(bool).init(false);
+    };
+    if (S.done.swap(true, .acq_rel)) return;
+
+    if (builtin.os.tag == .linux) {
+        // Linux 走裸 syscall，与 process.zig 同样的理由：不把 libc 拖进来。
+        const lx = std.os.linux;
+        const act = lx.Sigaction{
+            .handler = .{ .handler = lx.SIG.IGN },
+            .mask = std.mem.zeroes(lx.sigset_t),
+            .flags = 0,
+        };
+        _ = lx.sigaction(lx.SIG.PIPE, &act, null);
+        return;
+    }
+    // darwin / BSD 始终链 libSystem，直接用 libc 的 sigaction。
+    const c = std.c;
+    const act = c.Sigaction{
+        .handler = .{ .handler = c.SIG.IGN },
+        .mask = std.mem.zeroes(c.sigset_t),
+        .flags = 0,
+    };
+    _ = c.sigaction(c.SIG.PIPE, &act, null);
+}
 const SockOpt = root.SockOpt;
 const platform = root.platform;
 const Queue = queue_mod.Queue;
@@ -69,12 +105,14 @@ pub const Loop = struct {
     /// 从 `io` 构造循环。线程池用 `allocator` 存放线程句柄；
     /// 后端不提供分配器时可用 `std.heap.page_allocator`。
     pub fn init(io: Io) Loop {
+        ignoreSigpipeOnce();
         var self: Loop = .{ .io = io, .allocator = std.heap.page_allocator, .pool = Pool.init(std.heap.page_allocator, pool_mod.default_max_workers), .memory_fs = @import("file.zig").MemoryFs.init(std.heap.page_allocator) };
         self.timers.initWithAllocator(self.allocator);
         return self;
     }
 
     pub fn initWithAllocator(io: Io, allocator: std.mem.Allocator) Loop {
+        ignoreSigpipeOnce();
         var self: Loop = .{ .io = io, .allocator = allocator, .pool = Pool.init(allocator, pool_mod.default_max_workers), .memory_fs = @import("file.zig").MemoryFs.init(allocator) };
         self.timers.initWithAllocator(self.allocator);
         return self;

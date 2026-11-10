@@ -197,7 +197,9 @@ fn vtRecv(userdata: ?*anyopaque, socket: Handle, buffer: []u8, scratch: *root.Sc
 fn vtSend(userdata: ?*anyopaque, socket: Handle, bytes: []const u8, scratch: *root.Scratch) anyerror!?usize {
     const state = stateOf(userdata);
     const sqe = getSqe(state);
-    sqe.prep_send(fdOf(socket), bytes, 0);
+    // `MSG_NOSIGNAL` 不可省：对端已关闭时内核默认投递 SIGPIPE，直接把整个进程
+    // 杀掉（实测：write 到半关闭连接，第二次写就死）。带上它才变成可处理的 EPIPE。
+    sqe.prep_send(fdOf(socket), bytes, linux.MSG.NOSIGNAL);
     sqe.user_data = @intFromPtr(scratch);
     return null;
 }
@@ -649,7 +651,10 @@ pub fn closeSocket(h: Handle) void {
 
 pub fn sendBlocking(h: Handle, bytes: []const u8) !usize {
     var off: usize = 0;
-    while (off < bytes.len) off += try cvt(linux.write(fdOf(h), bytes.ptr + off, bytes.len - off));
+    while (off < bytes.len) {
+        // 走 `sendto` 而非 `write`，只为能带 `MSG_NOSIGNAL`（见 `vtSend` 的注释）。
+        off += try cvt(linux.sendto(fdOf(h), bytes.ptr + off, bytes.len - off, linux.MSG.NOSIGNAL, null, 0));
+    }
     return off;
 }
 
