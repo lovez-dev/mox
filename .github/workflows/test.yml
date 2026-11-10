@@ -171,73 +171,56 @@ jobs:
       - name: mox + mox_io 全量测试（kqueue 运行时）
         shell: bash
         run: |
-          # 带 180 秒看门狗：kqueue 是首次真跑，万一某个测试挂死，
-          # 光有一个「超时」失败没有任何定位价值。这里把最后启动的
-          # 测试名写成注解（公开仓库可通过 check-runs API 读回），
-          # 同时把尾部日志写进 job summary（公开可读）。
-          #
-          # 只用 bash 原生能力：不依赖 python3 / timeout（GNU coreutils
-          # 在 macOS runner 上不保证存在）。
           set +e
-          log=/tmp/kqueue-test.log
-          : >"$log"
-          # 这次要分离「编译」与「运行」：上一轮 306s 全被看门狗吃掉，
-          # 但本地交叉编译只要 3s，所以必须知道到底卡在哪一段。
-          # 这样只要看输出里的耗时就能定性，不需要读日志。
           secs() { echo "$(($(date +%s) - $1))"; }
-
-          # ---- 段 1：纯编译（不运行）----------------------------------
+          echo "== 编译 io 测试二进制 =="
           t0=$(date +%s)
-          zig test src/io/io.zig --test-no-exec -femit-bin=/tmp/io-test >"$log" 2>&1
+          zig test src/io/io.zig --test-no-exec -femit-bin=/tmp/io-test
           cbuild=$?
-          csecs=$(secs "$t0")
-          echo "== 段1 编译 io 测试二进制：rc=$cbuild 耗时=${csecs}s =="
-
-          # ---- 段 2：只跑已编译的二进制（逐条进度在这里）---------------
-          t0=$(date +%s)
-          /tmp/io-test >"$log" 2>&1 &
-          runner=$!
-          ( sleep 120; kill -9 "$runner" 2>/dev/null ) &
-          watchdog=$!
-          wait "$runner"
-          rc=$?
-          kill "$watchdog" 2>/dev/null
-          wait "$watchdog" 2>/dev/null
-          if [ "$rc" -eq 137 ]; then rc=124; fi
-          rsecs=$(secs "$t0")
-          echo "== 段2 运行 io 测试：rc=$rc 耗时=${rsecs}s =="
-          tail -30 "$log"
-
-          # ---- 段 3：mox 模块测试（独立二进制，独立计时）---------------
-          t0=$(date +%s)
-          zig build test --summary all >/tmp/mox-build.log 2>&1 &
-          runner=$!
-          ( sleep 120; kill -9 "$runner" 2>/dev/null ) &
-          watchdog=$!
-          wait "$runner"
-          rb=$?
-          kill "$watchdog" 2>/dev/null
-          wait "$watchdog" 2>/dev/null
-          if [ "$rb" -eq 137 ]; then rb=124; fi
-          bsecs=$(secs "$t0")
-          echo "== 段3 zig build test：rc=$rb 耗时=${bsecs}s =="
-
+          echo "compile_rc=$cbuild compile_seconds=$(secs "$t0")"
+          pass=0
+          hang=0
+          fail=0
+          total=0
+          report=/tmp/kqueue-report.txt
+          : >"$report"
+          names=$(sed -n 's/^test "\(.*\)" {$/\1/p' src/io/tests.zig)
+          while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            total=$((total + 1))
+            zig test src/io/io.zig --test-filter "$name" >/tmp/kqueue-one.log 2>&1 &
+            runner=$!
+            ( sleep 20; kill -9 "$runner" 2>/dev/null ) &
+            watchdog=$!
+            wait "$runner"
+            rc=$?
+            kill "$watchdog" 2>/dev/null
+            wait "$watchdog" 2>/dev/null
+            if [ "$rc" -eq 137 ]; then
+              echo "HANG $name" >>"$report"
+              hang=$((hang + 1))
+            elif [ "$rc" -ne 0 ]; then
+              echo "FAIL $name rc=$rc" >>"$report"
+              fail=$((fail + 1))
+            else
+              pass=$((pass + 1))
+            fi
+          done <<<"$names"
+          echo "== 逐条结果：total=$total pass=$pass fail=$fail hang=$hang =="
+          cat "$report"
           {
-            echo "### kqueue 诊断：编译=${csecs}s(rc=$cbuild) 运行=${rsecs}s(rc=$rc) build=${bsecs}s(rc=$rb)"
+            echo "### kqueue 逐条结果：total=$total pass=$pass fail=$fail hang=$hang"
             echo '```'
-            tail -30 "$log"
+            cat "$report"
             echo '```'
           } >>"$GITHUB_STEP_SUMMARY"
-
-          # 逐条进度行直接吐到 step 输出里（无论成败），注解作为备份通道。
-          last=$(grep -oE '[0-9]+/[0-9]+ [^.]*\.test\.[^.]+' "$log" | tail -1)
-          echo "ordering: compile=${csecs}s run=${rsecs}s build=${bsecs}s"
-          echo "last-started-test: ${last:-none}"
-          if [ "$rc" -ne 0 ] || [ "$rb" -ne 0 ] || [ "$cbuild" -ne 0 ]; then
-            echo "::error::kqueue 诊断 编译=${csecs}s(rc=$cbuild) 运行=${rsecs}s(rc=$rc) build=${bsecs}s(rc=$rb)；最后启动的测试: ${last:-未知}"
-            rc=1
+          if [ "$cbuild" -ne 0 ] || [ "$hang" -ne 0 ] || [ "$fail" -ne 0 ]; then
+            echo "::error::kqueue isolation total=$total pass=$pass fail=$fail hang=$hang"
+            exit 1
           fi
-          exit "$rc"
+          echo "== mox 模块测试 =="
+          zig build test --summary all
+
 
       - name: 单独跑 io 模块根测试
         run: zig test src/io/io.zig
