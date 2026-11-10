@@ -70,6 +70,9 @@ pub const ReadFile = struct {
     buf: []u8,
     /// 非空表示命中内存文件：`run` 直接 memcpy，不碰磁盘、不进池外的 I/O。
     memory: ?[]const u8 = null,
+    /// 起始偏移。为 0 时走整文件 `readFileInto`；非 0 走 `readFileAt`
+    /// （随机访问），是分段读大文件的基础。
+    offset: u64 = 0,
     len: usize = 0,
     err: ?anyerror = null,
 
@@ -79,19 +82,32 @@ pub const ReadFile = struct {
         return .{ .work = Work.init(run), .io = io, .path = path, .buf = buf, .memory = memory };
     }
 
+    /// 从 `offset` 开始读。命中内存文件时按偏移切片，不碰磁盘。
+    pub fn initAt(io: Io, path: []const u8, offset: u64, buf: []u8, memory: ?[]const u8) ReadFile {
+        return .{ .work = Work.init(run), .io = io, .path = path, .buf = buf, .memory = memory, .offset = offset };
+    }
+
     fn run(w: *Work) void {
         const self: *ReadFile = @fieldParentPtr("work", w);
         if (self.memory) |bytes| {
-            const n = @min(bytes.len, self.buf.len);
-            @memcpy(self.buf[0..n], bytes[0..n]);
+            // 偏移超出文件长度时读到 0 字节，与真实文件的短读语义一致。
+            const rest = if (self.offset < bytes.len) bytes[@intCast(self.offset)..] else bytes[bytes.len..];
+            const n = @min(rest.len, self.buf.len);
+            @memcpy(self.buf[0..n], rest[0..n]);
             self.len = n;
-            self.err = if (n != bytes.len) error.BufferTooSmall else null;
+            self.err = if (n != rest.len) error.BufferTooSmall else null;
             return;
         }
-        self.len = self.io.vtable.readFileInto(self.io.userdata, self.path, self.buf) catch |e| {
-            self.err = e;
-            return;
-        };
+        self.len = if (self.offset == 0)
+            self.io.vtable.readFileInto(self.io.userdata, self.path, self.buf) catch |e| {
+                self.err = e;
+                return;
+            }
+        else
+            self.io.vtable.readFileAt(self.io.userdata, self.path, self.offset, self.buf) catch |e| {
+                self.err = e;
+                return;
+            };
     }
 
     pub fn getResult(self: *const ReadFile) ![]const u8 {
@@ -104,10 +120,14 @@ pub const ReadFile = struct {
 /// 因此固定走 `Work` 池：池线程做阻塞的 open/write/close，回调落在循环线程。
 /// 与 `ReadFile` 对称，`Work` 节点内嵌，零额外分配。
 pub const WriteFile = struct {
+    /// 覆盖既有内容（默认），还是追加到末尾。
+    pub const Mode = enum { overwrite, append };
+
     work: Work,
     io: Io,
     path: []const u8,
     bytes: []const u8,
+    mode: Mode = .overwrite,
     written: usize = 0,
     err: ?anyerror = null,
 
@@ -116,12 +136,23 @@ pub const WriteFile = struct {
         return .{ .work = Work.init(run), .io = io, .path = path, .bytes = bytes };
     }
 
+    /// 追加模式：保留既有内容，把 `bytes` 写到末尾；文件不存在时创建。
+    pub fn initAppend(io: Io, path: []const u8, bytes: []const u8) WriteFile {
+        return .{ .work = Work.init(run), .io = io, .path = path, .bytes = bytes, .mode = .append };
+    }
+
     fn run(w: *Work) void {
         const self: *WriteFile = @fieldParentPtr("work", w);
-        self.io.vtable.writeFileAll(self.io.userdata, self.path, self.bytes) catch |e| {
-            self.err = e;
-            return;
-        };
+        switch (self.mode) {
+            .overwrite => self.io.vtable.writeFileAll(self.io.userdata, self.path, self.bytes) catch |e| {
+                self.err = e;
+                return;
+            },
+            .append => self.io.vtable.appendFile(self.io.userdata, self.path, self.bytes) catch |e| {
+                self.err = e;
+                return;
+            },
+        }
         self.written = self.bytes.len;
     }
 
@@ -129,6 +160,53 @@ pub const WriteFile = struct {
     pub fn getResult(self: *const WriteFile) !usize {
         if (self.err) |e| return e;
         return self.written;
+    }
+};
+
+/// 把文件截断到指定长度。走 `Work` 池，与读写对称。
+pub const TruncateFile = struct {
+    work: Work,
+    io: Io,
+    path: []const u8,
+    size: u64,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, path: []const u8, size: u64) TruncateFile {
+        return .{ .work = Work.init(run), .io = io, .path = path, .size = size };
+    }
+
+    fn run(w: *Work) void {
+        const self: *TruncateFile = @fieldParentPtr("work", w);
+        self.io.vtable.truncateFile(self.io.userdata, self.path, self.size) catch |e| {
+            self.err = e;
+        };
+    }
+
+    pub fn getResult(self: *const TruncateFile) !void {
+        if (self.err) |e| return e;
+    }
+};
+
+/// 删除文件。走 `Work` 池；文件不存在按成功处理（幂等）。
+pub const DeleteFile = struct {
+    work: Work,
+    io: Io,
+    path: []const u8,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, path: []const u8) DeleteFile {
+        return .{ .work = Work.init(run), .io = io, .path = path };
+    }
+
+    fn run(w: *Work) void {
+        const self: *DeleteFile = @fieldParentPtr("work", w);
+        self.io.vtable.deleteFile(self.io.userdata, self.path) catch |e| {
+            self.err = e;
+        };
+    }
+
+    pub fn getResult(self: *const DeleteFile) !void {
+        if (self.err) |e| return e;
     }
 };
 

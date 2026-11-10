@@ -17,6 +17,8 @@ const Handle = root.Handle;
 const INVALID_HANDLE = root.INVALID_HANDLE;
 const ReadFile = root.ReadFile;
 const WriteFile = root.WriteFile;
+const TruncateFile = root.TruncateFile;
+const DeleteFile = root.DeleteFile;
 const platform = root.platform;
 fn testLoop() !Loop {
     return Loop.init(try platform.create(std.testing.allocator));
@@ -810,4 +812,244 @@ test "WriteFile 写入失败时把错误交给回调" {
         std.debug.print("期望失败，却写入了 {d} 字节\n", .{n});
         return error.TestUnexpectedResult;
     } else |_| {}
+}
+
+// watchdog：正常完成时截止时间定时器被撤销，回调看到的是成功结果。
+test "watchdog 在操作按时完成时被撤销" {
+    var loop = try testLoop();
+    defer loop.deinit();
+
+    const Item = struct {
+        work: Work,
+        value: u32 = 0,
+    };
+    const Ctx = struct {
+        var done = false;
+        var saw_deadline = false;
+        fn workFn(w: *Work) void {
+            const self: *Item = @fieldParentPtr("work", w);
+            self.value = 7; // 立即完成，远早于 5000ms 的截止时间
+        }
+        fn cb(l: *Loop, c: *Completion) void {
+            done = true;
+            saw_deadline = if (c.err) |e| e == error.DeadlineExceeded else false;
+            l.stop();
+        }
+    };
+
+    var item: Item = .{ .work = Work.init(&Ctx.workFn) };
+    item.work.c.callback = &Ctx.cb;
+    var timer = Timer.init(0);
+    loop.watchdog(&item.work.c, &timer, 5000);
+    loop.add(&item.work.c);
+    try loop.run();
+
+    try std.testing.expect(Ctx.done);
+    try std.testing.expect(!Ctx.saw_deadline);
+    try std.testing.expectEqual(@as(u32, 7), item.value);
+    // 正常完成后链接被清空，定时器也不在队列里。
+    try std.testing.expect(item.work.c.timeout == null);
+    try std.testing.expect(timer.target == null);
+}
+
+// watchdog：操作超过截止时间仍未完成时，回调带 DeadlineExceeded 触发一次。
+test "watchdog 到点后以 DeadlineExceeded 回调一次" {
+    var loop = try testLoop();
+    defer loop.deinit();
+
+    const Item = struct {
+        work: Work,
+        value: u32 = 0,
+    };
+    const Ctx = struct {
+        var calls: usize = 0;
+        var saw_deadline = false;
+        fn workFn(w: *Work) void {
+            const self: *Item = @fieldParentPtr("work", w);
+            const start = platform.tickCount();
+            while (platform.tickCount() - start < 400) {}
+            self.value = 9;
+        }
+        fn cb(l: *Loop, c: *Completion) void {
+            calls += 1;
+            saw_deadline = if (c.err) |e| e == error.DeadlineExceeded else false;
+            l.stop();
+        }
+    };
+
+    var item: Item = .{ .work = Work.init(&Ctx.workFn) };
+    item.work.c.callback = &Ctx.cb;
+    var timer = Timer.init(0);
+    loop.watchdog(&item.work.c, &timer, 20); // 远小于 400ms 的实际耗时
+    loop.add(&item.work.c);
+    try loop.run();
+
+    try std.testing.expectEqual(@as(usize, 1), Ctx.calls);
+    try std.testing.expect(Ctx.saw_deadline);
+    try std.testing.expect(item.work.c.timeout == null);
+}
+
+// unwatchdog：调用方在超时前主动撤销，操作照常完成、不报超时。
+test "unwatchdog 主动撤销后操作按原样完成" {
+    var loop = try testLoop();
+    defer loop.deinit();
+
+    const Item = struct {
+        work: Work,
+    };
+    const Ctx = struct {
+        var done = false;
+        fn workFn(w: *Work) void {
+            _ = w;
+        }
+        fn cb(l: *Loop, c: *Completion) void {
+            done = c.err == null;
+            l.stop();
+        }
+    };
+
+    var item: Item = .{ .work = Work.init(&Ctx.workFn) };
+    item.work.c.callback = &Ctx.cb;
+    var timer = Timer.init(0);
+    loop.watchdog(&item.work.c, &timer, 5000);
+    loop.unwatchdog(&item.work.c);
+    try std.testing.expect(item.work.c.timeout == null);
+    try std.testing.expect(timer.target == null);
+
+    loop.add(&item.work.c);
+    try loop.run();
+    try std.testing.expect(Ctx.done);
+}
+
+// 偏移读：从中间开始读，验证随机访问与文件尾短读。
+test "ReadFile 支持偏移读与文件尾短读" {
+    var l = Loop.init(try platform.create(std.testing.allocator));
+    defer l.deinit();
+
+    const path = "zig-cache-mox-readat-test.txt";
+    try platform.writeFileAll(path, "0123456789");
+    defer platform.deleteFile(path);
+
+    const Ctx = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    };
+
+    var buf: [64]u8 = undefined;
+    var rf = ReadFile.initAt(l.io, path, 4, &buf, null);
+    rf.work.c.callback = &Ctx.cb;
+    l.add(&rf.work.c);
+    try l.run();
+    try std.testing.expectEqualStrings("456789", try rf.getResult());
+
+    // 偏移超出文件长度：读到 0 字节，而不是报错。
+    var rf2 = ReadFile.initAt(l.io, path, 100, &buf, null);
+    rf2.work.c.callback = &Ctx.cb;
+    l.add(&rf2.work.c);
+    try l.run();
+    try std.testing.expectEqual(@as(usize, 0), (try rf2.getResult()).len);
+}
+
+// 追加写：两次追加后内容应为两段拼接，既有内容不被覆盖。
+test "WriteFile 追加模式保留既有内容" {
+    var l = Loop.init(try platform.create(std.testing.allocator));
+    defer l.deinit();
+
+    const path = "zig-cache-mox-append-test.txt";
+    defer platform.deleteFile(path);
+
+    const Ctx = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    };
+
+    var w1 = WriteFile.init(l.io, path, "hello");
+    w1.work.c.callback = &Ctx.cb;
+    l.add(&w1.work.c);
+    try l.run();
+    try std.testing.expectEqual(@as(usize, 5), try w1.getResult());
+
+    var w2 = WriteFile.initAppend(l.io, path, "-world");
+    w2.work.c.callback = &Ctx.cb;
+    l.add(&w2.work.c);
+    try l.run();
+    try std.testing.expectEqual(@as(usize, 6), try w2.getResult());
+
+    var buf: [64]u8 = undefined;
+    var rf = ReadFile.init(l.io, path, &buf, null);
+    rf.work.c.callback = &Ctx.cb;
+    l.add(&rf.work.c);
+    try l.run();
+    try std.testing.expectEqualStrings("hello-world", try rf.getResult());
+}
+
+// 截断：把 10 字节文件截到 4 字节后，读回来只有前 4 字节。
+test "TruncateFile 缩短文件后再读只剩前缀" {
+    var l = Loop.init(try platform.create(std.testing.allocator));
+    defer l.deinit();
+
+    const path = "zig-cache-mox-truncate-test.txt";
+    try platform.writeFileAll(path, "0123456789");
+    defer platform.deleteFile(path);
+
+    const Ctx = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    };
+
+    var tf = TruncateFile.init(l.io, path, 4);
+    tf.work.c.callback = &Ctx.cb;
+    l.add(&tf.work.c);
+    try l.run();
+    try tf.getResult();
+
+    var buf: [64]u8 = undefined;
+    var rf = ReadFile.init(l.io, path, &buf, null);
+    rf.work.c.callback = &Ctx.cb;
+    l.add(&rf.work.c);
+    try l.run();
+    try std.testing.expectEqualStrings("0123", try rf.getResult());
+}
+
+// 删除：删掉后读应报 FileNotFound；再删一次仍成功（幂等）。
+test "DeleteFile 删除文件且重复删除不报错" {
+    var l = Loop.init(try platform.create(std.testing.allocator));
+    defer l.deinit();
+
+    const path = "zig-cache-mox-delete-test.txt";
+    try platform.writeFileAll(path, "gone");
+
+    const Ctx = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    };
+
+    var df = DeleteFile.init(l.io, path);
+    df.work.c.callback = &Ctx.cb;
+    l.add(&df.work.c);
+    try l.run();
+    try df.getResult();
+
+    // 第二次删除：文件已不存在，仍应成功。
+    var df2 = DeleteFile.init(l.io, path);
+    df2.work.c.callback = &Ctx.cb;
+    l.add(&df2.work.c);
+    try l.run();
+    try df2.getResult();
+
+    // 读已删除的文件必须失败。
+    var buf: [16]u8 = undefined;
+    var rf = ReadFile.init(l.io, path, &buf, null);
+    rf.work.c.callback = &Ctx.cb;
+    l.add(&rf.work.c);
+    try l.run();
+    try std.testing.expectError(@as(anyerror, error.FileNotFound), rf.getResult());
 }

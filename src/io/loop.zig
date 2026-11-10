@@ -380,7 +380,40 @@ pub const Loop = struct {
             _ = self.reclaim(&c.ov);
             return;
         }
+        // 操作正常完成：先撤销它的截止时间定时器，再回调。
+        // 「先撤销」保证回调里可安全释放对象（watchdog 不会再碰到它）。
+        self.unwatchdog(c);
         if (c.callback) |cb| cb(self, c);
+    }
+
+    /// 给已提交的操作挂一个截止时间（毫秒）。到点时若操作仍未完成，
+    /// 它的回调会带着 `error.DeadlineExceeded` 被调用一次；此后后端投递的
+    /// 完成包被静默丢弃，对象仍归调用方。
+    ///
+    /// `timer` 由调用方持有，生命周期必须覆盖 `ms` 或直到操作完成——
+    /// 与其它完成节点一样，`Loop` 不分配、不释放它。返回值是给调用方
+    /// 在未超时前主动撤销用的句柄（传回 `unwatchdog`）。
+    ///
+    /// 一个操作只能挂一个 watchdog；重复挂会覆盖前一个（旧定时器被摘除）。
+    pub fn watchdog(self: *Loop, c: *Completion, timer: *Timer, ms: u64) void {
+        self.unwatchdog(c);
+        timer.duration_ms = ms;
+        timer.target = c;
+        // 与 `Loop.add` 的 `.timer` 分支一致：堆按 `deadline_ms` 排序，
+        // 漏设会让定时器永远「已到期」，操作被误判超时。
+        timer.c.deadline_ms = self.io.vtable.now(self.io.userdata) + ms;
+        c.timeout = &timer.c;
+        self.timers.add(&timer.c);
+    }
+
+    /// 主动撤销截止时间（例如调用方自己决定放弃等待）。操作本身不受影响。
+    pub fn unwatchdog(self: *Loop, c: *Completion) void {
+        const t = c.timeout orelse return;
+        c.timeout = null;
+        if (self.timers.remove(t)) {
+            const node: *Timer = @fieldParentPtr("c", t);
+            node.target = null;
+        }
     }
 
     fn pushReady(self: *Loop, c: *Completion) void {
@@ -419,6 +452,29 @@ pub const Loop = struct {
     fn fireTimers(self: *Loop) void {
         const now = self.io.vtable.now(self.io.userdata);
         while (self.timers.popDue(now)) |c| {
+            // `watchdog` 定时器：到点时若目标还没完成，就通知后端放弃在飞
+            // 操作、把 `DeadlineExceeded` 交给目标的回调。目标自己先完成的
+            // 情况已在 `unwatchdog` 撤销本定时器，不会走到这里。
+            //
+            // 这里**不**走 `cancel`：`cancel` 会登记延迟回收并释放对象，而
+            // 超时后对象仍归调用方（要靠 `getResult()` 读错误）。改为把
+            // `callback` 置空：后端最终投递的完成包会因无回调被静默丢弃，
+            // 对象不被框架释放、也不会重复回调。
+            if (c.op == .timer) {
+                const t: *Timer = @fieldParentPtr("c", c);
+                if (t.target) |target| {
+                    t.target = null;
+                    target.timeout = null;
+                    if (!target.cancelled) {
+                        self.io.vtable.cancel(self.io.userdata, target.socket, &target.ov);
+                        target.err = error.DeadlineExceeded;
+                        const cb = target.callback;
+                        target.callback = null;
+                        if (cb) |f| f(self, target);
+                    }
+                    continue; // watchdog 定时器已处理，不再走普通回调路径。
+                }
+            }
             self.invoke(c);
             if (!self.running) return;
         }

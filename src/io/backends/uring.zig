@@ -437,6 +437,26 @@ fn vtWriteFileAll(userdata: ?*anyopaque, path: []const u8, bytes: []const u8) an
     return writeFileAll(path, bytes);
 }
 
+fn vtReadFileAt(userdata: ?*anyopaque, path: []const u8, offset: u64, buf: []u8) anyerror!usize {
+    _ = userdata;
+    return readFileAt(path, offset, buf);
+}
+
+fn vtAppendFile(userdata: ?*anyopaque, path: []const u8, bytes: []const u8) anyerror!void {
+    _ = userdata;
+    return appendFile(path, bytes);
+}
+
+fn vtTruncateFile(userdata: ?*anyopaque, path: []const u8, size: u64) anyerror!void {
+    _ = userdata;
+    return truncateFile(path, size);
+}
+
+fn vtDeleteFile(userdata: ?*anyopaque, path: []const u8) anyerror!void {
+    _ = userdata;
+    deleteFile(path);
+}
+
 const vtable_storage: root.VTable = .{
     .deinit = vtDeinit,
     .now = vtNow,
@@ -449,6 +469,10 @@ const vtable_storage: root.VTable = .{
     .fileSize = vtFileSize,
     .readFileInto = vtReadFileInto,
     .writeFileAll = vtWriteFileAll,
+    .readFileAt = vtReadFileAt,
+    .appendFile = vtAppendFile,
+    .truncateFile = vtTruncateFile,
+    .deleteFile = vtDeleteFile,
     .associate = vtAssociate,
     .recv = vtRecv,
     .send = vtSend,
@@ -676,6 +700,38 @@ pub fn deleteFile(path: []const u8) void {
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
     _ = linux.unlinkat(linux.AT.FDCWD, buf[0..path.len :0], 0);
+}
+
+/// 从 `offset` 处读入 `buf`，返回实际读到的字节数（文件尾会短读）。
+/// 与 `readFileInto` 的区别是支持随机访问，是分段读大文件的基础。
+pub fn readFileAt(path: []const u8, offset: u64, buf: []u8) !usize {
+    const fd = try std.posix.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0);
+    defer _ = linux.close(fd);
+    _ = try cvt(linux.lseek(fd, @intCast(offset), linux.SEEK.SET));
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = try cvt(linux.read(fd, buf.ptr + total, buf.len - total));
+        if (n == 0) break;
+        total += n;
+    }
+    return total;
+}
+
+/// 在文件末尾追加 `bytes`；文件不存在时创建。只做追加，不动既有内容。
+pub fn appendFile(path: []const u8, bytes: []const u8) !void {
+    const fd = try std.posix.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
+    defer _ = linux.close(fd);
+    var off: usize = 0;
+    while (off < bytes.len) {
+        off += try cvt(linux.write(fd, bytes.ptr + off, bytes.len - off));
+    }
+}
+
+/// 把文件截断到 `size` 字节。
+pub fn truncateFile(path: []const u8, size: u64) !void {
+    const fd = try std.posix.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .WRONLY }, 0);
+    defer _ = linux.close(fd);
+    _ = try cvt(linux.ftruncate(fd, @intCast(size)));
 }
 
 // ---- 测试（在 Linux 运行；已在 WSL 验证） ----------------------------------

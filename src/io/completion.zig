@@ -52,11 +52,20 @@ pub const Completion = struct {
     /// 侵入式链表：等待期间挂在定时器队列，同步完成时挂在就绪队列。
     next: ?*Completion = null,
     deadline_ms: u64 = 0,
+
+    /// 通过 `Loop.watchdog` 挂上的截止时间定时器（`op == .timer`）。
+    /// 非空时：本操作正常完成会撤销它；它先到点则取消本操作。
+    /// 双向链接（配合 `Timer.target`）让撤销是 O(1)、无需额外分配。
+    timeout: ?*Completion = null,
 };
 
 pub const Timer = struct {
     c: Completion = .{ .op = .timer },
     duration_ms: u64,
+
+    /// 由 `Loop.watchdog` 设置：本定时器到点时要取消的操作。
+    /// 手动构造的普通定时器保持 `null`。
+    target: ?*Completion = null,
 
     pub fn init(duration_ms: u64) Timer {
         return .{ .duration_ms = duration_ms };

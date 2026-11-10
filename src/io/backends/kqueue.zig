@@ -411,6 +411,26 @@ fn vtWriteFileAll(userdata: ?*anyopaque, path: []const u8, bytes: []const u8) an
     return writeFileAll(path, bytes);
 }
 
+fn vtReadFileAt(userdata: ?*anyopaque, path: []const u8, offset: u64, buf: []u8) anyerror!usize {
+    _ = userdata;
+    return readFileAt(path, offset, buf);
+}
+
+fn vtAppendFile(userdata: ?*anyopaque, path: []const u8, bytes: []const u8) anyerror!void {
+    _ = userdata;
+    return appendFile(path, bytes);
+}
+
+fn vtTruncateFile(userdata: ?*anyopaque, path: []const u8, size: u64) anyerror!void {
+    _ = userdata;
+    return truncateFile(path, size);
+}
+
+fn vtDeleteFile(userdata: ?*anyopaque, path: []const u8) anyerror!void {
+    _ = userdata;
+    deleteFile(path);
+}
+
 const vtable_storage: root.VTable = .{
     .deinit = vtDeinit,
     .now = vtNow,
@@ -423,6 +443,10 @@ const vtable_storage: root.VTable = .{
     .fileSize = vtFileSize,
     .readFileInto = vtReadFileInto,
     .writeFileAll = vtWriteFileAll,
+    .readFileAt = vtReadFileAt,
+    .appendFile = vtAppendFile,
+    .truncateFile = vtTruncateFile,
+    .deleteFile = vtDeleteFile,
     .associate = vtAssociate,
     .recv = vtRecv,
     .send = vtSend,
@@ -698,6 +722,49 @@ pub fn deleteFile(path: []const u8) void {
     var zbuf: [1024]u8 = undefined;
     const z = zpath(path, &zbuf) catch return;
     _ = c.unlink(z.ptr);
+}
+
+/// 从 `offset` 处读入 `buf`，返回实际读到的字节数（文件尾会短读）。
+pub fn readFileAt(path: []const u8, offset: u64, buf: []u8) !usize {
+    var zbuf: [1024]u8 = undefined;
+    const z = try zpath(path, &zbuf);
+    const fd = c.open(z.ptr, .{ .ACCMODE = .RDONLY }, @as(c.mode_t, 0));
+    if (fd < 0) return error.OpenFailed;
+    defer _ = c.close(fd);
+    if (c.lseek(fd, @intCast(offset), c.SEEK.SET) < 0) return error.SeekFailed;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = c.read(fd, buf.ptr + total, buf.len - total);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        total += @intCast(n);
+    }
+    return total;
+}
+
+/// 在文件末尾追加 `bytes`；文件不存在时创建。
+pub fn appendFile(path: []const u8, bytes: []const u8) !void {
+    var zbuf: [1024]u8 = undefined;
+    const z = try zpath(path, &zbuf);
+    const fd = c.open(z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(c.mode_t, 0o644));
+    if (fd < 0) return error.OpenFailed;
+    defer _ = c.close(fd);
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = c.write(fd, bytes.ptr + off, bytes.len - off);
+        if (n < 0) return error.WriteFailed;
+        off += @intCast(n);
+    }
+}
+
+/// 把文件截断到 `size` 字节。
+pub fn truncateFile(path: []const u8, size: u64) !void {
+    var zbuf: [1024]u8 = undefined;
+    const z = try zpath(path, &zbuf);
+    const fd = c.open(z.ptr, .{ .ACCMODE = .WRONLY }, @as(c.mode_t, 0));
+    if (fd < 0) return error.OpenFailed;
+    defer _ = c.close(fd);
+    if (c.ftruncate(fd, @intCast(size)) < 0) return error.TruncateFailed;
 }
 
 test "kqueue backend type-checks end to end" {

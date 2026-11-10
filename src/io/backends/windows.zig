@@ -967,6 +967,26 @@ fn vtWriteFileAll(userdata: ?*anyopaque, path: []const u8, bytes: []const u8) an
     return writeFileAll(path, bytes);
 }
 
+fn vtReadFileAt(userdata: ?*anyopaque, path: []const u8, offset: u64, buf: []u8) anyerror!usize {
+    _ = userdata;
+    return readFileAt(path, offset, buf);
+}
+
+fn vtAppendFile(userdata: ?*anyopaque, path: []const u8, bytes: []const u8) anyerror!void {
+    _ = userdata;
+    return appendFile(path, bytes);
+}
+
+fn vtTruncateFile(userdata: ?*anyopaque, path: []const u8, size: u64) anyerror!void {
+    _ = userdata;
+    return truncateFile(path, size);
+}
+
+fn vtDeleteFile(userdata: ?*anyopaque, path: []const u8) anyerror!void {
+    _ = userdata;
+    deleteFile(path);
+}
+
 const vtable_storage: root.VTable = .{
     .deinit = vtDeinit,
     .now = vtNow,
@@ -979,6 +999,10 @@ const vtable_storage: root.VTable = .{
     .fileSize = vtFileSize,
     .readFileInto = vtReadFileInto,
     .writeFileAll = vtWriteFileAll,
+    .readFileAt = vtReadFileAt,
+    .appendFile = vtAppendFile,
+    .truncateFile = vtTruncateFile,
+    .deleteFile = vtDeleteFile,
     .associate = vtAssociate,
     .recv = vtRecv,
     .send = vtSend,
@@ -1019,6 +1043,13 @@ const fl32 = struct {
     extern "kernel32" fn WriteFile(h: HANDLE, buf: [*]const u8, to_write: u32, written: *u32, ov: ?*anyopaque) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn GetFileSizeEx(h: HANDLE, size: *i64) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn DeleteFileW(name: [*]const u16) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn SetFilePointerEx(
+        h: HANDLE,
+        distance: std.os.windows.LARGE_INTEGER,
+        new_pos: ?*std.os.windows.LARGE_INTEGER,
+        method: u32,
+    ) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn SetEndOfFile(h: HANDLE) callconv(.winapi) windows.BOOL;
 };
 
 const GENERIC_READ: u32 = 0x80000000;
@@ -1027,6 +1058,9 @@ const FILE_SHARE_READ: u32 = 0x00000001;
 const OPEN_EXISTING: u32 = 3;
 const CREATE_ALWAYS: u32 = 2;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+const OPEN_ALWAYS: u32 = 4;
+const FILE_BEGIN: u32 = 0;
+const FILE_END: u32 = 2;
 
 fn invalidHandle() HANDLE {
     return @ptrFromInt(std.math.maxInt(usize));
@@ -1080,4 +1114,49 @@ pub fn deleteFile(path: []const u8) void {
     var wbuf: [1024]u16 = undefined;
     const w = widePath(path, &wbuf) catch return;
     _ = fl32.DeleteFileW(w.ptr);
+}
+
+/// 从 `offset` 处读入 `buf`，返回实际读到的字节数（文件尾会短读）。
+/// 与 `readFileInto` 的区别是支持随机访问，是分段读大文件的基础。
+pub fn readFileAt(path: []const u8, offset: u64, buf: []u8) anyerror!usize {
+    var wbuf: [1024]u16 = undefined;
+    const w = try widePath(path, &wbuf);
+    const h = fl32.CreateFileW(w.ptr, GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
+    if (h == invalidHandle()) return error.FileNotFound;
+    defer _ = c.CloseHandle(h);
+    const dist: std.os.windows.LARGE_INTEGER = @intCast(offset);
+    if (!fl32.SetFilePointerEx(h, dist, null, FILE_BEGIN).toBool()) return error.RequestFailed;
+    var total: usize = 0;
+    while (total < buf.len) {
+        var got: u32 = 0;
+        if (!fl32.ReadFile(h, buf.ptr + total, @intCast(buf.len - total), &got, null).toBool()) return error.RequestFailed;
+        if (got == 0) break;
+        total += got;
+    }
+    return total;
+}
+
+/// 在文件末尾追加 `bytes`；文件不存在时创建。只做追加，不动既有内容。
+pub fn appendFile(path: []const u8, bytes: []const u8) anyerror!void {
+    var wbuf: [1024]u16 = undefined;
+    const w = try widePath(path, &wbuf);
+    const h = fl32.CreateFileW(w.ptr, GENERIC_WRITE, FILE_SHARE_READ, null, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, null);
+    if (h == invalidHandle()) return error.RequestFailed;
+    defer _ = c.CloseHandle(h);
+    // 定位到文件末尾再写，等价于 POSIX 的 O_APPEND 语义。
+    if (!fl32.SetFilePointerEx(h, 0, null, FILE_END).toBool()) return error.RequestFailed;
+    var written: u32 = 0;
+    if (!fl32.WriteFile(h, bytes.ptr, @intCast(bytes.len), &written, null).toBool()) return error.RequestFailed;
+}
+
+/// 把文件截断到 `size` 字节。
+pub fn truncateFile(path: []const u8, size: u64) anyerror!void {
+    var wbuf: [1024]u16 = undefined;
+    const w = try widePath(path, &wbuf);
+    const h = fl32.CreateFileW(w.ptr, GENERIC_WRITE, FILE_SHARE_READ, null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
+    if (h == invalidHandle()) return error.FileNotFound;
+    defer _ = c.CloseHandle(h);
+    const dist: std.os.windows.LARGE_INTEGER = @intCast(size);
+    if (!fl32.SetFilePointerEx(h, dist, null, FILE_BEGIN).toBool()) return error.RequestFailed;
+    if (!fl32.SetEndOfFile(h).toBool()) return error.RequestFailed;
 }

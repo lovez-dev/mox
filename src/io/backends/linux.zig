@@ -34,6 +34,9 @@ pub const fileSize = uring.fileSize;
 pub const readFileInto = uring.readFileInto;
 pub const writeFileAll = uring.writeFileAll;
 pub const deleteFile = uring.deleteFile;
+pub const readFileAt = uring.readFileAt;
+pub const appendFile = uring.appendFile;
+pub const truncateFile = uring.truncateFile;
 
 /// 当前进程实际选中的后端，便于测试与日志观测。
 pub const Choice = enum { uring, epoll };

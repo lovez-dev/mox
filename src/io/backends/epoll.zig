@@ -158,6 +158,26 @@ fn vtWriteFileAll(userdata: ?*anyopaque, path: []const u8, bytes: []const u8) an
     return uring.writeFileAll(path, bytes);
 }
 
+fn vtReadFileAt(userdata: ?*anyopaque, path: []const u8, offset: u64, buf: []u8) anyerror!usize {
+    _ = userdata;
+    return uring.readFileAt(path, offset, buf);
+}
+
+fn vtAppendFile(userdata: ?*anyopaque, path: []const u8, bytes: []const u8) anyerror!void {
+    _ = userdata;
+    return uring.appendFile(path, bytes);
+}
+
+fn vtTruncateFile(userdata: ?*anyopaque, path: []const u8, size: u64) anyerror!void {
+    _ = userdata;
+    return uring.truncateFile(path, size);
+}
+
+fn vtDeleteFile(userdata: ?*anyopaque, path: []const u8) anyerror!void {
+    _ = userdata;
+    uring.deleteFile(path);
+}
+
 fn vtAssociate(userdata: ?*anyopaque, socket: Handle, key: usize) anyerror!void {
     _ = userdata;
     _ = socket;
@@ -422,6 +442,10 @@ const vtable_storage: root.VTable = .{
     .fileSize = vtFileSize,
     .readFileInto = vtReadFileInto,
     .writeFileAll = vtWriteFileAll,
+    .readFileAt = vtReadFileAt,
+    .appendFile = vtAppendFile,
+    .truncateFile = vtTruncateFile,
+    .deleteFile = vtDeleteFile,
     .associate = vtAssociate,
     .recv = vtRecv,
     .send = vtSend,

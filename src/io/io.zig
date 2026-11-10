@@ -123,6 +123,15 @@ pub const VTable = struct {
     /// 在 `Work` 池线程里阻塞整文件写入（覆盖既有内容）。与 `readFileInto`
     /// 同样是所有后端共用的兜底：没有可移植的原生异步写接口。
     writeFileAll: *const fn (userdata: ?*anyopaque, path: []const u8, bytes: []const u8) anyerror!void,
+    /// 从 `offset` 处阻塞读入 `buf`（`Work` 池线程）。支持随机访问，
+    /// 是分段读大文件的基础；文件尾会短读而不是报错。
+    readFileAt: *const fn (userdata: ?*anyopaque, path: []const u8, offset: u64, buf: []u8) anyerror!usize,
+    /// 在文件末尾阻塞追加 `bytes`（`Work` 池线程）；文件不存在时创建。
+    appendFile: *const fn (userdata: ?*anyopaque, path: []const u8, bytes: []const u8) anyerror!void,
+    /// 把文件阻塞截断到 `size` 字节（`Work` 池线程）。
+    truncateFile: *const fn (userdata: ?*anyopaque, path: []const u8, size: u64) anyerror!void,
+    /// 删除文件（`Work` 池线程）。文件不存在时不报错。
+    deleteFile: *const fn (userdata: ?*anyopaque, path: []const u8) anyerror!void,
     /// 把套接字的完成包路由到本后端（Windows 上同时为监听套接字启用 `AcceptEx`）。
     associate: *const fn (userdata: ?*anyopaque, socket: Handle, key: usize) anyerror!void,
     /// 发起一次重叠接收。返回 `null` 表示尚未完成，稍后由 `wait` 投递。
@@ -214,6 +223,8 @@ pub const Loop = loop_mod.Loop;
 
 pub const ReadFile = @import("file.zig").ReadFile;
 pub const WriteFile = @import("file.zig").WriteFile;
+pub const TruncateFile = @import("file.zig").TruncateFile;
+pub const DeleteFile = @import("file.zig").DeleteFile;
 
 /// 编译期选定的本目标后端。新增后端 = 写一个导出 `create(allocator) !Io`
 /// 的文件，再在这里加一个分支。

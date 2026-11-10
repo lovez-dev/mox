@@ -255,6 +255,27 @@ resolver 配置（由调用方传入 server 地址）。加第三个能力仍然
 对有内核在飞的操作仍等后端取消完成包；`drainRetired(ms)` 只用于停机时
 等待最后一类，超时是泄漏对象而非崩溃。
 
+## 截止时间（deadline）
+
+`Loop.watchdog(c, &timer, ms)` 给任意已提交的操作挂一个截止时间：
+
+```zig
+var req_timer = Timer.init(0);
+loop.watchdog(&req.work.c, &req_timer, 3000); // 这个请求 3 秒内必须结束
+loop.add(&req.work.c);
+```
+
+`timer` 由调用方持有（内嵌即可，零额外分配），与目标操作通过双向指针关联：
+
+- 操作先完成 → `invoke` 自动摘除定时器，回调看到的是正常结果。
+- 定时器先到点 → 通知后端取消在飞操作，把 `error.DeadlineExceeded` 写进
+  操作的 `err`，然后回调一次并把回调指针置空；之后到达的完成包被静默丢弃。
+- `Loop.unwatchdog(c)` 可提前主动撤销。
+
+超时不走 `cancel` 的延迟回收路径：**对象仍归调用方**，因为调用方需要靠
+`getResult()` 读到 `DeadlineExceeded`。也没有「同一操作挂多个 watchdog」的语义，
+重复调用 `watchdog` 会先撤销上一个。
+
 ## 作为包被依赖
 
 仓库根有 `build.zig.zon`，包名 `mox`，最低 Zig 版本 `0.17.1`。外部项目
@@ -505,10 +526,16 @@ try mox.serveWith(.{ .gpa = gpa, .address = addr, .routes = routes }, mountAll);
 - 代码注释统一使用中文。
 - 不使用 `std.Io` 的异步运行时句柄；`std.Io.net.IpAddress` 仅作为地址值类型出现在接口签名里。
 - 文件读写都通过 `Work` 池在后台线程阻塞执行，完成回调回到循环线程。
-  `ReadFile`（缓冲区由调用方提供，命中 `memory_fs` 时只做一次 memcpy）与
-  `WriteFile`（整文件覆盖写，`VTable.writeFileAll` 是所有后端共用的兜底，
-  没有可移植的原生异步写接口）形状对称，都是内嵌 `Work` 节点的零分配结构。
-  两者都不在 `Loop` 上开便捷入口，用法是 `xxx.init(...)` + `loop.add(&xxx.work.c)`。
+  四个结构形状一致，都是内嵌 `Work` 节点的零分配结构，用法统一为
+  `xxx.init(...)` + `loop.add(&xxx.work.c)`，都不在 `Loop` 上开便捷入口：
+  - `ReadFile`：缓冲区由调用方提供，命中 `memory_fs` 时只做一次 memcpy；
+    `initAt(...)` 可指定起始偏移做随机访问（分段读大文件的基础），
+    偏移超出文件长度时短读为 0 字节而不报错。
+  - `WriteFile`：默认整文件覆盖写；`initAppend(...)` 追加到末尾并保留既有内容。
+  - `TruncateFile`：把文件截断到指定长度。
+  - `DeleteFile`：删除文件，文件不存在按成功处理（幂等）。
+  `VTable` 上对应的 `readFileInto`/`readFileAt`/`writeFileAll`/`appendFile`/
+  `truncateFile`/`deleteFile` 是所有后端共用的兜底，没有可移植的原生异步接口。
 
 ## 许可证
 
