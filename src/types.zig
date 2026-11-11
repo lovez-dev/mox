@@ -45,7 +45,10 @@ pub const Response = struct {
     file_path: []const u8 = "",
     /// `file_path` 由处理器堆分配时置位（由 mox 释放）。
     file_path_owned: bool = false,
-
+    /// WebSocket handler 函数指针（由 server.zig 解释）。
+    ws_handler: ?WsHandler = null,
+    /// SSE handler 函数指针（由 server.zig 解释）。
+    sse_handler: ?SseHandler = null,
     /// 返回 JSON 响应：content_type 自动设为 application/json。
     /// `json_body` 必须是已序列化的 JSON 字节切片。
     pub fn withJson(json_body: []const u8) Response {
@@ -66,7 +69,88 @@ pub const Response = struct {
         };
         return .{ .status = status, .headers = &S.h };
     }
+
+    /// 触发 WebSocket 升级。handler 返回此值后，mox 完成握手并循环调用
+    /// `ws_handler`，直到连接关闭。
+    pub fn upgrade(handler: WsHandler) Response {
+        return .{ .ws_handler = handler };
+    }
+
+    /// 触发 SSE 流。handler 返回此值后，mox 发出 SSE 头，
+    /// 然后反复调用 `sse_handler`（每次传入一个 `SseWriter`）直到 handler 返回 false。
+    pub fn sse(handler: SseHandler) Response {
+        return .{ .sse_handler = handler };
+    }
 };
+
+/// WebSocket 操作码。
+pub const WsOpcode = enum(u8) {
+    continuation = 0x0,
+    text = 0x1,
+    binary = 0x2,
+    close = 0x8,
+    ping = 0x9,
+    pong = 0xa,
+    _,
+};
+
+/// 单帧解码后的 WebSocket 消息。data 借用接收缓冲区（掩码已原地去除）。
+pub const WsMessage = struct {
+    opcode: WsOpcode,
+    data: []u8,
+};
+
+/// 传给 ws_handler 的 WebSocket 连接句柄。
+/// server.zig 负责在 handler 返回前保持此结构有效。
+pub const WsConn = struct {
+    /// 不透明指针，指向 server.zig 内部的 Connection；通过 vtable 操作。
+    ptr: *anyopaque,
+    vtable: *const WsVtable,
+
+    /// 发送文本帧（UTF-8）。
+    pub fn sendText(self: WsConn, data: []const u8) void {
+        self.vtable.send(self.ptr, .text, data);
+    }
+    /// 发送二进制帧。
+    pub fn sendBinary(self: WsConn, data: []const u8) void {
+        self.vtable.send(self.ptr, .binary, data);
+    }
+    /// 发送 close 帧并关闭连接。
+    pub fn close(self: WsConn) void {
+        self.vtable.close(self.ptr);
+    }
+};
+
+pub const WsVtable = struct {
+    send: *const fn (ptr: *anyopaque, opcode: WsOpcode, data: []const u8) void,
+    close: *const fn (ptr: *anyopaque) void,
+};
+
+/// WebSocket handler 签名：每收到一帧（或连接关闭）调用一次。
+pub const WsHandler = *const fn (conn: WsConn, msg: WsMessage) void;
+
+/// SSE writer 由 server.zig 管理；handler 通过它推送 event。
+pub const SseWriter = struct {
+    ptr: *anyopaque,
+    vtable: *const SseVtable,
+
+    /// 发送一个 SSE event。event 可为空（使用默认 "message"）。
+    pub fn send(self: SseWriter, event: []const u8, data: []const u8) void {
+        self.vtable.send(self.ptr, event, data);
+    }
+    /// 关闭 SSE 流。
+    pub fn close(self: SseWriter) void {
+        self.vtable.close(self.ptr);
+    }
+};
+
+pub const SseVtable = struct {
+    send: *const fn (ptr: *anyopaque, event: []const u8, data: []const u8) void,
+    close: *const fn (ptr: *anyopaque) void,
+};
+
+/// SSE handler 签名：服务端推送时反复调用；返回 false 表示流结束。
+pub const SseHandler = *const fn (writer: SseWriter) bool;
 
 /// 交给每个处理器与中间件的单次请求状态，仅在调用期间有效。
 pub const Context = struct {

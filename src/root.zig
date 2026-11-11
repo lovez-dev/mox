@@ -37,6 +37,16 @@ pub const Header = types.Header;
 pub const ErrorHandler = types.ErrorHandler;
 pub const group = types.group;
 pub const routes = types.routes;
+pub const multipart = @import("multipart.zig");
+pub const Multipart = multipart.Part;
+pub const extractBoundary = multipart.extractBoundary;
+pub const parseMultipart = multipart.parse;
+pub const WsConn = types.WsConn;
+pub const WsMessage = types.WsMessage;
+pub const WsOpcode = types.WsOpcode;
+pub const WsHandler = types.WsHandler;
+pub const SseWriter = types.SseWriter;
+pub const SseHandler = types.SseHandler;
 
 test {
     @import("std").testing.refAllDecls(@This());
