@@ -255,3 +255,243 @@ test "cors GET 请求透传且追加 CORS 头" {
     }
     try std.testing.expect(found);
 }
+
+// ---- 静态文件 MIME 检测 ---------------------------------------------------
+
+/// 根据文件扩展名猜测 Content-Type。
+pub fn mimeFor(path: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, path, ".html") or std.mem.endsWith(u8, path, ".htm"))
+        return "text/html; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".css")) return "text/css; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".js")) return "text/javascript; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".json")) return "application/json";
+    if (std.mem.endsWith(u8, path, ".svg")) return "image/svg+xml";
+    if (std.mem.endsWith(u8, path, ".png")) return "image/png";
+    if (std.mem.endsWith(u8, path, ".jpg") or std.mem.endsWith(u8, path, ".jpeg"))
+        return "image/jpeg";
+    if (std.mem.endsWith(u8, path, ".gif")) return "image/gif";
+    if (std.mem.endsWith(u8, path, ".ico")) return "image/x-icon";
+    if (std.mem.endsWith(u8, path, ".woff2")) return "font/woff2";
+    if (std.mem.endsWith(u8, path, ".woff")) return "font/woff";
+    if (std.mem.endsWith(u8, path, ".txt")) return "text/plain; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".xml")) return "application/xml";
+    if (std.mem.endsWith(u8, path, ".pdf")) return "application/pdf";
+    if (std.mem.endsWith(u8, path, ".wasm")) return "application/wasm";
+    return "application/octet-stream";
+}
+
+/// 静态文件目录 handler 工厂。
+///
+/// `staticDir("/public")` 返回一个 Handler，把路由里的 `*path`
+/// 参数拼到 `dir` 前缀后作为磁盘路径（走 Work 池读取）：
+///
+///     .{ .method = .GET, .path = "/static/*path", .handler = mox.staticDir("/public") }
+///
+/// 注意：`dir` 必须是编译期常量（comptime），路径拼接在堆上分配。
+pub fn staticDir(comptime dir: []const u8) Handler {
+    return struct {
+        fn handle(ctx: *Context) anyerror!Response {
+            const sub = ctx.param("path") orelse
+                return Response{ .status = .not_found, .body = "not found\n" };
+            // 防路径穿越：拒绝含 .. 的子路径。
+            if (std.mem.indexOf(u8, sub, "..") != null)
+                return Response{ .status = .bad_request, .body = "bad path\n" };
+            const path = try std.fmt.allocPrint(ctx.gpa, dir ++ "{s}", .{sub});
+            return Response{
+                .file_path = path,
+                .file_path_owned = true,
+                .content_type = mimeFor(sub),
+            };
+        }
+    }.handle;
+}
+
+// ---- 限流（滑动窗口 / per-IP token bucket）-------------------------------
+
+/// 限流中间件配置。
+pub const RateLimitOptions = struct {
+    /// 窗口大小（毫秒）。
+    window_ms: u64 = 60_000,
+    /// 每个来源在窗口内允许的最大请求数。
+    max_requests: u32 = 100,
+    /// 超限时的响应体文字。
+    message: []const u8 = "rate limit exceeded\n",
+};
+
+/// 返回基于内存的 per-IP 滑动计数器限流中间件。
+///
+/// **重要**：每次 `compose` 调用生成独立的全局计数器（comptime static），
+/// 因此同一进程里不要对同一路由 `compose` 两次。
+/// 生产用途建议用外部 Redis 计数器；此实现适合单节点测试/原型。
+pub fn rateLimit(comptime opts: RateLimitOptions) Middleware {
+    return struct {
+        // 每个 Bucket 对应一个 IPv4/IPv6 来源。最多 1024 个桶；超出时 LRU 淘汰最旧。
+        const max_buckets = 1024;
+        const Bucket = struct {
+            ip: [64]u8 = undefined,
+            ip_len: usize = 0,
+            count: u32 = 0,
+            window_start: u64 = 0,
+        };
+        // comptime static —— 进程生命周期内持久。
+        var buckets: [max_buckets]Bucket = std.mem.zeroes([max_buckets]Bucket);
+        var bucket_len: usize = 0;
+        // 自旋锁（单核场景退化为 nop；mox 使用单线程事件循环，
+        // handler 在主线程运行，这里无竞争，仅做形式保护）。
+        var lock = std.atomic.Value(bool).init(false);
+
+        fn acquire() void {
+            while (lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+        }
+        fn release() void {
+            lock.store(false, .release);
+        }
+
+        fn nowMs() u64 {
+            const mox_io = @import("mox_io");
+            return mox_io.platform.tickCount();
+        }
+
+        fn findOrCreate(ip: []const u8) *Bucket {
+            for (buckets[0..bucket_len]) |*b| {
+                if (std.mem.eql(u8, b.ip[0..b.ip_len], ip)) return b;
+            }
+            // 未找到：若有空位新建；否则复用最旧（count 最小）的桶。
+            if (bucket_len < max_buckets) {
+                const b = &buckets[bucket_len];
+                bucket_len += 1;
+                b.ip_len = @min(ip.len, b.ip.len);
+                @memcpy(b.ip[0..b.ip_len], ip[0..b.ip_len]);
+                b.count = 0;
+                b.window_start = nowMs();
+                return b;
+            }
+            var oldest: *Bucket = &buckets[0];
+            for (buckets[1..bucket_len]) |*b| {
+                if (b.window_start < oldest.window_start) oldest = b;
+            }
+            oldest.ip_len = @min(ip.len, oldest.ip.len);
+            @memcpy(oldest.ip[0..oldest.ip_len], ip[0..oldest.ip_len]);
+            oldest.count = 0;
+            oldest.window_start = nowMs();
+            return oldest;
+        }
+
+        fn wrap(comptime next: Handler) Handler {
+            return struct {
+                fn handle(ctx: *Context) anyerror!Response {
+                    // 从 X-Forwarded-For 或 X-Real-IP 读来源 IP；
+                    // 生产环境应只信任 nginx 转发的头，这里做简化实现。
+                    const ip = ctx.request.header("x-real-ip") orelse
+                        ctx.request.header("x-forwarded-for") orelse "unknown";
+
+                    acquire();
+                    defer release();
+
+                    const now = nowMs();
+                    const b = findOrCreate(ip);
+                    // 窗口滚动
+                    if (now - b.window_start >= opts.window_ms) {
+                        b.count = 0;
+                        b.window_start = now;
+                    }
+                    b.count += 1;
+                    if (b.count > opts.max_requests) {
+                        return Response{ .status = .too_many_requests, .body = opts.message };
+                    }
+                    return next(ctx);
+                }
+            }.handle;
+        }
+    }.wrap;
+}
+
+// ---- 结构化 JSON 日志 -------------------------------------------------------
+
+/// JSON 日志中间件。把每个请求的方法、路径、状态、耗时写到 stderr（JSON Lines）。
+///
+/// 输出示例：{"ts":1731345670123,"method":"GET","path":"/api","status":200,"ms":3}
+pub fn jsonLog(comptime next: Handler) Handler {
+    return struct {
+        fn nowMs() u64 {
+            const mox_io = @import("mox_io");
+            return mox_io.platform.tickCount();
+        }
+        fn handle(ctx: *Context) anyerror!Response {
+            const t0 = nowMs();
+            const response = try next(ctx);
+            const elapsed = nowMs() - t0;
+            // 直接写 stderr，不经过 std.log（避免 std.log 格式前缀影响解析）。
+            std.debug.print(
+                "{{\"ts\":{d},\"method\":\"{s}\",\"path\":\"{s}\",\"status\":{d},\"ms\":{d}}}\n",
+                .{
+                    t0,
+                    @tagName(ctx.request.method),
+                    ctx.request.path,
+                    @backingInt(response.status),
+                    elapsed,
+                },
+            );
+            return response;
+        }
+    }.handle;
+}
+
+// ---- 新增测试 ---------------------------------------------------------------
+
+test "mimeFor 识别常见扩展名" {
+    try std.testing.expect(std.mem.startsWith(u8, mimeFor("app.js"), "text/javascript"));
+    try std.testing.expect(std.mem.startsWith(u8, mimeFor("index.html"), "text/html"));
+    try std.testing.expect(std.mem.startsWith(u8, mimeFor("style.css"), "text/css"));
+    try std.testing.expectEqualStrings("application/octet-stream", mimeFor("file.bin"));
+    try std.testing.expectEqualStrings("image/svg+xml", mimeFor("logo.svg"));
+    try std.testing.expectEqualStrings("application/wasm", mimeFor("module.wasm"));
+}
+
+test "staticDir 拒绝路径穿越" {
+    const http = @import("http.zig");
+    const req: http.Request = .{
+        .method = .GET,
+        .target = "/static/../etc/passwd",
+        .path = "/static/../etc/passwd",
+        .version = "HTTP/1.1",
+        .head = "",
+        .body = "",
+        .keep_alive = false,
+    };
+    var params: @import("types.zig").Params = .{};
+    _ = params.push("path", "/../etc/passwd");
+    var ctx: Context = .{
+        .gpa = std.testing.allocator,
+        .request = &req,
+        .params = &params,
+    };
+    const h = staticDir("/public");
+    const resp = try h(&ctx);
+    try std.testing.expectEqual(std.http.Status.bad_request, resp.status);
+}
+
+test "rateLimit 超出限额后返回 429" {
+    const http = @import("http.zig");
+    const req: http.Request = .{
+        .method = .GET,
+        .target = "/",
+        .path = "/",
+        .version = "HTTP/1.1",
+        .head = "x-real-ip: 1.2.3.4",
+        .body = "",
+        .keep_alive = true,
+    };
+    var params: @import("types.zig").Params = .{};
+    var ctx: Context = .{
+        .gpa = std.testing.allocator,
+        .request = &req,
+        .params = &params,
+    };
+    // 窗口 60s，限 1 次——用独立实例隔离 comptime 桶
+    const limiter = rateLimit(.{ .window_ms = 60_000, .max_requests = 1 });
+    const app = limiter(ok);
+    _ = try app(&ctx); // 第 1 次：ok
+    const resp = try app(&ctx); // 第 2 次：超限
+    try std.testing.expectEqual(std.http.Status.too_many_requests, resp.status);
+}
