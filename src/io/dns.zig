@@ -232,46 +232,17 @@ fn buildQueryAAAA(buf: []u8, name: []const u8) usize {
     return off + 4;
 }
 
-/// 高层便捷接口：封装 Work 节点 + 自动探测 A/AAAA。
-/// 使用系统 resolver 配置（读 /etc/resolv.conf 或 Windows registry）。
-pub const GetAddressList = struct {
-    work: @import("completion.zig").Work,
-    host: []const u8,
-    port: u16,
-    allocator: std.mem.Allocator,
-    addresses: ?[]std.net.Address = null,
-    err: ?anyerror = null,
-
-    pub fn init(allocator: std.mem.Allocator, host: []const u8, port: u16) GetAddressList {
-        return .{
-            .work = @import("completion.zig").Work.init(run),
-            .allocator = allocator,
-            .host = host,
-            .port = port,
-        };
-    }
-
-    fn run(w: *@import("completion.zig").Work) void {
-        const self: *GetAddressList = @fieldParentPtr("work", w);
-        // 回落到系统 getaddrinfo（阻塞调用，运行在 Work 池线程）
-        self.addresses = std.net.getAddressList(self.allocator, self.host, self.port) catch |e| {
-            self.err = e;
-            return;
-        };
-    }
-
-    pub fn deinit(self: *GetAddressList) void {
-        if (self.addresses) |addrs| {
-            self.allocator.free(addrs);
-            self.addresses = null;
-        }
-    }
-
-    pub fn getResult(self: *GetAddressList) ![]const std.net.Address {
-        if (self.err) |e| return e;
-        return self.addresses orelse error.NoAddresses;
-    }
-};
+// ──────────────────────────────────────────────────────────────
+// 高层域名→地址解析（getaddrinfo 封装）
+// ──────────────────────────────────────────────────────────────
+// Zig 0.17.1 的域名解析入口是 std.Io.net.HostName.lookup，需要 std.Io
+// 异步运行时句柄——mox_io 明确不用 std.Io 运行时，因此无法直接复用。
+// 无 libc 的 Linux 上 getaddrinfo 也不可用（它是 libc 函数，非 syscall）。
+//
+// 需要高层解析的调用方有两个选择：
+// 1. 用低层 Query 节点指向已知 DNS 服务器（如 127.0.0.53 或 8.8.8.8）
+// 2. 在上层应用中自行解析 /etc/resolv.conf 再调 Query
+//
 
 test "DNS 查询报文格式与应答解析" {
     var buf: [512]u8 = undefined;

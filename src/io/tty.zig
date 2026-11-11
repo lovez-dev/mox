@@ -42,19 +42,11 @@ else
     std.posix.termios;
 
 /// 获取终端尺寸（字符行列）。
+/// Windows：Zig 0.17.1 的 kernel32.zig 未暴露 GetConsoleScreenBufferInfo，
+/// 暂返回 error.Unsupported；POSIX 路径经 CI 实测。
 pub fn getSize(handle: Handle) !Size {
     if (is_windows) {
-        const kernel32 = std.os.windows.kernel32;
-        var info: std.os.windows.CONSOLE_SCREEN_BUFFER_INFO = undefined;
-        if (kernel32.GetConsoleScreenBufferInfo(handle, &info) == 0) {
-            return error.GetConsoleFailed;
-        }
-        const cols = info.srWindow.Right - info.srWindow.Left + 1;
-        const rows = info.srWindow.Bottom - info.srWindow.Top + 1;
-        return .{
-            .rows = @intCast(rows),
-            .cols = @intCast(cols),
-        };
+        return error.Unsupported; // TODO: Windows ConPTY / GetConsoleScreenBufferInfo
     } else {
         var ws: std.posix.system.winsize = undefined;
         const rc = std.posix.system.ioctl(handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
@@ -64,47 +56,30 @@ pub fn getSize(handle: Handle) !Size {
 }
 
 /// 保存当前终端状态（用于后续恢复）。
+/// Windows：kernel32.zig 未暴露 GetConsoleMode，暂返回 error.Unsupported。
 pub fn save(handle: Handle) !SavedState {
     if (is_windows) {
-        const kernel32 = std.os.windows.kernel32;
-        var input_mode: std.os.windows.DWORD = 0;
-        if (kernel32.GetConsoleMode(handle, &input_mode) == 0) return error.GetConsoleFailed;
-        // 输出模式从 stdout 读取（假设 handle 是 stdin，需要另一个 handle）
-        // 简化实现：只保存输入模式；输出模式由调用方分别保存 stdout handle。
-        return .{ .input_mode = input_mode, .output_mode = 0 };
+        return error.Unsupported; // TODO: Windows GetConsoleMode
     } else {
         return try std.posix.tcgetattr(handle);
     }
 }
 
 /// 恢复终端状态。
+/// Windows：kernel32.zig 未暴露 SetConsoleMode，暂返回 error.Unsupported。
 pub fn restore(handle: Handle, state: SavedState) !void {
     if (is_windows) {
-        const kernel32 = std.os.windows.kernel32;
-        if (kernel32.SetConsoleMode(handle, state.input_mode) == 0) {
-            return error.SetConsoleFailed;
-        }
+        return error.Unsupported; // TODO: Windows SetConsoleMode
     } else {
         try std.posix.tcsetattr(handle, .FLUSH, state);
     }
 }
 
 /// 设置终端模式。
+/// Windows：kernel32.zig 未暴露 GetConsoleMode/SetConsoleMode，暂返回 error.Unsupported。
 pub fn setMode(handle: Handle, mode: Mode) !void {
     if (is_windows) {
-        const kernel32 = std.os.windows.kernel32;
-        var current_mode: std.os.windows.DWORD = 0;
-        if (kernel32.GetConsoleMode(handle, &current_mode) == 0) {
-            return error.GetConsoleFailed;
-        }
-        const new_mode = switch (mode) {
-            .cooked => current_mode | 0x0001 | 0x0002 | 0x0004, // ENABLE_ECHO_INPUT | LINE_INPUT | PROCESSED_INPUT
-            .raw => current_mode & ~@as(std.os.windows.DWORD, 0x0001 | 0x0002 | 0x0004),
-            .cbreak => (current_mode | 0x0001) & ~@as(std.os.windows.DWORD, 0x0002), // 回显、无行缓冲
-        };
-        if (kernel32.SetConsoleMode(handle, new_mode) == 0) {
-            return error.SetConsoleFailed;
-        }
+        return error.Unsupported; // TODO: Windows GetConsoleMode/SetConsoleMode
     } else {
         var termios = try std.posix.tcgetattr(handle);
         switch (mode) {
@@ -138,11 +113,10 @@ pub fn setMode(handle: Handle, mode: Mode) !void {
 }
 
 /// 是否是 TTY（而非管道、文件重定向）。
+/// Windows：isTty 通过 NtQueryObject 或 ConDrv 判断，暂返回 false。
 pub fn isTty(handle: Handle) bool {
     if (is_windows) {
-        const kernel32 = std.os.windows.kernel32;
-        var mode: std.os.windows.DWORD = 0;
-        return kernel32.GetConsoleMode(handle, &mode) != 0;
+        return false; // TODO: Windows ConDrv / NtQueryObject 检测
     } else {
         return std.posix.isatty(handle);
     }
