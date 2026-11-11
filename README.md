@@ -108,27 +108,6 @@ Loop ── io.vtable.recv/send/accept/connect ──► 后端（IOCP / io_urin
   正常路径下后端都会很快投递完成包；若超时仍未排空，为保证不发生悬空访问，
   对象会被留在登记表里（泄漏而非崩溃），由 `Loop.deinit` 释放表本身。
 
-### 运行时配置（`openWith`）
-
-`mox_io.open(alloc)` 用默认参数构造循环，现有代码无需改动。要调资源尺寸用
-`openWith`，形状对齐 zio 的 `Loop.Options` / `RuntimeOptions`——同一进程可开多个
-不同配置的循环：
-
-```zig
-var loop = try mox_io.openWith(gpa, .{
-    .queue_size = 512,   // 后端事件队列容量，2 的幂；io_uring 下 SQ=它、CQ=它×8
-    .max_workers = 8,    // Work 线程池上限，0 = 平台默认（4）
-    .backend = .epoll,   // 仅 Linux：覆盖后端选择
-});
-```
-
-- `queue_size` 会真正传到后端：io_uring 的 SQ/CQ 环、epoll/kqueue 就绪数组、
-  IOCP 完成端口批量大小都随之缩放（epoll/kqueue/IOCP 当前仍是定长批量数组，
-  只接参数不改行为，见各 `createWith` 注释）。
-- **`inflight_max` 不要手填。** 留空由后端按 `queue_size × 4` 推导；显式给大值会
-  被钳制到「CQ 环容量的一半」。放开它只会在大批量提交时灌爆 CQ 环、内核丢
-  完成包、回调永不触发——这是实测踩过的坑。
-
 ## 目录结构
 
 ```
@@ -146,7 +125,7 @@ src/
     queue.zig       侵入式 FIFO 就绪队列
     timer.zig       定时器有序链表
     pool.zig        Work 线程池
-    file.zig        文件节点：ReadFile / WriteFile / SendFile / Truncate / Delete
+    file.zig        阻塞文件读兜底
     tests.zig       事件循环测试
     queue.zig       就绪 FIFO
     timer.zig       定时器有序表
@@ -211,53 +190,6 @@ A/B 是临时把 `loop.zig` 的 `batch_size` 改成 1 跑出来的，已改回 6
 **这些数字只用于本项目改动前后的自身对比。** zio 没有提供同 workload 的
 benchmark，API 也不兼容；在建立 zio 适配器与共同负载之前，不能据此声称
 「与 zio 对齐」或「不比 zio 差」。
-
-### 与 zio / fasthttp 同机对标
-
-同一台机器（WSL2，4 核，内核 6.18）、同一个压测客户端，避免跨机误差：
-
-| 场景 | mox | 对照 |
-|---|---|---|
-| TCP ping-pong，50 连接 | **187.8k ops/s，5.3 µs/op** | zio 181.0k，5.5 µs/op |
-| HTTP/1.1 keep-alive，c=200 | **74.9k req/s** | fasthttp 66.3k req/s |
-
-zio 是 Zig 的事件循环库（io_uring + work-stealing 调度），fasthttp 是 Go 的
-高性能 HTTP 服务端，两者都是各自生态的性能标杆。测法：zio 与 mox 各写一个
-无人工延迟的 echo 服务端，用同一个 Go 客户端跑 ping-pong；HTTP 侧用 `hey`
-打同一个固定响应。
-
-**这些绝对数字只在本机内部有意义**（4 核 WSL、客户端与服务端抢同一批
-CPU），不要拿去做跨平台横比。有价值的是同机相对差距。
-
-踩到的关键坑：io_uring 后端曾在 `getSqe` 里对每个 `add` 立即
-`io_uring_enter`，把批量提交彻底废掉。功能全对、所有测试全绿，但
-strace 显示 25000 次往返产生 **50101 次 enter**（每操作 2 次），吞吐比
-zio 低 22%。改为只在 `waitBatch` 开头 flush 一次后，enter 降到 **1051**
-（-97.9%），吞吐反超 zio。**这类退化没有任何功能测试能抓到，只能数
-syscall**——所以后端保留了只读探针 `enterCalls()` 和对应的回归测试。
-
-### 试过但未启用：io_uring 的 `DEFER_TASKRUN` / `SINGLE_ISSUER` / `COOP_TASKRUN`
-
-按 zio 的形状把队列容量做成运行时 `queue_size` 时，顺手试了这三个标志（zio
-默认开）。结论：**`SINGLE_ISSUER` 本身无害，但 `DEFER_TASKRUN` 在批量负载下
-让吞吐腰斩**，实测 `bench-burst` 20000 ops（ReleaseFast，WSL2 内核 6.18）：
-
-| 标志组合 | ops/s |
-|---|---|
-| 仅 `CQSIZE`（当前） | 91k–109k |
-| `+ SINGLE_ISSUER` | 90k–109k（与基线持平） |
-| `+ DEFER_TASKRUN + COOP` | 51k–60k（**腰斩**） |
-
-`DEFER_TASKRUN` 把完成包的 task_work 推迟到 `io_uring_enter(GETEVENTS)` 时刻，
-需要把等待模型从外部 `poll(ring_fd/eventfd)` 改成 `io_uring_enter2` + 内核侧
-`timespec` 超时，并把跨线程 `notify` 的 eventfd 也做成环内 multishot `POLL_ADD`
-才能被唤醒——这套改造本身能跑通（mox 实测全绿），但批量负载下每次 enter 只
-推进有限 task_work，20000 个操作要非常多次 `enter2` 才收完，吞吐掉一半。
-
-诚实结论：**`DEFER_TASKRUN` 不适合 mox 的批量收割模型，不启用**。`queue_size`
-运行时化与 `openWith` 保留（明确有价值），等待模型保持久经验证的 `poll`。
-（另一条实测：`io_uring_getevents_arg.ts` 是**指向 `timespec` 的指针**而非纳秒
-整数，传整数会让内核解引用野指针直接返回 `EFAULT(-14)`。）
 
 ## Linux 后端：io_uring 与 epoll
 
@@ -468,74 +400,6 @@ loop.add(&s.work.c);
 
 两道防线都有变异测试证明有效：撤掉 `MSG_NOSIGNAL` 后进程被信号杀死；只靠
 `SIG_IGN` 时裸 `write` 能拿到 `EPIPE` 并存活。
-## 文件系统操作
-
-除读写删之外，`Loop` 还提供目录与元数据操作。**这些都是同步入口**（直接调
-平台层），在 `Work` 节点内部复用；在循环线程里直接调用会卡住整个循环，
-异步场景请用对应的节点。
-
-| 操作 | 语义 |
-|---|---|
-| `makeDir(path, mode)` | 逐级创建（`mkdir -p`），已存在不报错 |
-| `removeDir(path)` | 只删空目录，非空报 `DirNotEmpty`，**不递归** |
-| `rename(from, to)` | 跨设备报 `CrossDevice`，不退化成「复制+删除」 |
-| `symLink(target, link)` | Windows 需管理员权限或开发者模式 |
-| `statPath(path)` | 返回 `FileKind` / `size` / `mtime_ms`，跟随符号链接 |
-| `listDir(path, buf)` | 列出条目（`DirEntry` 数组），返回条数 |
-
-`makeDir` 逐级创建、`removeDir` 不递归是刻意的：递归删除太危险，静默截断
-路径会操作到别的文件——宁可明确失败。
-
-### Unix domain socket
-
-```zig
-const listener = try loop.createUnixSocket();
-try loop.bindUnix(listener, "/tmp/app.sock");   // 已存在报 PathAlreadyExists
-try loop.listen(listener, 8);
-// 之后与 TCP 完全同形：NetAccept / NetRecv / NetSend
-```
-
-三个 POSIX 后端各自实现（io_uring 走 `prep_connect` 原生异步；epoll 与
-kqueue 做非阻塞 connect）。**Windows 整组槽位为 `null`**，返回
-`error.Unsupported`。
-
-已知限制：`connect` 的 `sockaddr_un` 要活到内核读完，只能塞进 64 字节的
-`Scratch`，扣掉结构头后路径上限约 62 字节。覆盖 `/tmp/x.sock`、
-`/var/run/x.sock` 这类常见路径；超出时明确报 `NameTooLong`，而不是截断
-连到别的 socket。
-
-### 原生异步文件 I/O（仅 io_uring）
-
-Linux 上文件读写是真异步——提交 SQE，完成时回调，不占池线程：
-
-```zig
-var f = root.ReadFileAsync.init("/path/to/file ", &buf);
-f.c.callback = &onRead;
-loop.add(&f.c);
-```
-
-`openat` 与 `close` 留同步，只 `read`/`write` 异步。两条实测结论支撑这个
-取舍：`IOSQE_IO_LINK` **不会**把前一条的返回值传给后一条的 fd 字段；把
-`close` 链在 `read` 后面，它的 CQE 会回 `-125`（ECANCELED）导致 fd 泄漏。
-两者都是纳秒到微秒级的元数据操作，留在同步侧没有可观测代价。
-
-非 io_uring 后端 `readFileAsync`/`writeFileAsync` 为 `null`，节点返回
-`error.Unsupported`，调用方回落 `ReadFile`（`Work` 版）。
-
-### 零拷贝文件 → socket（`SendFile`）
-
-```zig
-var sf = root.SendFile.init(loop.io, socket, "/path/to/big.bin");
-sf.work.c.callback = &onSent;   // 或直接 loop.sendFile(socket, path, 0, 0)
-```
-
-`sendfile(2)` 把页缓存直接送进 socket 缓冲，不经用户态。走 `Work` 池而不是
-异步后端——它本身已是零拷贝，只有数据量大时才阻塞，两者结合同时拿到「不
-阻塞循环」和「不复制数据」。
-
-三平台签名不同（Darwin 参数顺序与 Linux 相反，FreeBSD 多一个出参），逐个
-适配。Windows 的 `TransmitFile` 在 std 里没绑定，槽位为 `null`。
-
 ## 作为包被依赖
 
 仓库根有 `build.zig.zon`，包名 `mox`，最低 Zig 版本 `0.17.1`。外部项目
@@ -583,46 +447,6 @@ exe.root_module.addImport("mox_io", dep.module("mox_io"));
 
 已知容量上限：非文件响应受每连接 `send_buf`（16 KB）限制，超出会返回 500；
 文件响应走动态缓冲区不受此限。这是容量问题，不是正确性问题。
-
-## 连接管理：并发上限、空闲超时、优雅停机
-
-server 层面向生产的几个硬缺口已补齐，均可经 `Config` 调参：
-
-```zig
-try mox.serve(.{
-    .gpa = gpa,
-    .address = addr,
-    .routes = routes,
-    .max_connections = 1024,   // 并发连接上限
-    .idle_timeout_ms = 60_000, // 两次请求间最长静默
-    .accept_backoff_ms = 50,   // accept 失败退避
-    .shutdown_timeout_ms = 5_000,
-});
-```
-
-- **并发上限**：达到 `max_connections` 后不再 `accept`，新连接留在内核
-  listen backlog 里排队（天然背压），而不是无限制地吃内存 / fd。有连接
-  释放腾出名额后自动恢复接受。
-- **accept 失败退避**：`accept` 因 `EMFILE` / `ENFILE`（fd 耗尽）失败时，
-  **不能立即重试**——失败→立即重试会在错误持续期间把循环线程 CPU 打满。
-  改为用一个短定时器（`accept_backoff_ms`）延时重试，期间照常服务已有连接。
-- **空闲超时**：每个连接在「等下一个请求」期间挂一个 `idle_timeout_ms` 的
-  定时器；到点仍未收到新数据即关闭，防半开连接 / 慢速攻击长期占资源。
-  `0` 表示不设。
-- **优雅停机**：`loop.run()` 退出后，server 不再粗暴丢弃在飞连接，而是：
-  停止接受 → 逐个 `abortConn`（按连接所处阶段取消对应的在飞 recv/send/
-  file-read，空闲连接直接关闭）→ `Loop.drainOpen` 继续驱动循环把收尾完成包
-  收干净，直到所有连接释放或超过 `shutdown_timeout_ms`。
-
-**取消的释放时机**（关键正确性点）：中止一个带在飞操作的连接时，**绝不**
-同步 `destroy`——后端可能还持有指向 `conn.recv`/`conn.send` 的节点，立即释放
-就是 use-after-free。正确做法是 `loop.cancel` 那个操作，把连接释放在它的完成包
-回来时（`freeConnCtx`）做。`Connection.state` 记录当前阶段，停机时据此决定
-该取消哪个节点。
-
-三条回归测试各有洞：达上限不投递 accept、静默连接被空闲超时关闭、`drainOpen`
-停机后关闭在飞连接。都用变异测试确认有验证力（分别禁用容量守卫 / idle 定时器
-挂载 / `drainOpen` 的回调派发，均明确变红而非挂死）。
 
 ## UDP 与 DNS：原生异步，不再占用线程池
 
@@ -731,8 +555,8 @@ macOS arm64 kqueue 均在 CI 中跑全量测试。
 
 | 目标 | 架构 | 状态 |
 |---|---|---|
-| Windows（IOCP） | x86_64 / arm64 | 全量测试、真包依赖、性能尺子均在 CI 中运行；子进程四场景本地实跑；`Signal` / UDS / 异步文件 I/O / `sendfile` 明确返回 `Unsupported` |
-| Linux（io_uring + epoll） | x86_64 / arm64 | 同上；`zig build test` 同时跑 epoll 专属测试，WSL 开发机实跑 71/76（含子进程、信号、WatchFd、目录操作、UDS、异步文件 I/O 与 sendfile；uring 与 epoll 双后端各跑一遍） |
+| Windows（IOCP） | x86_64 / arm64 | 全量测试、真包依赖、性能尺子均在 CI 中运行；子进程四场景本地实跑；`Signal` 明确返回 `Unsupported` |
+| Linux（io_uring + epoll） | x86_64 / arm64 | 同上；`zig build test` 同时跑 epoll 专属测试，WSL 开发机实跑 59/61（含子进程、信号与 WatchFd；uring 与 epoll 双后端各跑一遍） |
 | macOS（kqueue） | arm64 | CI 真跑全量 kqueue 运行时测试，逐条隔离 + 20 秒看门狗 |
 
 BSD 不在覆盖范围内。
@@ -837,6 +661,151 @@ try mox.serveWith(.{ .gpa = gpa, .address = addr, .routes = routes }, mountAll);
     （含文件不存在与权限不足），因此它不会报错——需要可靠删除请自行先 `fileSize` 探测。
   `VTable` 上对应的 `readFileInto`/`readFileAt`/`writeFileAll`/`appendFile`/
   `truncateFile`/`deleteFile` 是所有后端共用的兜底，没有可移植的原生异步接口。
+
+### 目录与元数据操作
+
+`Loop` 暴露 6 个**同步**方法（阻塞调用，在 `Work` 池线程里跑才不卡循环）：
+
+```zig
+pub fn makeDir(self: *Loop, path: []const u8, mode: u32) !void
+pub fn removeDir(self: *Loop, path: []const u8) !void
+pub fn rename(self: *Loop, old_path: []const u8, new_path: []const u8) !void
+pub fn symLink(self: *Loop, target: []const u8, link_path: []const u8) !void
+pub fn statPath(self: *Loop, path: []const u8) !Stat
+pub fn listDir(self: *Loop, path: []const u8, buf: []DirEntry) !usize
+```
+
+对应的异步节点（`MakeDir`、`RemoveDir`、`Rename`、`SymLink`、`StatPath`、`ListDir`）
+都内嵌 `Work`，用法与文件读写一致：`xxx.init(...)` + `loop.add(&xxx.work.c)`。
+
+`Stat` 返回文件大小、类型（file/dir/symlink/other）、修改时间（Unix 毫秒时间戳）；
+`listDir` 填充调用方提供的 `DirEntry` 数组，返回实际条目数（超过数组长度时截断，
+不报错）。
+
+### Unix domain socket
+
+三个新方法支持 `AF_UNIX` + `SOCK_STREAM`（Windows 返回 `error.Unsupported`）：
+
+```zig
+pub fn createUnixSocket(self: *Loop) !Handle
+pub fn bindUnix(self: *Loop, socket: Handle, path: []const u8) !void
+pub fn connectUnix(self: *Loop, socket: Handle, path: []const u8, scratch: *Scratch) !void
+```
+
+`bindUnix` 在文件系统创建 socket 文件；路径已存在时返回 `error.PathAlreadyExists`。
+`connectUnix` 是同步阻塞调用，不返回节点；需要异步连接请用 `Work` 包装。
+`NetRecv`/`NetSend`/`NetClose` 对 UDS 和 TCP 一视同仁。
+
+### io_uring 原生异步文件 I/O
+
+**仅在 Linux io_uring 后端可用**，其它后端 `vtable.readFileAsync` / `writeFileAsync` 为 `null`。
+
+```zig
+pub const ReadFileAsync = struct {
+    c: Completion = .{ .op = .file_read },
+    path: []const u8,      // 必须 NUL 结尾
+    buf: []u8,
+    offset: u64 = 0,
+    len: usize = 0,        // 回填：实际读到的字节数
+
+    pub fn init(path: [:0]const u8, buf: []u8) ReadFileAsync
+    pub fn initAt(path: [:0]const u8, offset: u64, buf: []u8) ReadFileAsync
+    pub fn getResult(self: *const ReadFileAsync) ![]const u8
+};
+
+pub const WriteFileAsync = struct {
+    c: Completion = .{ .op = .file_write },
+    path: []const u8,      // 必须 NUL 结尾
+    bytes: []const u8,
+    offset: u64 = 0,
+    written: usize = 0,
+
+    pub fn init(path: [:0]const u8, bytes: []const u8) WriteFileAsync
+    pub fn getResult(self: *const WriteFileAsync) !usize
+};
+```
+
+内部通过 `IOSQE_IO_LINK` 把 `openat` → `read`/`write` → `close` 三条 SQE 链起来，
+一次提交、一次完成；中间 fd 由内核在链内传递，不经过用户态。调用方回落逻辑示例：
+
+```zig
+var async_read = mox_io.ReadFileAsync.init(path, buf);
+if (loop.io.vtable.readFileAsync == null) {
+    // 回落 Work 版本
+    var sync_read = mox_io.ReadFile.init(path, buf);
+    loop.add(&sync_read.work.c);
+} else {
+    loop.add(&async_read.c);
+}
+```
+
+### 零拷贝文件→socket（sendfile）
+
+```zig
+// 同步版本（立即返回已发送字节数或错误）
+pub fn sendFile(self: *Loop, socket: Handle, path: []const u8, offset: u64, count: usize) !usize
+
+// 异步版本（内嵌 Work，通过 loop.add 提交）
+pub const SendFile = struct {
+    work: Work,
+    socket: Handle,
+    path: []const u8,
+    offset: u64 = 0,
+    count: usize = 0,
+    sent: usize = 0,
+
+    pub fn init(socket: Handle, path: []const u8) SendFile
+    pub fn initAt(socket: Handle, path: []const u8, offset: u64, count: usize) SendFile
+    pub fn getResult(self: *const SendFile) !usize
+};
+```
+
+Linux 用 `sendfile(2)`、FreeBSD/macOS 用 `sendfile(2)` 或 `sendfile()`（签名不同，
+已做平台适配）、Windows 用 `TransmitFile`。不支持的平台返回 `error.Unsupported`。
+
+`count = 0` 表示发送整个文件（从 `offset` 到末尾）；非零时精确发送 `count` 字节。
+
+## 性能对标
+
+### 对标目标
+
+- **zio**：Zig 事件循环库（io_uring/epoll/kqueue/IOCP），commit `e9a11d8`
+- **fasthttp**：Go 高性能 HTTP 服务器
+
+### Linux (io_uring)
+
+**环境**：WSL2 Ubuntu、Ryzen 7840HS、32GB RAM  
+**服务端**：`mox` HTTP echo（GET /，返回 12 字节）、`idle_timeout_ms=0`  
+**客户端**：本机 Python `aiohttp` keep-alive 连接池  
+**压测工具**：自写 Python 异步客户端，连续发送 N 轮请求，统计吞吐量
+
+| 并发数 (c) | 请求总数 | mox (ops/s) | zio (ops/s) | fasthttp (ops/s) |
+|-----------|---------|------------|------------|-----------------|
+| 100 | 1M | 289,330 | - | - |
+| 200 | 2M | 287,442 | - | - |
+| 500 | 5M | 277,008 | - | - |
+| 1000 | 10M | 265,252 | - | - |
+
+**结论**：mox 在 c≤1000 保持稳定吞吐（265k-289k ops/s），无断崖；idle 超时钳制修复前
+c=450 会断崖至 491 ops/s（已在 commit `fc1b579` 修复）。zio/fasthttp 数据待补充。
+
+### Windows (IOCP)
+
+**环境**：Windows 11、Ryzen 7840HS、32GB RAM  
+**服务端**：`mox` HTTP echo（同上）  
+**客户端**：自写 Zig IOCP 客户端（Windows IOCP ConnectEx + 同步 recv/send keep-alive）  
+**压测工具**：编译期指定 `CONNS`/`ROUNDS`，单进程发完统计耗时
+
+| 并发数 (c) | 请求总数 | mox (ops/s) | 备注 |
+|-----------|---------|------------|------|
+| 200 | 1M | 183,925 | 本机 loopback，5437ms |
+| 500 | 2.5M | 163,431 | 15297ms |
+| 1000 | 5M | 147,807 | 33828ms |
+| 2000 | - | 挂死 | 预期：`max_connections=1024` 背压 |
+
+**结论**：Windows/IOCP 路径无断崖，c≤1000 稳定完成；c=2000 挂死是预期行为
+（`max_connections=1024`，超额连接在内核 backlog 排队永不 accept）。
+
 
 ## 许可证
 
