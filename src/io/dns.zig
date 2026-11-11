@@ -315,6 +315,50 @@ test "A 应答可解析成 IpAddress" {
     try std.testing.expectEqual(@as(u8, 4), q.answer.addresses[0].ip4.bytes[3]);
 }
 
+test "AAAA 应答可解析成 IPv6 IpAddress" {
+    var msg: [80]u8 = @splat(0);
+    // 头部：id、flags=0x8180、QD=1、AN=1
+    std.mem.writeInt(u16, msg[0..2], 0x1234, .big);
+    std.mem.writeInt(u16, msg[2..4], 0x8180, .big);
+    std.mem.writeInt(u16, msg[4..6], 1, .big);
+    std.mem.writeInt(u16, msg[6..8], 1, .big);
+    // 问题节：\x03foo\x00 TYPE=AAAA CLASS=IN
+    msg[12] = 3;
+    @memcpy(msg[13..16], "foo");
+    msg[16] = 0;
+    std.mem.writeInt(u16, msg[17..19], 28, .big); // AAAA
+    std.mem.writeInt(u16, msg[19..21], 1, .big);  // IN
+    // 回答节：NAME 压缩指针、TYPE=28、CLASS=IN、TTL(4字节)、RDLEN=16
+    var off: usize = 21;
+    msg[off] = 0xc0; msg[off + 1] = 0x0c; off += 2;
+    std.mem.writeInt(u16, msg[off..][0..2], 28, .big); off += 2; // TYPE AAAA
+    std.mem.writeInt(u16, msg[off..][0..2], 1,  .big); off += 2; // CLASS IN
+    off += 4; // TTL
+    std.mem.writeInt(u16, msg[off..][0..2], 16, .big); off += 2; // RDLEN
+    // IPv6 地址：2001:db8::1
+    const ipv6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0,0,0,0, 0,0,0,0, 0,0,0,1 };
+    @memcpy(msg[off..][0..16], &ipv6);
+    off += 16;
+
+    var q: Query = undefined;
+    q.answer = .{};
+    q.parse(msg[0..off]);
+    try std.testing.expectEqual(@as(usize, 1), q.answer.count);
+    try std.testing.expectEqual(@as(u8, 0x20), q.answer.addresses[0].ip6.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0xb8), q.answer.addresses[0].ip6.bytes[3]); // 2001:0db8 的第 4 字节
+    try std.testing.expectEqual(@as(u8, 0x01), q.answer.addresses[0].ip6.bytes[15]); // ::1 的末字节
+}
+
+test "AAAA 查询报文 QTYPE=28" {
+    var buf: [512]u8 = undefined;
+    const n = buildQueryAAAA(&buf, "foo.example");
+    try std.testing.expect(n > 12);
+    // QTYPE 在 QNAME 末尾 \x00 之后，取最后 4 字节中的前 2 字节
+    const qtype = std.mem.readInt(u16, buf[n - 4 ..][0..2], .big);
+    try std.testing.expectEqual(@as(u16, 28), qtype);
+}
+
+
 test "能力表同时提供 UDP 与 DNS 两个 ID" {
     try std.testing.expect(udp.id != id);
     try std.testing.expectEqual(id, root.cap("mox.io.dns.v1"));

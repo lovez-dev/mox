@@ -147,3 +147,37 @@ pub fn isTty(handle: Handle) bool {
         return std.posix.isatty(handle);
     }
 }
+
+
+test "isTty：管道不是 TTY" {
+    // 用 pipe 两端验证：管道 fd 一定不是 tty
+    if (is_windows) return error.SkipZigTest;
+    var fds: [2]std.posix.fd_t = undefined;
+    _ = std.posix.pipe2(&fds, .{ .CLOEXEC = true }) catch return error.SkipZigTest;
+    defer { std.posix.close(fds[0]); std.posix.close(fds[1]); }
+    try std.testing.expect(!isTty(fds[0]));
+    try std.testing.expect(!isTty(fds[1]));
+}
+
+test "getSize 对管道返回错误" {
+    // 管道 fd 不支持 TIOCGWINSZ，getSize 应返回错误而非 panic
+    if (is_windows) return error.SkipZigTest;
+    var fds: [2]std.posix.fd_t = undefined;
+    _ = std.posix.pipe2(&fds, .{ .CLOEXEC = true }) catch return error.SkipZigTest;
+    defer { std.posix.close(fds[0]); std.posix.close(fds[1]); }
+    try std.testing.expectError(error.IoctlFailed, getSize(fds[0]));
+}
+
+test "Size 结构体字段可读" {
+    const s: Size = .{ .rows = 24, .cols = 80 };
+    try std.testing.expectEqual(@as(u16, 24), s.rows);
+    try std.testing.expectEqual(@as(u16, 80), s.cols);
+}
+
+test "Mode 枚举三个值均可用" {
+    const modes = [_]Mode{ .cooked, .raw, .cbreak };
+    for (modes) |m| {
+        // 只验证可以构造、不调 setMode（CI 环境无终端）
+        _ = m;
+    }
+}
