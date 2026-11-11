@@ -24,6 +24,14 @@ pub const Params = router.Params;
 
 pub const compose = middleware.compose;
 pub const Middleware = middleware.Middleware;
+pub const cors = middleware.cors;
+pub const CorsOptions = middleware.CorsOptions;
+pub const logging = middleware.logging;
+pub const requireHeader = middleware.requireHeader;
+pub const Header = types.Header;
+pub const ErrorHandler = types.ErrorHandler;
+pub const group = types.group;
+pub const routes = types.routes;
 
 test {
     @import("std").testing.refAllDecls(@This());

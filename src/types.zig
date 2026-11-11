@@ -108,6 +108,51 @@ pub const Route = struct {
     handler: Handler,
 };
 
+
+/// 路由分组：在编译期把 `prefix` 拼到每条路由的路径前，
+/// 返回扩展后的路由切片。用于 `Config.routes` 组合：
+///
+///     const v1 = mox.group("/api/v1", &.{
+///         .{ .method = .GET,  .path = "/users", .handler = listUsers },
+///         .{ .method = .POST, .path = "/users", .handler = createUser },
+///     });
+///     const cfg = mox.Config{ .routes = v1, ... };
+pub fn group(comptime prefix: []const u8, comptime defs: []const Route) []const Route {
+    comptime {
+        var out: [defs.len]Route = undefined;
+        for (defs, 0..) |r, i| {
+            out[i] = .{
+                .method = r.method,
+                // 编译期字符串拼接
+                .path = prefix ++ r.path,
+                .handler = r.handler,
+            };
+        }
+        const result = out;
+        return &result;
+    }
+}
+
+/// 合并多个路由切片为一个（编译期展平）。
+///
+///     const all = mox.routes(.{ v1_routes, v2_routes, public_routes });
+pub fn routes(comptime groups: anytype) []const Route {
+    comptime {
+        var total: usize = 0;
+        for (groups) |g| total += g.len;
+        var out: [total]Route = undefined;
+        var pos: usize = 0;
+        for (groups) |g| {
+            for (g) |r| {
+                out[pos] = r;
+                pos += 1;
+            }
+        }
+        const result = out;
+        return &result;
+    }
+}
+
 pub const Config = struct {
     gpa: std.mem.Allocator,
     address: std.Io.net.IpAddress,
@@ -127,7 +172,26 @@ pub const Config = struct {
 
     /// 请求体上限（字节）。超出返回 413 Payload Too Large。0 = 不限。
     max_body_size: usize = 4 * 1024 * 1024,
+
+    /// 单次请求最长处理时间（毫秒）。超时后强制关闭连接。0 = 不限。默认 30s。
+    request_timeout_ms: u32 = 30_000,
+
+    /// handler 返回错误时的兜底响应。默认返回 500 + 错误名字字符串。
+    error_handler: ErrorHandler = defaultErrorHandler,
+
+    /// 路由未命中时的兜底响应。默认返回 404 "not found\n"。
+    not_found: Handler = defaultNotFound,
 };
+
+pub fn defaultNotFound(_: *Context) anyerror!Response {
+    return .{ .status = .not_found, .body = "not found\n" };
+}
+
+pub fn defaultErrorHandler(_: *Context, err: anyerror) Response {
+    return .{ .status = .internal_server_error, .body = @errorName(err) };
+}
+
+pub const ErrorHandler = *const fn (*Context, anyerror) Response;
 
 // ---- 测试 ------------------------------------------------------------------
 test "query 解析 URL 查询参数" {

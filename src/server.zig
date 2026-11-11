@@ -71,6 +71,9 @@ pub fn serveWith(config: Config, mount_hook: ?MountHook) !void {
         .idle_timeout_ms = config.idle_timeout_ms,
         .backoff_ms = config.accept_backoff_ms,
         .max_body_size = config.max_body_size,
+        .request_timeout_ms = config.request_timeout_ms,
+        .error_handler = config.error_handler,
+        .not_found_handler = config.not_found,
     };
     // 订阅停机信号（POSIX only；Windows 返回 Unsupported，comptime 跳过整段）。
     // 信号到达时回调 `onSignal` → `loop.stop()`，`loop.run()` 返回后走优雅停机段。
@@ -156,6 +159,12 @@ const Server = struct {
     shutting_down: bool = false,
     /// 请求体上限（字节）。来自 Config.max_body_size。0 = 不限。
     max_body_size: usize = 4 * 1024 * 1024,
+    /// 单次请求最长处理时间（毫秒）。来自 Config.request_timeout_ms。0 = 不限。
+    request_timeout_ms: u32 = 30_000,
+    /// handler 返回错误时的兜底响应。
+    error_handler: types.ErrorHandler = types.defaultErrorHandler,
+    /// 路由未命中时的兜底响应。
+    not_found_handler: types.Handler = types.defaultNotFound,
     /// 活跃连接的双向链表头（侵入式，`Connection.prev/next`）。
     conns: ?*Connection = null,
 
@@ -323,6 +332,9 @@ const Connection = struct {
     // 本次响应待写的完整切片，与已写入字节数：内核部分写入时靠它们续发尾部。
     send_wire: []const u8 = &.{},
     sent_len: usize = 0,
+    /// 请求超时定时器：handler 执行期间到点则强制关闭连接。
+    req_timeout: Timer = undefined,
+    req_timeout_armed: bool = false,
 };
 
 fn postRecv(conn: *Connection) void {
@@ -359,6 +371,31 @@ fn onIdle(loop: *Loop, c: *Completion) void {
     const conn: *Connection = @fieldParentPtr("idle", t);
     conn.idle_armed = false; // 已从堆里弹出
     // 到点仍静默：中止连接（含取消在飞 recv）。
+    abortConn(conn);
+}
+
+/// 武装请求超时计时器。handler 执行期间到点则强制关闭连接。
+fn armRequestTimeout(conn: *Connection, ms: u32) void {
+    disarmRequestTimeout(conn);
+    conn.req_timeout = Timer.init(ms);
+    conn.req_timeout.c.callback = onRequestTimeout;
+    conn.req_timeout_armed = true;
+    conn.loop.add(&conn.req_timeout.c);
+}
+
+/// 撤销请求超时计时器。
+fn disarmRequestTimeout(conn: *Connection) void {
+    if (!conn.req_timeout_armed) return;
+    conn.req_timeout_armed = false;
+    conn.loop.cancel(&conn.req_timeout.c, @ptrCast(conn), noopDispose);
+}
+
+fn onRequestTimeout(loop: *Loop, c: *Completion) void {
+    _ = loop;
+    const t: *Timer = @fieldParentPtr("c", c);
+    const conn: *Connection = @fieldParentPtr("req_timeout", t);
+    conn.req_timeout_armed = false;
+    // 请求处理超时：中止连接（含取消在飞 recv/send）。
     abortConn(conn);
 }
 
@@ -401,17 +438,38 @@ fn onRecv(loop: *Loop, c: *Completion) void {
 }
 
 fn handleRequest(conn: *Connection, req: http.Request) void {
+    // 获取 Server 指针（测试中直连 Connection 时为 null，降级为默认行为）
+    const srv = conn.server;
+    // 武装请求超时计时器（如果配置了的话）
+    if (srv) |s| {
+        if (s.request_timeout_ms > 0) armRequestTimeout(conn, s.request_timeout_ms);
+    }
+
     var params: Params = .{};
     const handler = conn.router.match(req.method, req.path, &params) orelse {
-        respond(conn, .{ .status = .not_found, .body = "not found\n" }, req.keep_alive);
+        // 路由未命中：调用可自定义的 not_found handler
+        var ctx: Context = .{ .gpa = conn.alloc, .request = &req, .params = &params, .body = req.body };
+        const nf_resp = if (srv) |s|
+            s.not_found_handler(&ctx) catch Response{ .status = .not_found, .body = "not found\n" }
+        else
+            Response{ .status = .not_found, .body = "not found\n" };
+        disarmRequestTimeout(conn);
+        respond(conn, nf_resp, req.keep_alive);
         return;
     };
 
     var ctx: Context = .{ .gpa = conn.alloc, .request = &req, .params = &params, .body = req.body };
-    const response = handler(&ctx) catch {
-        respond(conn, .{ .status = .internal_server_error, .body = "internal error\n" }, false);
+    const response = handler(&ctx) catch |err| {
+        // handler 出错：调用可自定义的 error_handler
+        disarmRequestTimeout(conn);
+        const err_resp = if (srv) |s|
+            s.error_handler(&ctx, err)
+        else
+            Response{ .status = .internal_server_error, .body = @errorName(err) };
+        respond(conn, err_resp, false);
         return;
     };
+    disarmRequestTimeout(conn);
     if (response.file_path.len != 0)
         serveFile(conn, response, req.keep_alive)
     else
