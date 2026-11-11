@@ -117,15 +117,33 @@ pub const Loop = struct {
     /// 从 `io` 构造循环。线程池用 `allocator` 存放线程句柄；
     /// 后端不提供分配器时可用 `std.heap.page_allocator`。
     pub fn init(io: Io) Loop {
-        ignoreSigpipeOnce();
-        var self: Loop = .{ .io = io, .allocator = std.heap.page_allocator, .pool = Pool.init(std.heap.page_allocator, pool_mod.default_max_workers), .memory_fs = @import("file.zig").MemoryFs.init(std.heap.page_allocator) };
-        self.timers.initWithAllocator(self.allocator);
-        return self;
+        return initWithAllocator(io, std.heap.page_allocator);
     }
 
     pub fn initWithAllocator(io: Io, allocator: std.mem.Allocator) Loop {
+        return initWithOptions(io, allocator, .{});
+    }
+
+    /// 按 `Options` 构造循环。
+    ///
+    /// `inflight_max` 的推导是**硬性正确性约束**而不是调优：后端 CQ 环容量
+    /// 是 `queue_size × 8`，窗口取它的一半（即 `queue_size × 4`），保证大批量
+    /// 提交时完成包一定有地方放。用户显式给的值会被钳制到这个上限——
+    /// 放开它只会让内核丢完成包、回调永不触发。
+    pub fn initWithOptions(io: Io, allocator: std.mem.Allocator, opts: root.Options) Loop {
         ignoreSigpipeOnce();
-        var self: Loop = .{ .io = io, .allocator = allocator, .pool = Pool.init(allocator, pool_mod.default_max_workers), .memory_fs = @import("file.zig").MemoryFs.init(allocator) };
+        const workers = if (opts.max_workers == 0) pool_mod.default_max_workers else opts.max_workers;
+        const cq_capacity: usize = @as(usize, opts.queue_size) * 8;
+        const derived: usize = cq_capacity / 2;
+        const inflight_cap: usize = if (opts.inflight_max) |v| @min(v, derived) else derived;
+
+        var self: Loop = .{
+            .io = io,
+            .allocator = allocator,
+            .pool = Pool.init(allocator, workers),
+            .memory_fs = @import("file.zig").MemoryFs.init(allocator),
+            .inflight_max = inflight_cap,
+        };
         self.timers.initWithAllocator(self.allocator);
         return self;
     }

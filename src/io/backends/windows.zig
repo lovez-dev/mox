@@ -1061,7 +1061,21 @@ const vtable_storage: root.VTable = .{
 };
 
 /// 拉起 IOCP 后端，交回一个可供循环驱动的 `Io`。
+/// 无配置入口，保留给旧调用点。
 pub fn create(alloc: std.mem.Allocator) !root.Io {
+    return createWith(alloc, .{});
+}
+
+/// 带配置的入口。当前这些后端不按 `queue_size` 缩放内部批量数组
+/// （epoll / kqueue 的就绪数组和 IOCP 的 OVERLAPPED_ENTRY 数组仍是编译期
+/// 定长），所以这里只接住参数、不改动行为。`Options` 的其余字段由 Loop
+/// 层消费。将来要缩放时在这个函数里改即可，上层不用动。
+pub fn createWith(alloc: std.mem.Allocator, opts: root.Options) !root.Io {
+    _ = opts;
+    return createBody(alloc);
+}
+
+fn createBody(alloc: std.mem.Allocator) !root.Io {
     try startup();
     const st = try alloc.create(State);
     errdefer alloc.destroy(st);

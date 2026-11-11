@@ -8,6 +8,109 @@ const net = std.Io.net;
 const root = @import("io.zig");
 
 const Loop = root.Loop;
+
+// Options：运行时配置必须真的传到后端，不能只是把参数接住扔掉。
+test "openWith 的 queue_size 非法值报错，合法值生效" {
+    // 0 和 3（非 2 的幂）都要明确报错，不能静默截断——静默改尺寸会让
+    // 用户以为自己测的是另一种配置。
+    try std.testing.expectError(error.InvalidQueueSize, root.openWith(std.testing.allocator, .{ .queue_size = 0 }));
+    try std.testing.expectError(error.InvalidQueueSize, root.openWith(std.testing.allocator, .{ .queue_size = 3 }));
+}
+
+test "openWith 的 queue_size 改变后端环容量与在飞窗口" {
+    // 只在能观测到 SQ/CQ 环的 io_uring 后端上验证；epoll / kqueue / IOCP
+    // 目前不按 queue_size 缩放内部数组（见各自 createWith 注释）。
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var small = try root.openWith(std.testing.allocator, .{ .queue_size = 64, .backend = .uring });
+    defer small.deinit();
+    var large = try root.openWith(std.testing.allocator, .{ .queue_size = 512, .backend = .uring });
+    defer large.deinit();
+
+    // CQ 容量 = queue_size × 8，在飞窗口 = 它的一半 = queue_size × 4。
+    try std.testing.expectEqual(@as(usize, 64 * 4), small.inflight_max);
+    try std.testing.expectEqual(@as(usize, 512 * 4), large.inflight_max);
+
+    // 更硬的证据：内核实际回填的 SQ/CQ 环尺寸必须跟着配置走。
+    // 只断言 `inflight_max` 是不够的——那是 Loop 层按参数算出来的，
+    // 就算后端把 `queue_size` 整个忽略掉也照样对。必须直接读后端状态。
+    const uring = @import("backends/uring.zig");
+    const s64 = uring.ringSizes(small.io.userdata);
+    const s512 = uring.ringSizes(large.io.userdata);
+    try std.testing.expectEqual(@as(u32, 64), s64[0]);
+    try std.testing.expectEqual(@as(u32, 64 * 8), s64[1]);
+    try std.testing.expectEqual(@as(u32, 512), s512[0]);
+    try std.testing.expectEqual(@as(u32, 512 * 8), s512[1]);
+}
+
+test "openWith 的 inflight_max 显式值被钳制到 CQ 容量一半" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    // 传一个大到会灌爆 CQ 环的值（1<<20），必须被钳制而不是照单全收。
+    var l = try root.openWith(std.testing.allocator, .{
+        .queue_size = 64,
+        .inflight_max = 1 << 20,
+        .backend = .uring,
+    });
+    defer l.deinit();
+    try std.testing.expectEqual(@as(usize, 64 * 4), l.inflight_max);
+}
+
+test "openWith 的 max_workers 生效" {
+    var l = try root.openWith(std.testing.allocator, .{ .max_workers = 2 });
+    defer l.deinit();
+    try std.testing.expectEqual(@as(usize, 2), l.pool.max_workers);
+}
+
+test "不同 queue_size 的 Loop 都能完成大批量提交" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (root.platform.chosen == .epoll) return error.SkipZigTest;
+
+    // 关键回归：queue_size 缩到 64 时 CQ 只有 512 格，仍不能丢完成包。
+    // 窗口必须跟着缩小，否则一次 add 3000 个操作就会灌爆 CQ。
+    var l = try root.openWith(std.testing.allocator, .{ .queue_size = 64, .backend = .uring });
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "qsz");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+    var fbuf: [600]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&fbuf, "{s}/q.txt", .{dir});
+    defer l.deleteFile(fpath);
+    try l.writeFileAll(fpath, "q");
+    var zbuf: [700]u8 = undefined;
+    @memcpy(zbuf[0..fpath.len], fpath);
+    zbuf[fpath.len] = 0;
+    const zpath: [:0]const u8 = zbuf[0..fpath.len :0];
+
+    const n = 600; // > CQ 容量 512
+    const Ctx = struct {
+        var remaining: usize = 0;
+        var bad: usize = 0;
+        fn cb(lp: *Loop, c: *root.Completion) void {
+            if (c.err != null) bad += 1;
+            remaining -|= 1;
+            if (remaining == 0) lp.stop();
+        }
+    };
+    Ctx.remaining = n;
+    Ctx.bad = 0;
+
+    var nodes: [n]root.ReadFileAsync = undefined;
+    var bufs: [n][16]u8 = undefined;
+    var wds: [n]root.Timer = undefined;
+    for (&nodes, 0..) |*node, i| {
+        node.* = root.ReadFileAsync.init(zpath, &bufs[i]);
+        node.c.callback = &Ctx.cb;
+        l.add(&node.c);
+        wds[i] = root.Timer.init(30_000);
+        l.watchdog(&node.c, &wds[i], 30_000);
+    }
+    try l.run();
+    try std.testing.expectEqual(@as(usize, 0), Ctx.bad);
+    try std.testing.expectEqual(@as(usize, 0), Ctx.remaining);
+}
 const Completion = root.Completion;
 const Timer = root.Timer;
 const NetRecv = root.NetRecv;

@@ -22,7 +22,12 @@ const io_uring_sqe = linux.io_uring_sqe;
 const io_uring_params = linux.io_uring_params;
 const io_uring_cqe = linux.io_uring_cqe;
 
-const ENTRIES = 256;
+/// `create(alloc)` 无配置入口用的默认队列容量，与 `Options.queue_size` 一致。
+const DEFAULT_QUEUE_SIZE: u16 = 256;
+
+/// CQ 环相对 SQ 环的倍数。CQ 必须显著大于 SQ：`getSqe` 可能连续提交满
+/// 一个 SQ 环，内核立刻产出同样多的完成包；CQ 与 SQ 等大时第一批就填满 CQ。
+const CQ_MULTIPLIER: u32 = 8;
 
 const MapSlice = []align(std.heap.page_size_min) u8;
 
@@ -49,7 +54,14 @@ const State = struct {
     ///
     /// 容量取 CQ 环大小：一次最多腾空一个 CQ 环，不会溢出。**丢了就是回调
     /// 永不触发**，所以宁可放大也不缩。
-    overflow: [ENTRIES * 8]root.Ref = undefined,
+    /// 配置下来的 SQ 环容量（格数）。CQ 环 = 它 × `CQ_MULTIPLIER`。
+    queue_size: u16,
+
+    /// CQE 溢出暂存：`reapCq` 收满 `refs`、或 `getSqe` 为腾 CQ 空位而提前
+    /// 收割时，完成包先搬到这里，下次 `waitBatch` 优先吐出。容量 = CQ 环
+    /// 大小，在 `createWith` 里按 `queue_size` 堆分配（队列容量现在是运行时
+    /// 可配的，不再是编译期定长）。**丢了就是回调永不触发**，宁可放大。
+    overflow: []root.Ref = undefined,
     overflow_len: usize = 0,
     sqes: [*]io_uring_sqe,
 
@@ -116,8 +128,8 @@ fn setup(state: *State) !void {
     // 它，CQ 仍是默认的 `sq_entries` 大小。实测漏掉这个标志时内核回填
     // `cq_entries=512`（= 2×SQ），一次 add 2000 个操作收割停在 512 再也不动。
     p.flags = linux.IORING_SETUP_CQSIZE;
-    p.cq_entries = ENTRIES * 8;
-    const rc = linux.io_uring_setup(ENTRIES, &p);
+    p.cq_entries = @as(u32, state.queue_size) * CQ_MULTIPLIER;
+    const rc = linux.io_uring_setup(state.queue_size, &p);
     if (signed(rc) < 0) return error.SetupFailed;
     state.fd = @intCast(rc);
 
@@ -178,7 +190,7 @@ fn teardown(state: *State) void {
 ///
 /// **两道背压，缺一不可：**
 ///
-/// 1. SQ 环空位（`tail - head < sq_entries`）。环只有 `ENTRIES` 格，`tail & mask`
+/// 1. SQ 环空位（`tail - head < sq_entries`）。环只有 `queue_size` 格，`tail & mask`
 ///    绕回去会覆写内核还没读走的 SQE。
 /// 2. CQ 环空位。CQ 满时内核**停止产生完成包**，连带不再推进 SQ head，于是
 ///    第 1 条永远等不到空位——死锁。所以这里必须主动收割 CQ。
@@ -252,6 +264,7 @@ fn vtDeinit(userdata: ?*anyopaque) void {
     const state = stateOf(userdata);
     const alloc = state.alloc;
     teardown(state);
+    alloc.free(state.overflow);
     alloc.destroy(state);
 }
 
@@ -861,11 +874,22 @@ const vtable_storage: root.VTable = .{
     .notify = vtNotify,
 };
 
+/// 无配置入口，保留给旧调用点。
 pub fn create(alloc: std.mem.Allocator) !root.Io {
+    return createWith(alloc, .{});
+}
+
+/// 带配置的入口：`queue_size` 决定 SQ 环大小，CQ 环与溢出队列随之缩放。
+pub fn createWith(alloc: std.mem.Allocator, opts: root.Options) !root.Io {
+    const qs = opts.queue_size;
     const state = try alloc.create(State);
     errdefer alloc.destroy(state);
+    const overflow = try alloc.alloc(root.Ref, @as(usize, qs) * CQ_MULTIPLIER);
+    errdefer alloc.free(overflow);
     state.* = .{
         .alloc = alloc,
+        .queue_size = qs,
+        .overflow = overflow,
         .fd = -1,
         .efd = -1,
         .sq_map = undefined,
@@ -1035,6 +1059,16 @@ pub fn sendBlocking(h: Handle, bytes: []const u8) !usize {
 /// 阻塞接收，仅用于测试 / benchmark 的客户端线程。
 pub fn recvBlocking(h: Handle, buf: []u8) !usize {
     return cvt(linux.read(fdOf(h), buf.ptr, buf.len));
+}
+
+/// 测试探针：返回内核实际回填的 `(sq_entries, cq_entries)`。
+///
+/// 存在的唯一理由是验证 `Options.queue_size` 真的传到了后端、而不是被
+/// 悄悄忽略——这是只能黑盒观测内部状态的正确性要求，所以开一个只读钩子。
+/// 生产代码不该调用它。
+pub fn ringSizes(userdata: ?*anyopaque) [2]u32 {
+    const state = stateOf(userdata);
+    return .{ state.sq_entries, state.cq_entries };
 }
 
 pub fn tickCount() u64 {

@@ -47,16 +47,28 @@ pub var chosen: Choice = .uring;
 pub var forced: ?Choice = null;
 
 pub fn create(alloc: std.mem.Allocator) !root.Io {
-    if (forced == .epoll) {
+    return createWith(alloc, .{});
+}
+
+/// 带配置的入口。`Options.backend` 覆盖进程级 `forced`；两者都没设时
+/// 优先 io_uring，setup 失败自动回落 epoll。
+pub fn createWith(alloc: std.mem.Allocator, opts: root.Options) !root.Io {
+    const force_epoll = if (opts.backend) |b| switch (b) {
+        .epoll => true,
+        .uring => false,
+    } else forced == .epoll;
+    if (force_epoll) {
         chosen = .epoll;
-        return epoll.create(alloc);
+        return epoll.createWith(alloc, opts);
     }
-    const io = uring.create(alloc) catch |err| {
+    const io = uring.createWith(alloc, opts) catch |err| {
         // `io_uring_setup` 失败（ENOSYS / EPERM / seccomp 拦截）时回落；
         // mmap 之类的资源失败也一并回落，epoll 不依赖这些资源。
-        if (err == error.OutOfMemory) return err;
+        // 显式点名 `.uring` 时不悄悄换后端——用户要的是那个后端，换掉
+        // 会让「我配了 uring」变成假象。
+        if (err == error.OutOfMemory or opts.backend == .uring) return err;
         chosen = .epoll;
-        return epoll.create(alloc);
+        return epoll.createWith(alloc, opts);
     };
     chosen = .uring;
     return io;

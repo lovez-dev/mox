@@ -381,9 +381,70 @@ fn withCaps(io_value: Io) Io {
     return out;
 }
 
-/// 用平台默认后端构造一个 `Loop`。
+/// 构造 `Loop` 时的可调参数。
+///
+/// 命名与形状对齐 zio 的 `Loop.Options` / `RuntimeOptions`：运行时实例级配置，
+/// 同一个进程里可以开多个不同配置的 `Loop`，互不影响。
+///
+/// **为什么不是编译期全局 `mox_options`**：zio 那份是给「调度模型」这类
+/// 一旦不同就不兼容的开关用的（它要保证同一二进制里所有依赖看到同一份）。
+/// mox 的这几项都是纯资源尺寸，实例间不同完全安全，做成实例参数更有用。
+pub const Options = struct {
+    /// 后端事件队列容量（格数）。
+    ///
+    /// io_uring 下它同时决定 SQ 环大小，CQ 环取它的 8 倍；epoll / kqueue /
+    /// IOCP 下决定一次 `waitBatch` 能取回的就绪事件数。默认 256（实测最优）。
+    ///
+    /// 必须是 2 的幂且不为 0——`io_uring_setup` 和环掩码都依赖这一点。
+    queue_size: u16 = 256,
+
+    /// 在飞窗口上限：同时下发给后端、完成包还没回来的操作数。
+    ///
+    /// **不要手填。** `null` 表示由后端按 `queue_size` 自动推导（当前取
+    /// `queue_size * 4`，即 CQ 环容量的一半）。传大了会在大批量提交时
+    /// 灌爆 CQ 环、内核丢弃完成包、回调永不触发——这是实测踩过的坑。
+    /// 传小了只会降低吞吐，不会错。
+    inflight_max: ?usize = null,
+
+    /// `Work` 线程池上限。0 表示用平台默认值（4）。
+    max_workers: usize = 0,
+
+    /// Linux 后端覆盖。`null` = 自动（优先 io_uring，setup 失败回落 epoll）。
+    /// 非 Linux 平台上这个值被忽略。
+    backend: ?Backend = null,
+
+    pub const Backend = enum { uring, epoll };
+
+    /// 把用户填的值解析成实际生效的配置。`queue_size` 非法时报错而不是
+    /// 静默截断——静默改尺寸会让人以为自己测的是另一种配置。
+    pub fn validate(self: Options) !Options {
+        const qs = self.queue_size;
+        if (qs == 0 or (qs & (qs - 1)) != 0) return error.InvalidQueueSize;
+        return self;
+    }
+};
+
+/// 用平台默认后端、默认配置构造一个 `Loop`。
+///
+/// 保留单参数入口是为了向后兼容：现有调用点（`server.zig`、bench、示例）
+/// 全都不用改。要调参用 `openWith`。
 pub fn open(alloc: std.mem.Allocator) !Loop {
-    return Loop.initWithAllocator(withCaps(try platform.create(alloc)), alloc);
+    return openWith(alloc, .{});
+}
+
+/// 用自定义配置构造一个 `Loop`。
+///
+/// ```zig
+/// var loop = try mox_io.openWith(gpa, .{
+///     .queue_size = 512,
+///     .max_workers = 8,
+///     .backend = .epoll,
+/// });
+/// ```
+pub fn openWith(alloc: std.mem.Allocator, opts: Options) !Loop {
+    const resolved = try opts.validate();
+    const io_value = withCaps(try platform.createWith(alloc, resolved));
+    return Loop.initWithOptions(io_value, alloc, resolved);
 }
 
 test {

@@ -108,6 +108,27 @@ Loop ── io.vtable.recv/send/accept/connect ──► 后端（IOCP / io_urin
   正常路径下后端都会很快投递完成包；若超时仍未排空，为保证不发生悬空访问，
   对象会被留在登记表里（泄漏而非崩溃），由 `Loop.deinit` 释放表本身。
 
+### 运行时配置（`openWith`）
+
+`mox_io.open(alloc)` 用默认参数构造循环，现有代码无需改动。要调资源尺寸用
+`openWith`，形状对齐 zio 的 `Loop.Options` / `RuntimeOptions`——同一进程可开多个
+不同配置的循环：
+
+```zig
+var loop = try mox_io.openWith(gpa, .{
+    .queue_size = 512,   // 后端事件队列容量，2 的幂；io_uring 下 SQ=它、CQ=它×8
+    .max_workers = 8,    // Work 线程池上限，0 = 平台默认（4）
+    .backend = .epoll,   // 仅 Linux：覆盖后端选择
+});
+```
+
+- `queue_size` 会真正传到后端：io_uring 的 SQ/CQ 环、epoll/kqueue 就绪数组、
+  IOCP 完成端口批量大小都随之缩放（epoll/kqueue/IOCP 当前仍是定长批量数组，
+  只接参数不改行为，见各 `createWith` 注释）。
+- **`inflight_max` 不要手填。** 留空由后端按 `queue_size × 4` 推导；显式给大值会
+  被钳制到「CQ 环容量的一半」。放开它只会在大批量提交时灌爆 CQ 环、内核丢
+  完成包、回调永不触发——这是实测踩过的坑。
+
 ## 目录结构
 
 ```
@@ -190,6 +211,29 @@ A/B 是临时把 `loop.zig` 的 `batch_size` 改成 1 跑出来的，已改回 6
 **这些数字只用于本项目改动前后的自身对比。** zio 没有提供同 workload 的
 benchmark，API 也不兼容；在建立 zio 适配器与共同负载之前，不能据此声称
 「与 zio 对齐」或「不比 zio 差」。
+
+### 试过但未启用：io_uring 的 `DEFER_TASKRUN` / `SINGLE_ISSUER` / `COOP_TASKRUN`
+
+按 zio 的形状把队列容量做成运行时 `queue_size` 时，顺手试了这三个标志（zio
+默认开）。结论：**`SINGLE_ISSUER` 本身无害，但 `DEFER_TASKRUN` 在批量负载下
+让吞吐腰斩**，实测 `bench-burst` 20000 ops（ReleaseFast，WSL2 内核 6.18）：
+
+| 标志组合 | ops/s |
+|---|---|
+| 仅 `CQSIZE`（当前） | 91k–109k |
+| `+ SINGLE_ISSUER` | 90k–109k（与基线持平） |
+| `+ DEFER_TASKRUN + COOP` | 51k–60k（**腰斩**） |
+
+`DEFER_TASKRUN` 把完成包的 task_work 推迟到 `io_uring_enter(GETEVENTS)` 时刻，
+需要把等待模型从外部 `poll(ring_fd/eventfd)` 改成 `io_uring_enter2` + 内核侧
+`timespec` 超时，并把跨线程 `notify` 的 eventfd 也做成环内 multishot `POLL_ADD`
+才能被唤醒——这套改造本身能跑通（mox 实测全绿），但批量负载下每次 enter 只
+推进有限 task_work，20000 个操作要非常多次 `enter2` 才收完，吞吐掉一半。
+
+诚实结论：**`DEFER_TASKRUN` 不适合 mox 的批量收割模型，不启用**。`queue_size`
+运行时化与 `openWith` 保留（明确有价值），等待模型保持久经验证的 `poll`。
+（另一条实测：`io_uring_getevents_arg.ts` 是**指向 `timespec` 的指针**而非纳秒
+整数，传整数会让内核解引用野指针直接返回 `EFAULT(-14)`。）
 
 ## Linux 后端：io_uring 与 epoll
 
