@@ -25,13 +25,22 @@ pub const TimerQueue = struct {
     }
 
     /// 插入一个定时器。
+    /// 交换两个槽位并同步维护各自的下标，所有堆调整都必须走它。
+    fn swapAt(self: *TimerQueue, a: usize, b: usize) void {
+        std.mem.swap(*Completion, &self.items.items[a], &self.items.items[b]);
+        self.items.items[a].heap_index = a;
+        self.items.items[b].heap_index = b;
+    }
+
+    /// 插入一个定时器。
     pub fn add(self: *TimerQueue, c: *Completion) void {
         self.items.append(self.allocator, c) catch return;
         var i = self.items.items.len - 1;
+        c.heap_index = i;
         while (i > 0) {
             const parent = (i - 1) / 2;
             if (!less(self.items.items[i], self.items.items[parent])) break;
-            std.mem.swap(*Completion, &self.items.items[i], &self.items.items[parent]);
+            self.swapAt(i, parent);
             i = parent;
         }
     }
@@ -40,29 +49,42 @@ pub const TimerQueue = struct {
     pub fn popDue(self: *TimerQueue, now: u64) ?*Completion {
         const first = self.peek() orelse return null;
         if (first.deadline_ms > now) return null;
+        first.heap_index = std.math.maxInt(usize);
         const last = self.items.pop().?;
         if (self.items.items.len != 0) {
+            // 标准堆删除：把末节点搬到堆顶，再下沉。直接覆盖下标 0，
+            // 不能用 swapAt（末节点已被 pop 出数组）。
             self.items.items[0] = last;
+            last.heap_index = 0;
             self.siftDown(0);
         }
         return first;
     }
 
     /// 从堆中摘除指定节点，用于取消尚未到期的定时器。
-    /// 定时器取消不在热路径上，线性查找即可。
+    ///
+    ///
+    /// 普通定时器取消在 HTTP 加 idle 超时后已落在热路径上（每个请求周期都
+    /// `armIdle`/`disarmIdle` 各一次），所以这里用 `heap_index` 定位到 O(1)，
+    /// 再下沉/上浮到 O(log n)；不再做 O(n) 线性扫描。
     pub fn remove(self: *TimerQueue, c: *Completion) bool {
-        var i: usize = 0;
-        while (i < self.items.items.len) : (i += 1) {
-            if (self.items.items[i] != c) continue;
-            const last = self.items.pop().?;
-            if (i == self.items.items.len) return true;
-            self.items.items[i] = last;
-            // 可能上浮，也可能下沉；两个方向都试一次即可。
-            self.siftUp(i);
-            self.siftDown(i);
-            return true;
+        const i = c.heap_index;
+        if (i >= self.items.items.len or self.items.items[i] != c) {
+            // 不在堆中（同步完成已弹出，或从未加入）：直接返回。
+            return false;
         }
-        return false;
+        const last = self.items.pop().?;
+        if (i == self.items.items.len) {
+            last.heap_index = std.math.maxInt(usize);
+            return true; // 正好是末节点，弹出即可
+        }
+        self.items.items[i] = last;
+        self.items.items[i] = last;
+        last.heap_index = i;
+        self.siftUp(i);
+        self.siftDown(i);
+        c.heap_index = std.math.maxInt(usize); // 摘除节点必须作废其索引，否则残留旧值会被误用
+        return true;
     }
 
     fn peek(self: *const TimerQueue) ?*Completion {
@@ -74,7 +96,7 @@ pub const TimerQueue = struct {
         while (i > 0) {
             const parent = (i - 1) / 2;
             if (!less(self.items.items[i], self.items.items[parent])) break;
-            std.mem.swap(*Completion, &self.items.items[i], &self.items.items[parent]);
+            self.swapAt(i, parent);
             i = parent;
         }
     }
@@ -88,7 +110,7 @@ pub const TimerQueue = struct {
             var child = left;
             if (right < self.items.items.len and less(self.items.items[right], self.items.items[left])) child = right;
             if (!less(self.items.items[child], self.items.items[i])) break;
-            std.mem.swap(*Completion, &self.items.items[i], &self.items.items[child]);
+            self.swapAt(i, child);
             i = child;
         }
     }
@@ -151,4 +173,33 @@ test "nextTimeout 反映队首与就绪队列" {
     var empty: TimerQueue = .{};
     defer empty.deinit();
     try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), empty.nextTimeout(10, false));
+}
+
+test "heap_index 在 add/remove/popDue 后始终保持一致" {
+    // O(log n) 的 `remove` 依赖 `Completion.heap_index` 精确指回堆内下标。
+    // 一旦偏移，定位即错、删除会动错节点。这条测试锁死不变量。
+    var q: TimerQueue = .{};
+    defer q.deinit();
+    var nodes: [16]Completion = undefined;
+    for (&nodes, 0..) |*n, i| {
+        n.* = .{ .op = .timer, .deadline_ms = @intCast((i % 5) * 10 + (i / 5)) };
+        q.add(n);
+    }
+    // 周期性删除与弹出，制造堆内部动荡。
+    try std.testing.expect(q.remove(&nodes[7]));
+    _ = q.popDue(1000);
+    try std.testing.expect(q.remove(&nodes[2]));
+    try std.testing.expect(q.remove(&nodes[11]));
+    _ = q.popDue(1000);
+    // 逐个删除剩余，验证每个节点的 heap_index 与真实下标对应。
+    var checked: usize = 0;
+    while (q.items.items.len > 0) : (checked += 1) {
+        const idx = q.items.items[0].heap_index;
+        try std.testing.expectEqual(idx, @as(usize, 0));
+        _ = q.popDue(100000) orelse break;
+    }
+    try std.testing.expect(checked > 0);
+    // 已删除的节点不应再能删除，且其 heap_index 已置为 maxInt。
+    try std.testing.expect(!q.remove(&nodes[7]));
+    try std.testing.expectEqual(nodes[7].heap_index, std.math.maxInt(usize));
 }

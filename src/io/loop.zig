@@ -361,7 +361,11 @@ pub const Loop = struct {
             self.drainWork();
             if (!self.running) break;
 
-            const timeout = self.nextTimeout();
+            // 主循环也给超时设上限，与 `drainOpen` 一致。否则当所有连接都挂着
+            // 长 idle 定时器时（HTTP 默认 60s），`nextTimeout` 返回一个超大值，
+            // `waitBatch` 的 `poll` 会睡满 60s；期间若有连接完成但新事件未到，
+            // 整个 loop 被活锁——实测 HTTP 在 ~450 并发直接断崖。
+            const timeout = @min(self.nextTimeout(), 200);
             const n = try self.io.vtable.waitBatch(self.io.userdata, timeout, &batch);
             self.fireTimers();
             if (!self.running) break;

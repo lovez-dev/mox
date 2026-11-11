@@ -60,6 +60,12 @@ pub const Completion = struct {
     /// 非空时：本操作正常完成会撤销它；它先到点则取消本操作。
     /// 双向链接（配合 `Timer.target`）让撤销是 O(1)、无需额外分配。
     timeout: ?*Completion = null,
+
+    /// 在 `TimerQueue` 堆中的下标。仅当节点在定时器堆里时有效；
+    /// 由 `TimerQueue` 在每次堆调整时维护，使 `remove` 从 O(n) 线性扫描
+    /// 降为 O(log n)。不在堆中时值为 `std.math.maxInt(usize)`，避免
+    /// 误用；同步完成 / 就绪队列路径不触碰它。
+    heap_index: usize = std.math.maxInt(usize),
 };
 
 /// 就绪方向。`watchFd` 用它在回调里告诉调用方「哪个方向就绪了」。
