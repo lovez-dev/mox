@@ -1222,9 +1222,9 @@ pub const FileKind = enum { file, directory, sym_link, other };
 comptime {
     const root_kind = @typeInfo(root.FileKind).@"enum";
     const self_kind = @typeInfo(FileKind).@"enum";
-    if (root_kind.fields.len != self_kind.fields.len) @compileError("uring.FileKind 与 root.FileKind 字段数不一致");
-    for (root_kind.fields, self_kind.fields) |rf, sf| {
-        if (rf.value != sf.value) @compileError("uring.FileKind 与 root.FileKind 取值错位: " ++ rf.name);
+    if (root_kind.field_names.len != self_kind.field_names.len) @compileError("uring.FileKind 与 root.FileKind 字段数不一致");
+    for (root_kind.field_values, self_kind.field_values, 0..) |rv, sv, i| {
+        if (rv != sv) @compileError("uring.FileKind 与 root.FileKind 取值错位: " ++ root_kind.field_names[i]);
     }
 }
 
