@@ -67,7 +67,7 @@ const NetConnect = completion.NetConnect;
 const Work = completion.Work;
 
 /// 一次 `waitBatch` 最多收割的完成包数。
-pub const batch_size = 64;
+pub const batch_size = 256;
 /// 延迟回收项：一个被取消的操作 + 它所属对象的释放函数。
 pub const Retired = struct {
     scratch: *Scratch,
@@ -89,6 +89,18 @@ pub const Loop = struct {
     submitted: std.atomic.Value(?*Completion) = std.atomic.Value(?*Completion).init(null),
     /// 已入队但尚未被循环线程取走的项数，仅用于诊断与测试。
     submitted_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// 在飞操作数（已下发给后端、完成包还没回来）。
+    ///
+    /// **这是硬性背压，不是调优参数。** io_uring 的 CQ 环容量有限，后端只能
+    /// 缓存这么多完成包；一次 `add` 上万个操作时 CQ 必满，内核随即**丢弃**
+    /// 后续完成包（实测 add 5000 个读操作，`sq_head` 推进到 5000 表示全部
+    /// 消费，却只有 2048 个 CQE 回来，其余回调永不触发）。
+    ///
+    /// `add` 是同步 API，用户在两次调用之间没有机会收割，所以必须在这里
+    /// 设窗口：满了就压进 `submitted`，由 `run` 每轮搬一部分进来。
+    inflight: usize = 0,
+    /// 在飞窗口大小。留足 CQ 余量，也保证「提交多少、收割多少」的节奏。
+    inflight_max: usize = 1024,
     /// 延迟回收：被取消的操作所属的外层对象，等最后一个完成包回来再释放。
     /// 由调用方通过 `retire` 注册，键是 `Completion.ov` 的地址。
     retired: std.ArrayListUnmanaged(Retired) = .empty,
@@ -141,6 +153,21 @@ pub const Loop = struct {
     }
 
     /// 循环线程取走跨线程提交项，按入队顺序逐个 `add`。
+    /// 把一个操作压进跨线程待提交栈（`add` 超窗口时用）。
+    fn enqueueSubmitted(self: *Loop, c: *Completion) void {
+        var head = self.submitted.load(.acquire);
+        while (true) {
+            c.next = head;
+            head = self.submitted.cmpxchgWeak(head, c, .acq_rel, .acquire) orelse break;
+        }
+        _ = self.submitted_count.fetchAdd(1, .monotonic);
+    }
+
+    /// 把跨线程提交的操作搬进循环。
+    ///
+    /// **搬到在飞窗口满为止**，剩下的留在 `submitted` 栈里等下一轮。这是
+    /// 硬性背压：一次灌入上万个操作会把后端环灌爆，完成包被丢弃，回调
+    /// 永不触发。
     fn drainSubmitted(self: *Loop) void {
         var head: ?*Completion = self.submitted.swap(null, .acquire);
         if (head == null) return;
@@ -155,6 +182,17 @@ pub const Loop = struct {
         while (reversed) |c| {
             reversed = c.next;
             c.next = null;
+            if (c.op != .timer and c.op != .work and self.inflight >= self.inflight_max) {
+                // 窗口满：这个和后面的都放回去，下轮再来。
+                self.enqueueSubmitted(c);
+                var rest = reversed;
+                while (rest) |r| {
+                    rest = r.next;
+                    r.next = null;
+                    self.enqueueSubmitted(r);
+                }
+                break;
+            }
             self.add(c);
             count += 1;
         }
@@ -162,6 +200,20 @@ pub const Loop = struct {
     }
     /// 提交一个操作。回调可能在本调用内触发（同步完成），也可能稍后由 `run` 触发。
     pub fn add(self: *Loop, c: *Completion) void {
+        // 在飞窗口满了：压进待提交栈，由 `run` 下一轮再处理。
+        // 计时器与 work 不占窗口（它们不进后端环）。
+        if (c.op != .timer and c.op != .work) {
+            if (self.inflight >= self.inflight_max) {
+                self.enqueueSubmitted(c);
+                return;
+            }
+            self.inflight += 1;
+        }
+        self.addRaw(c);
+    }
+
+    /// 不经窗口检查的提交。`drainSubmitted` 已自行控制节奏。
+    fn addRaw(self: *Loop, c: *Completion) void {
         switch (c.op) {
             .timer => {
                 const t: *Timer = @fieldParentPtr("c", c);
@@ -299,6 +351,9 @@ pub const Loop = struct {
             var i: usize = 0;
             while (i < n) : (i += 1) {
                 self.completeOne(batch[i]);
+                // 完成包回来就腾出在飞名额。计时器/work 不进后端，不会出现在
+                // `batch` 里，所以这里每个 `Ref` 都对应一个占过名额的操作。
+                if (self.inflight > 0) self.inflight -= 1;
                 if (!self.running) break;
             }
         }

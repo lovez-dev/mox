@@ -42,9 +42,14 @@ const State = struct {
     sq_mask: u32,
     /// SQ 环容量（格数）。`getSqe` 用它判断何时必须先 flush。
     sq_entries: u32,
-    /// CQE 溢出暂存：`reapCq` 收满 `refs` 但环里还有完成包时，先搬到这里，
-    /// 下次 `waitBatch` 优先吐出。容量取 CQ 环的两倍，正常永远用不满。
-    overflow: [ENTRIES * 2]root.Ref = undefined,
+    /// CQ 环容量（格数）。`getSqe` 用它判断何时该提前收割，避免 CQ 满丢包。
+    cq_entries: u32,
+    /// CQE 溢出暂存：`reapCq` 收满 `refs`、或 `getSqe` 为腾 CQ 空位而提前
+    /// 收割时，完成包先搬到这里，下次 `waitBatch` 优先吐出。
+    ///
+    /// 容量取 CQ 环大小：一次最多腾空一个 CQ 环，不会溢出。**丢了就是回调
+    /// 永不触发**，所以宁可放大也不缩。
+    overflow: [ENTRIES * 8]root.Ref = undefined,
     overflow_len: usize = 0,
     sqes: [*]io_uring_sqe,
 
@@ -55,6 +60,26 @@ const State = struct {
 
     sq_pending: u32 = 0,
     ref: root.Ref = undefined,
+
+    /// 把 CQ 环腾空，完成包搬进 `overflow`。
+    ///
+    /// `getSqe` 在等 SQ 空位时调用它：CQ 满了内核就不产出完成包，也不推进
+    /// SQ head，只等不腾就是死锁。
+    fn pumpCq(self: *State) void {
+        while (peekCqe(self)) |cqe| {
+            if (cqe.user_data != 0) {
+                if (cqe.user_data & FILE_TAG != 0) {
+                    const sp: *root.Scratch = @ptrFromInt(cqe.user_data & ~@as(u64, 7));
+                    _ = linux.close(takeFd(sp));
+                }
+                if (self.overflow_len < self.overflow.len) {
+                    self.overflow[self.overflow_len] = fillRef(cqe);
+                    self.overflow_len += 1;
+                }
+            }
+            advanceCq(self);
+        }
+    }
 };
 
 fn stateOf(userdata: ?*anyopaque) *State {
@@ -87,8 +112,11 @@ fn setup(state: *State) !void {
     // CQ 环要能容下「SQ 满时一次 flush 的全部完成包」，否则内核会因 CQ 满
     // 而停止推进，`io_uring_enter` 阻塞，整个循环卡死。SQ 与 CQ 各 256 是
     // 不够的：一次 flush 提交 256 条，而之前可能已有未收割的完成包。
-    p.flags = 0;
-    p.cq_entries = ENTRIES * 2;
+    // `cq_entries` 必须配 `IORING_SETUP_CQSIZE` 才生效——否则内核**静默忽略**
+    // 它，CQ 仍是默认的 `sq_entries` 大小。实测漏掉这个标志时内核回填
+    // `cq_entries=512`（= 2×SQ），一次 add 2000 个操作收割停在 512 再也不动。
+    p.flags = linux.IORING_SETUP_CQSIZE;
+    p.cq_entries = ENTRIES * 8;
     const rc = linux.io_uring_setup(ENTRIES, &p);
     if (signed(rc) < 0) return error.SetupFailed;
     state.fd = @intCast(rc);
@@ -125,6 +153,7 @@ fn setup(state: *State) !void {
     state.cq_tail = @ptrCast(@alignCast(cqb + p.cq_off.tail));
     state.cqes = @ptrCast(@alignCast(cqb + p.cq_off.cqes));
     state.cq_mask = @as(*const u32, @ptrCast(@alignCast(cqb + p.cq_off.ring_mask))).*;
+    state.cq_entries = state.cq_mask + 1;
 
     const efd = linux.eventfd(0, 0);
     if (signed(efd) < 0) return error.EventfdFailed;
@@ -147,18 +176,53 @@ fn teardown(state: *State) void {
 
 /// 取一个 SQE 槽位。
 ///
-/// **必须在 SQ 环满时先把已排队的提交下去**，否则会覆写还没交给内核的 SQE：
-/// 环有 `ENTRIES` 格，`tail & mask` 会绕回去，把前 256 个操作直接踩掉。实测
-/// 一次性 `add` 600 个读操作时只有 256 个成功，其余 344 个静默失败。
+/// **两道背压，缺一不可：**
 ///
-/// 这里做的是「满了就 flush 一次」，不是「等待空间」——`flush` 只是
-/// `io_uring_enter` 提交，内核会立刻消费 SQ，通常一次就够。极端情况下
-/// （内核还没消费完）继续写入仍是安全的：`tail` 只在提交后推进，
-/// 未提交的槽位不会被内核读。
+/// 1. SQ 环空位（`tail - head < sq_entries`）。环只有 `ENTRIES` 格，`tail & mask`
+///    绕回去会覆写内核还没读走的 SQE。
+/// 2. CQ 环空位。CQ 满时内核**停止产生完成包**，连带不再推进 SQ head，于是
+///    第 1 条永远等不到空位——死锁。所以这里必须主动收割 CQ。
+///
+/// 收割到的 `Ref` 进 `early` 队列，由 `waitBatch` 优先吐出。每个 `Ref` 背后
+/// 都有一个等着回调的 `Completion`，丢了就是回调永不触发。
+///
+/// 这两条都是实测逼出来的：一次 `add` 2000 个操作，只做第 1 条时收割停在
+/// CQ 容量（512）再也不动，其余操作既不完成也不报错。
+/// 把排队的 SQE 交给内核。
+///
+/// **一次提交量不能超过 SQ 环容量**：`to_submit` 大于环内实际待提交条目时
+/// 内核返回 `EINVAL`，那批 SQE 一个都没提交。曾无条件把 `sq_pending` 清零，
+/// 超出的部分被当成「已提交」永久丢失。
+fn flush(state: *State) void {
+    while (state.sq_pending != 0) {
+        const chunk = @min(state.sq_pending, state.sq_entries);
+        const rc = linux.io_uring_enter(state.fd, chunk, 0, 0, null);
+        const rc_s = signed(rc);
+        if (rc_s <= 0) return; // 失败或无进展：留着下次再试
+        state.sq_pending -= @intCast(rc_s);
+    }
+}
+
 fn getSqe(state: *State) *io_uring_sqe {
-    // 已排队但未提交的数量达到环容量时，先提交，腾出可安全覆写的槽位。
-    //
-    if (state.sq_pending >= state.sq_entries) flush(state);
+    if (state.sq_pending != 0) flush(state);
+
+    var spins: usize = 0;
+    while (true) {
+        const head = @atomicLoad(u32, state.sq_head, .acquire);
+        const tail = @atomicLoad(u32, state.sq_tail, .monotonic);
+        if (tail -% head < state.sq_entries) break;
+
+        // SQ 满：内核还没读走槽位。收一次 CQ 并进内核催一下。
+        state.pumpCq();
+        _ = linux.io_uring_enter(state.fd, 0, 0, linux.IORING_ENTER_GETEVENTS, null);
+
+        spins += 1;
+        if (spins > 10000) {
+            // 极端情况（内核被饿死）：让出 CPU 再试，不做无限自旋。
+            std.Thread.yield() catch {};
+            spins = 0;
+        }
+    }
 
     const tail = @atomicLoad(u32, state.sq_tail, .monotonic);
     const index = tail & state.sq_mask;
@@ -168,13 +232,6 @@ fn getSqe(state: *State) *io_uring_sqe {
     @atomicStore(u32, state.sq_tail, tail +% 1, .release);
     state.sq_pending += 1;
     return sqe;
-}
-
-fn flush(state: *State) void {
-    if (state.sq_pending == 0) return;
-    const rc = linux.io_uring_enter(state.fd, state.sq_pending, 0, 0, null);
-    state.sq_pending = 0;
-    if (signed(rc) < 0) {} // best-effort; a later poll will surface errors
 }
 
 fn peekCqe(state: *State) ?*io_uring_cqe {
@@ -820,6 +877,7 @@ pub fn create(alloc: std.mem.Allocator) !root.Io {
         .sq_array = undefined,
         .sq_mask = 0,
         .sq_entries = 0,
+        .cq_entries = 0,
         .overflow_len = 0,
         .sqes = undefined,
         .cq_head = undefined,

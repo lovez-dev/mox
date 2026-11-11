@@ -62,6 +62,7 @@ pub fn build(b: *std.Build) void {
     const bench_options = b.addOptions();
     bench_options.addOption(usize, "rounds", b.option(usize, "rounds", "TCP echo 往返次数") orelse 2000);
     bench_options.addOption(usize, "conns", b.option(usize, "conns", "并发连接数") orelse 16);
+    bench_options.addOption(usize, "ops", b.option(usize, "ops", "burst 尺子一次灌入的操作数") orelse 20000);
     const bench = b.addExecutable(.{
         .name = "bench-echo",
         .root_module = b.createModule(.{
@@ -102,6 +103,22 @@ pub fn build(b: *std.Build) void {
     concurrent.root_module.addOptions("build_options", bench_options);
     const run_concurrent = b.addRunArtifact(concurrent);
     b.step("bench-concurrent", "运行多连接并发吞吐尺子").dependOn(&run_concurrent.step);
+
+    // 环管理尺子：一次灌入大量操作，让 SQ/CQ 环的批量路径真正被走到。
+    // `bench/echo.zig` 是单连接串行往返，每轮只有 1 个在飞操作，测不出
+    // 环管理改动的任何收益——必须有这个尺子才有对比基线。
+    const burst = b.addExecutable(.{
+        .name = "bench-burst",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/burst.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    burst.root_module.addImport("mox_io", mox_io);
+    burst.root_module.addOptions("build_options", bench_options);
+    const run_burst = b.addRunArtifact(burst);
+    b.step("bench-burst", "运行环管理批量吞吐尺子").dependOn(&run_burst.step);
 
     // 真包依赖验证：在 examples/consumer 里通过 `b.dependency("mox")` 编译。
     const pkg_build = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });

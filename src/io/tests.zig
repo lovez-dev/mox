@@ -1780,6 +1780,74 @@ test "ReadFileAsync 对不存在的文件报 FileNotFound" {
     _ = Ctx.got;
 }
 
+// 一次提交远超环容量的操作数，每个都必须完成。
+//
+// **这条测的是背压，不是性能。** io_uring 的 SQ 环只有 256 格、CQ 环有限，
+// 一次性 `add` 上千个操作时有三条独立路径会让完成包静默消失：
+//
+// 1. `getSqe` 绕环覆写还没提交的 SQE；
+// 2. CQ 满后内核停止推进 SQ head，`getSqe` 死等；
+// 3. CQ 满后内核**丢弃**后续完成包（`sq_head` 照样推进，看起来像全消费了）。
+//
+// 三种表现都是「回调永不触发」，在 CI 里表现为挂死（超时 124）而不是失败。
+// 所以每个节点都挂 watchdog，把挂死转成明确的 `DeadlineExceeded`。
+//
+// 规模取 1200：既超过 SQ 环（256）也超过 CQ 环（2048/2 的常规余量），
+// 又能在 30s watchdog 内跑完（20000 个在本地要 10s 以上）。
+test "大批量提交超过环容量时每个操作都完成（背压不丢回调）" {
+    var l = try testLoop();
+    defer l.deinit();
+    if (l.io.vtable.readFileAsync == null) return error.SkipZigTest;
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "burst");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var fbuf: [600]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&fbuf, "{s}/b.txt", .{dir});
+    defer l.deleteFile(fpath);
+    try l.writeFileAll(fpath, "hello-burst");
+
+    var zpath_buf: [700]u8 = undefined;
+    @memcpy(zpath_buf[0..fpath.len], fpath);
+    zpath_buf[fpath.len] = 0;
+    const zpath: [:0]const u8 = zpath_buf[0..fpath.len :0];
+
+    const n = 3000;
+    const Ctx = struct {
+        var remaining: usize = 0;
+        var bad: usize = 0;
+        fn cb(lp: *Loop, c: *Completion) void {
+            if (c.err != null) bad += 1;
+            // 饱和减法：watchdog 与真实完成可能先后触发同一个节点。
+            remaining -|= 1;
+            if (remaining == 0) lp.stop();
+        }
+    };
+    Ctx.remaining = n;
+    Ctx.bad = 0;
+
+    var nodes: [n]root.ReadFileAsync = undefined;
+    var bufs: [n][16]u8 = undefined;
+    var wds: [n]Timer = undefined;
+    for (&nodes, 0..) |*node, i| {
+        node.* = root.ReadFileAsync.init(zpath, &bufs[i]);
+        node.c.callback = &Ctx.cb;
+        l.add(&node.c);
+        // 每个节点单独挂 30s watchdog：环管理坏掉时是挂死，不是失败。
+        wds[i] = Timer.init(30_000);
+        l.watchdog(&node.c, &wds[i], 30_000);
+    }
+
+    try l.run();
+
+    // 失败的个数必须为 0——任何一个丢了回调，`remaining` 就永远降不到 0，
+    // 循环会靠 watchdog 超时退出，而超时的节点会把 `bad` 加上去。
+    try std.testing.expectEqual(@as(usize, 0), Ctx.bad);
+    try std.testing.expectEqual(@as(usize, 0), Ctx.remaining);
+}
+
 test "ReadFileAsync 的 offset 生效（从中间读）" {
     var l = try testLoop();
     defer l.deinit();
