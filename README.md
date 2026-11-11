@@ -212,6 +212,30 @@ A/B 是临时把 `loop.zig` 的 `batch_size` 改成 1 跑出来的，已改回 6
 benchmark，API 也不兼容；在建立 zio 适配器与共同负载之前，不能据此声称
 「与 zio 对齐」或「不比 zio 差」。
 
+### 与 zio / fasthttp 同机对标
+
+同一台机器（WSL2，4 核，内核 6.18）、同一个压测客户端，避免跨机误差：
+
+| 场景 | mox | 对照 |
+|---|---|---|
+| TCP ping-pong，50 连接 | **187.8k ops/s，5.3 µs/op** | zio 181.0k，5.5 µs/op |
+| HTTP/1.1 keep-alive，c=200 | **74.9k req/s** | fasthttp 66.3k req/s |
+
+zio 是 Zig 的事件循环库（io_uring + work-stealing 调度），fasthttp 是 Go 的
+高性能 HTTP 服务端，两者都是各自生态的性能标杆。测法：zio 与 mox 各写一个
+无人工延迟的 echo 服务端，用同一个 Go 客户端跑 ping-pong；HTTP 侧用 `hey`
+打同一个固定响应。
+
+**这些绝对数字只在本机内部有意义**（4 核 WSL、客户端与服务端抢同一批
+CPU），不要拿去做跨平台横比。有价值的是同机相对差距。
+
+踩到的关键坑：io_uring 后端曾在 `getSqe` 里对每个 `add` 立即
+`io_uring_enter`，把批量提交彻底废掉。功能全对、所有测试全绿，但
+strace 显示 25000 次往返产生 **50101 次 enter**（每操作 2 次），吞吐比
+zio 低 22%。改为只在 `waitBatch` 开头 flush 一次后，enter 降到 **1051**
+（-97.9%），吞吐反超 zio。**这类退化没有任何功能测试能抓到，只能数
+syscall**——所以后端保留了只读探针 `enterCalls()` 和对应的回归测试。
+
 ### 试过但未启用：io_uring 的 `DEFER_TASKRUN` / `SINGLE_ISSUER` / `COOP_TASKRUN`
 
 按 zio 的形状把队列容量做成运行时 `queue_size` 时，顺手试了这三个标志（zio
