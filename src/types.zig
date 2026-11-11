@@ -70,4 +70,22 @@ pub const Config = struct {
     gpa: std.mem.Allocator,
     address: std.Io.net.IpAddress,
     routes: []const Route,
+
+    /// 并发连接上限。达到上限后不再 `accept`，新连接在内核 listen backlog
+    /// 里排队（形成天然背压），而不是无限制地吃内存 / fd。默认 1024。
+    max_connections: usize = 1024,
+
+    /// 空闲超时（毫秒）：一个已建立的连接在两次请求之间允许的最长静默时间。
+    /// 超时即关闭，防止半开连接 / 慢速攻击长期占用资源。0 表示不设超时。
+    /// 默认 60s。
+    idle_timeout_ms: u32 = 60_000,
+
+    /// `accept` 失败（典型是 EMFILE / ENFILE，fd 耗尽）后的退避毫秒数。
+    /// **不能立即重试**：失败→立即重试会在错误持续期间把 CPU 打满。
+    /// 默认 50ms。
+    accept_backoff_ms: u32 = 50,
+
+    /// 优雅停机的总预算（毫秒）。停机时先关掉在飞连接、再等它们的完成包
+    /// 回来，超过这个时间仍未收尾就放弃等待直接返回。默认 5s。
+    shutdown_timeout_ms: u32 = 5_000,
 };

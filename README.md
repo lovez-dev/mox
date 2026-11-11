@@ -560,6 +560,46 @@ exe.root_module.addImport("mox_io", dep.module("mox_io"));
 已知容量上限：非文件响应受每连接 `send_buf`（16 KB）限制，超出会返回 500；
 文件响应走动态缓冲区不受此限。这是容量问题，不是正确性问题。
 
+## 连接管理：并发上限、空闲超时、优雅停机
+
+server 层面向生产的几个硬缺口已补齐，均可经 `Config` 调参：
+
+```zig
+try mox.serve(.{
+    .gpa = gpa,
+    .address = addr,
+    .routes = routes,
+    .max_connections = 1024,   // 并发连接上限
+    .idle_timeout_ms = 60_000, // 两次请求间最长静默
+    .accept_backoff_ms = 50,   // accept 失败退避
+    .shutdown_timeout_ms = 5_000,
+});
+```
+
+- **并发上限**：达到 `max_connections` 后不再 `accept`，新连接留在内核
+  listen backlog 里排队（天然背压），而不是无限制地吃内存 / fd。有连接
+  释放腾出名额后自动恢复接受。
+- **accept 失败退避**：`accept` 因 `EMFILE` / `ENFILE`（fd 耗尽）失败时，
+  **不能立即重试**——失败→立即重试会在错误持续期间把循环线程 CPU 打满。
+  改为用一个短定时器（`accept_backoff_ms`）延时重试，期间照常服务已有连接。
+- **空闲超时**：每个连接在「等下一个请求」期间挂一个 `idle_timeout_ms` 的
+  定时器；到点仍未收到新数据即关闭，防半开连接 / 慢速攻击长期占资源。
+  `0` 表示不设。
+- **优雅停机**：`loop.run()` 退出后，server 不再粗暴丢弃在飞连接，而是：
+  停止接受 → 逐个 `abortConn`（按连接所处阶段取消对应的在飞 recv/send/
+  file-read，空闲连接直接关闭）→ `Loop.drainOpen` 继续驱动循环把收尾完成包
+  收干净，直到所有连接释放或超过 `shutdown_timeout_ms`。
+
+**取消的释放时机**（关键正确性点）：中止一个带在飞操作的连接时，**绝不**
+同步 `destroy`——后端可能还持有指向 `conn.recv`/`conn.send` 的节点，立即释放
+就是 use-after-free。正确做法是 `loop.cancel` 那个操作，把连接释放在它的完成包
+回来时（`freeConnCtx`）做。`Connection.state` 记录当前阶段，停机时据此决定
+该取消哪个节点。
+
+三条回归测试各有洞：达上限不投递 accept、静默连接被空闲超时关闭、`drainOpen`
+停机后关闭在飞连接。都用变异测试确认有验证力（分别禁用容量守卫 / idle 定时器
+挂载 / `drainOpen` 的回调派发，均明确变红而非挂死）。
+
 ## UDP 与 DNS：原生异步，不再占用线程池
 
 UDP 数据报原先只能在 `Work` 池里用阻塞 `recvfrom` 实现。这个组合有一个致命

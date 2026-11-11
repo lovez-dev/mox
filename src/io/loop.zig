@@ -481,6 +481,52 @@ pub const Loop = struct {
         }
     }
 
+    /// 停机后继续驱动循环，直到 `done(ctx)` 返回 true 或超过 `max_wait_ms`。
+    ///
+    /// 用于优雅关闭：`run()` 因 `stop()` 退出后，可能还有连接要收尾（取消
+    /// 在飞操作、等它们的完成包回来释放内存）。这时需要把循环再跑起来，
+    /// 让正常完成包（如 `NetClose`）的回调真正执行——`drainRetired` 只回收
+    /// 取消项、不跑普通回调，所以不能替代本函数。
+    ///
+    /// 与 `run()` 的区别：不理会 `stop()`（停机关闭过程中回调再调 `stop`
+    /// 不会打断收尾），退出条件完全由 `done` 与超时决定。超时是硬边界，
+    /// 到期即返回，残留对象归属转交调用方。
+    pub fn drainOpen(
+        self: *Loop,
+        max_wait_ms: u32,
+        ctx: *anyopaque,
+        done: *const fn (*anyopaque) bool,
+    ) void {
+        const start = self.io.vtable.now(self.io.userdata);
+        var batch: [batch_size]Ref = undefined;
+        while (!done(ctx)) {
+            if (self.io.vtable.now(self.io.userdata) - start >= max_wait_ms) {
+                self.running = false;
+                return;
+            }
+            // 停机后仍要跑回调：置 running 为真，`drainReady` / `drainWork`
+            // 里的 `if (!self.running) return` 才不会把收尾回调挡掉。
+            self.running = true;
+            self.drainSubmitted();
+            self.drainReady();
+            self.drainWork();
+            // 轮询上限压到 50ms：保证能及时复查 `done` 与超时，不被一个
+            // 「永远等待」的 waitBatch 卡死（停机时后端可能已无事件）。
+            const timeout = @min(self.nextTimeout(), 50);
+            const n = self.io.vtable.waitBatch(self.io.userdata, timeout, &batch) catch {
+                self.running = false;
+                return;
+            };
+            self.fireTimers();
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                self.completeOne(batch[i]);
+                if (self.inflight > 0) self.inflight -= 1;
+            }
+        }
+        self.running = false;
+    }
+
     pub fn stop(self: *Loop) void {
         self.running = false;
     }
