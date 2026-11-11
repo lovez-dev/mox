@@ -19,3 +19,4 @@ Thumbs.db
 .tmp_*
 .mox_*
 .zonprobe/
+.benchtmp/

@@ -671,7 +671,7 @@ test "取消定时器立即回收，不等待完成包" {
 
     try std.testing.expectEqual(@as(usize, 0), Ctx.fired);
     try std.testing.expectEqual(@as(usize, 1), Ctx.disposed);
-    try std.testing.expectEqual(@as(usize, 0), loop.retired.items.len);
+    try std.testing.expectEqual(@as(usize, 0), loop.retired.count());
 }
 
 test "能力表同时容纳 UDP 与 DNS，未注册能力仍返回 null" {
@@ -846,14 +846,14 @@ test "drainRetired 超时可观测：永不回来的取消项记一次超时且�
     w.c.socket = root.INVALID_HANDLE;
     loop.cancel(&w.c, &w, &Ctx.dispose);
 
-    try std.testing.expectEqual(@as(usize, 1), loop.retired.items.len);
+    try std.testing.expectEqual(@as(usize, 1), loop.retired.count());
     try std.testing.expectEqual(@as(usize, 0), loop.retired_timeouts);
 
     loop.drainRetired(50);
 
     // 超时必须被记下来，而不是静默返回；对象也仍然没有被 dispose。
     try std.testing.expectEqual(@as(usize, 1), loop.retired_timeouts);
-    try std.testing.expectEqual(@as(usize, 1), loop.retired.items.len);
+    try std.testing.expectEqual(@as(usize, 1), loop.retired.count());
 }
 
 // WriteFile 与 ReadFile 对称：都内嵌 Work 节点、回调落在循环线程。

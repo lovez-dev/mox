@@ -103,7 +103,7 @@ pub const Loop = struct {
     inflight_max: usize = 1024,
     /// 延迟回收：被取消的操作所属的外层对象，等最后一个完成包回来再释放。
     /// 由调用方通过 `retire` 注册，键是 `Completion.ov` 的地址。
-    retired: std.ArrayListUnmanaged(Retired) = .empty,
+    retired: std.AutoHashMapUnmanaged(*Scratch, Retired) = .{},
     /// `drainRetired` 因超时提前返回的次数。正常关停应当为 0；
     /// 非零说明有完成包没能在预算内回来，context 归属已转交调用方。
     retired_timeouts: usize = 0,
@@ -340,7 +340,7 @@ pub const Loop = struct {
                 // 这两种操作由 `Udp` 自己向后端提交（它同时持有能力表和节点
                 // 布局，不必反过来让 Loop 认识 UDP 节点）。回落到线程池时，
                 // op 已被改回 `.work`，因此不会走到这里。
-                unreachable;
+                @panic("UDP 操作通过 Udp.recv()/Udp.send() 提交，不要直接 loop.add");
             },
 
             .work => {
@@ -423,7 +423,7 @@ pub const Loop = struct {
     /// `invoke` 自然回收，因此不会卡在 `drainRetired` 超时上。
     pub fn cancel(self: *Loop, c: *Completion, ctx: *anyopaque, dispose: *const fn (*anyopaque) void) void {
         c.cancelled = true;
-        self.retired.append(self.allocator, .{
+        self.retired.put(self.allocator, &c.ov, .{
             .scratch = &c.ov,
             .context = ctx,
             .dispose = dispose,
@@ -441,15 +441,11 @@ pub const Loop = struct {
     }
 
     /// 完成包对应一个被取消的操作：只回收对象，不回调。
+    /// 完成包对应一个被取消的操作：只回收对象，不回调。
     fn reclaim(self: *Loop, scratch: *Scratch) bool {
-        var i: usize = 0;
-        while (i < self.retired.items.len) : (i += 1) {
-            if (self.retired.items[i].scratch != scratch) continue;
-            const r = self.retired.orderedRemove(i);
-            r.dispose(r.context);
-            return true;
-        }
-        return false;
+        const r = self.retired.fetchRemove(scratch) orelse return false;
+        r.value.dispose(r.value.context);
+        return true;
     }
     /// 停机后排空所有已登记的取消项：继续批量取完成包直到登记表为空。
     /// `Server` 的 `NetAccept` 在栈上，必须等它回收完才能让 `serve` 返回。
@@ -466,7 +462,7 @@ pub const Loop = struct {
     pub fn drainRetired(self: *Loop, max_wait_ms: u32) void {
         const start = self.io.vtable.now(self.io.userdata);
         var batch: [batch_size]Ref = undefined;
-        while (self.retired.items.len != 0) {
+        while (self.retired.count() != 0) {
             if (self.io.vtable.now(self.io.userdata) - start >= max_wait_ms) {
                 self.retired_timeouts += 1;
                 return;
@@ -532,6 +528,8 @@ pub const Loop = struct {
 
     pub fn stop(self: *Loop) void {
         self.running = false;
+        // 主动唤醒可能正睡在 waitBatch 里的循环，让停机即时生效（否则最多等 200ms）。
+        self.io.vtable.notify(self.io.userdata);
     }
 
     /// 把套接字的 I/O（以及其上投递的 AcceptEx）路由到本后端。
@@ -616,6 +614,23 @@ pub const Loop = struct {
         return self.io.vtable.fileSize(self.io.userdata, path);
     }
 
+
+    // ---- 可观测接口 ---------------------------------------------------------
+
+    /// 返回当前在飞操作数（已提交到后端、尚未收到完成包的非 timer/work 操作）。
+    pub fn inflightCount(self: *const Loop) usize {
+        return self.inflight;
+    }
+
+    /// 返回待触发的定时器数量（包括普通定时器和 watchdog 定时器）。
+    pub fn pendingTimers(self: *const Loop) usize {
+        return self.timers.items.items.len;
+    }
+
+    /// 返回已登记、待回收的取消项数量。正常停机后应为 0；非零说明有完成包未能在预算内回来。
+    pub fn pendingRetired(self: *const Loop) usize {
+        return self.retired.count();
+    }
     // ---- 目录与元数据（阻塞调用，在 `Work` 池线程里跑才不卡循环） ----------
     //
     // 这些是**同步**入口：直接调平台层，会阻塞当前线程。放在 `Loop` 上是为了

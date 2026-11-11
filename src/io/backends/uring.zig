@@ -59,10 +59,13 @@ const State = struct {
 
     /// CQE 溢出暂存：`reapCq` 收满 `refs`、或 `getSqe` 为腾 CQ 空位而提前
     /// 收割时，完成包先搬到这里，下次 `waitBatch` 优先吐出。容量 = CQ 环
-    /// 大小，在 `createWith` 里按 `queue_size` 堆分配（队列容量现在是运行时
-    /// 可配的，不再是编译期定长）。**丢了就是回调永不触发**，宁可放大。
+    /// 大小，在 `createWith` 里按 `queue_size` 堆分配。
+    ///
+    /// 用环形缓冲（head/tail mod len）而不是移位数组：出队 O(1) 而非 O(n)，
+    /// 在大批量提交导致频繁溢出时避免热路径上的线性移位。
     overflow: []root.Ref = undefined,
-    overflow_len: usize = 0,
+    overflow_head: usize = 0,
+    overflow_tail: usize = 0,
     sqes: [*]io_uring_sqe,
 
     cq_head: *u32,
@@ -81,6 +84,23 @@ const State = struct {
     ///
     /// `getSqe` 在等 SQ 空位时调用它：CQ 满了内核就不产出完成包，也不推进
     /// SQ head，只等不腾就是死锁。
+    fn overflowLen(self: *const State) usize {
+        return self.overflow_tail -% self.overflow_head;
+    }
+
+    fn overflowPush(self: *State, ref: root.Ref) void {
+        if (self.overflowLen() >= self.overflow.len) return; // 满了就丢（不应发生）
+        self.overflow[self.overflow_tail % self.overflow.len] = ref;
+        self.overflow_tail +%= 1;
+    }
+
+    fn overflowPop(self: *State) ?root.Ref {
+        if (self.overflow_head == self.overflow_tail) return null;
+        const ref = self.overflow[self.overflow_head % self.overflow.len];
+        self.overflow_head +%= 1;
+        return ref;
+    }
+
     fn pumpCq(self: *State) void {
         while (peekCqe(self)) |cqe| {
             if (cqe.user_data != 0) {
@@ -88,10 +108,7 @@ const State = struct {
                     const sp: *root.Scratch = @ptrFromInt(cqe.user_data & ~@as(u64, 7));
                     _ = linux.close(takeFd(sp));
                 }
-                if (self.overflow_len < self.overflow.len) {
-                    self.overflow[self.overflow_len] = fillRef(cqe);
-                    self.overflow_len += 1;
-                }
+                self.overflowPush(fillRef(cqe));
             }
             advanceCq(self);
         }
@@ -393,9 +410,13 @@ fn vtClose(userdata: ?*anyopaque, socket: Handle) void {
 }
 
 /// 按 user_data 取消一个已提交的 SQE。取消请求自身的 user_data 为 0，
-/// `vtWait` 会跳过它的 CQE；原操作随后收到 `-ECANCELED` 完成包。
+/// `reapCq` 会跳过它的 CQE；原操作随后收到 `-ECANCELED` 完成包。
+///
+/// `socket == INVALID_HANDLE` 表示该节点不经过 io_uring（`timer` / `work`），
+/// 提交 cancel SQE 只会得到 `ENOENT` 再被 `user_data == 0` 路径丢弃，
+/// 白白多一次 `io_uring_enter`。直接返回即可。
 fn vtCancel(userdata: ?*anyopaque, socket: root.Handle, scratch: *root.Scratch) void {
-    _ = socket;
+    if (socket == root.INVALID_HANDLE) return;
     const state = stateOf(userdata);
     const sqe = getSqe(state);
     sqe.prep_cancel(@intFromPtr(scratch), 0);
@@ -477,19 +498,15 @@ fn vtWaitBatch(userdata: ?*anyopaque, timeout_ms: u32, refs: []root.Ref) anyerro
 fn reapCq(state: *State, refs: []root.Ref) usize {
     var n: usize = 0;
 
-    // 先把上次溢出的搬出来。
-    while (n < refs.len and state.overflow_len > 0) {
-        refs[n] = state.overflow[0];
+    // 先把上次溢出的搬出来（环形缓冲 O(1) 出队）。
+    while (n < refs.len) {
+        refs[n] = state.overflowPop() orelse break;
         n += 1;
-        state.overflow_len -= 1;
-        var i: usize = 0;
-        while (i < state.overflow_len) : (i += 1) state.overflow[i] = state.overflow[i + 1];
     }
     if (n == refs.len) return n;
 
     while (peekCqe(state)) |cqe| {
         if (cqe.user_data != 0) {
-            // 文件 I/O 完成：同步关掉 openat 开的 fd（纳秒级，不必异步）。
             if (cqe.user_data & FILE_TAG != 0) {
                 const sp: *root.Scratch = @ptrFromInt(cqe.user_data & ~@as(u64, 7));
                 _ = linux.close(takeFd(sp));
@@ -498,11 +515,9 @@ fn reapCq(state: *State, refs: []root.Ref) usize {
             if (n < refs.len) {
                 refs[n] = ref;
                 n += 1;
-            } else if (state.overflow_len < state.overflow.len) {
-                // 环必须腾空（否则 CQ 满 → 内核停推 → 循环卡死），
-                // 但完成包不能丢，先存起来。
-                state.overflow[state.overflow_len] = ref;
-                state.overflow_len += 1;
+            } else {
+                // 环必须腾空（否则 CQ 满 → 内核停推 → 循环卡死），溢出存起来。
+                state.overflowPush(ref);
             }
         }
         advanceCq(state);
@@ -913,7 +928,8 @@ pub fn createWith(alloc: std.mem.Allocator, opts: root.Options) !root.Io {
         .sq_mask = 0,
         .sq_entries = 0,
         .cq_entries = 0,
-        .overflow_len = 0,
+        .overflow_head = 0,
+        .overflow_tail = 0,
         .sqes = undefined,
         .cq_head = undefined,
         .cq_tail = undefined,
@@ -1200,8 +1216,17 @@ pub fn symLink(target: []const u8, link_path: []const u8) !void {
 }
 
 /// 文件类型。与 `std.fs.File.Kind` 的常用子集对齐，够静态服务判断
-/// 「是不是普通文件」用。
+/// 「是不是普通文件」用。必须与 `root.FileKind` 字段顺序一致——
+/// `vtStatPath` 通过 backing int 做转换，加这一条编译期断言锁死不变量。
 pub const FileKind = enum { file, directory, sym_link, other };
+comptime {
+    const root_kind = @typeInfo(root.FileKind).@"enum";
+    const self_kind = @typeInfo(FileKind).@"enum";
+    if (root_kind.fields.len != self_kind.fields.len) @compileError("uring.FileKind 与 root.FileKind 字段数不一致");
+    for (root_kind.fields, self_kind.fields) |rf, sf| {
+        if (rf.value != sf.value) @compileError("uring.FileKind 与 root.FileKind 取值错位: " ++ rf.name);
+    }
+}
 
 /// 路径元数据。`mtime_ms` 是 Unix 毫秒，便于直接做 `If-Modified-Since`。
 pub const Stat = struct {
@@ -1253,8 +1278,7 @@ pub fn stat(path: []const u8) !Stat {
 ///
 /// 不排序、不含 `.` 与 `..`：排序是策略，交给调用方。
 pub fn listDir(path: []const u8, buf: []DirEntry) !usize {
-    var pbuf: [1024]u8 = undefined;
-    const p = try pathZ(path, &pbuf);
+    // `std.posix.openat` 接受 Zig 切片并自行处理 NUL 结尾，无需提前转。
     const fd = try std.posix.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
     defer _ = linux.close(fd);
 
@@ -1285,7 +1309,6 @@ pub fn listDir(path: []const u8, buf: []DirEntry) !usize {
             off += rec_len;
         }
     }
-    _ = p;
     return count;
 }
 

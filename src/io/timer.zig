@@ -79,7 +79,6 @@ pub const TimerQueue = struct {
             return true; // 正好是末节点，弹出即可
         }
         self.items.items[i] = last;
-        self.items.items[i] = last;
         last.heap_index = i;
         self.siftUp(i);
         self.siftDown(i);

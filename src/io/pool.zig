@@ -63,7 +63,9 @@ pub const Pool = struct {
     }
 
     fn start(self: *Pool, wake: *const fn (*anyopaque) void, ctx: *anyopaque) void {
-        const n = @min(self.max_workers, 8);
+        // 不再对 `max_workers` 加隐式上限：调用方通过 `Options.max_workers`
+        // 显式给的值就是它想要的线程数，静默截断只会让人以为自己开够了线程。
+        const n = self.max_workers;
         self.threads = self.allocator.alloc(std.Thread, n) catch {
             // 拿不到线程数组：保持未启动，任务将在停机或排空时兜底执行。
             return;
