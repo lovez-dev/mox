@@ -333,6 +333,10 @@ pub const ProcessWait = process.Wait;
 /// `Loop.init` 已把 `SIGPIPE` 设为 `SIG_IGN`，不要再用本模块订阅它。详见 `signal.zig`。
 pub const signal = @import("signal.zig");
 pub const Signal = signal.Signal;
+
+/// TTY / 终端支持：模式切换（raw/cooked/cbreak）、尺寸查询、保存/恢复状态。
+/// 只暴露同步接口（终端操作微秒级完成，无需异步化）。详见 `tty.zig`。
+pub const tty = @import("tty.zig");
 pub const Signals = signal.Signals;
 
 const udp_storage = udp.VTable{

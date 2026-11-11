@@ -128,10 +128,21 @@ pub const Query = struct {
             const rdlen = readU16(msg, off + 8);
             off += 10;
             if (off + rdlen > msg.len) return;
+            // TYPE=1 (A), RDLEN=4: IPv4
             if (typ == 1 and class == 1 and rdlen == 4) {
                 self.answer.addresses[self.answer.count] = .{ .ip4 = .{
                     .bytes = msg[off..][0..4].*,
                     .port = 0,
+                } };
+                self.answer.count += 1;
+            }
+            // TYPE=28 (AAAA), RDLEN=16: IPv6
+            if (typ == 28 and class == 1 and rdlen == 16) {
+                self.answer.addresses[self.answer.count] = .{ .ip6 = .{
+                    .bytes = msg[off..][0..16].*,
+                    .port = 0,
+                    .flow = 0,
+                    .interface = .none,
                 } };
                 self.answer.count += 1;
             }
@@ -144,6 +155,14 @@ pub const Query = struct {
         if (self.on_done) |cb| cb(l, &self.recv.work.c);
     }
 };
+
+
+    /// 构造 AAAA 查询（IPv6）。
+    pub fn initAAAA(socket: Handle, server: IpAddress, name: []const u8) Query {
+        var q: Query = .{ .socket = socket, .server = server, .name = name };
+        q.request_len = buildQueryAAAA(&q.request, name);
+        return q;
+    }
 
 /// 从任意偏移读大端 u16；切片长度运行时才知道，用位运算避开类型要求。
 fn readU16(msg: []const u8, off: usize) u16 {
@@ -187,6 +206,72 @@ fn buildQuery(buf: []u8, name: []const u8) usize {
     std.mem.writeInt(u16, buf[off + 2 ..][0..2], 1, .big); // IN
     return off + 4;
 }
+
+
+/// 构造标准 AAAA 查询（IPv6）：与 buildQuery 类似，QTYPE=28。
+fn buildQueryAAAA(buf: []u8, name: []const u8) usize {
+    @memset(buf[0..12], 0);
+    std.mem.writeInt(u16, buf[0..2], 0x1234, .big);
+    std.mem.writeInt(u16, buf[2..4], 0x0100, .big); // RD
+    std.mem.writeInt(u16, buf[4..6], 1, .big); // QDCOUNT
+    var off: usize = 12;
+    var it = std.mem.splitScalar(u8, name, '.');
+    while (it.next()) |label| {
+        if (label.len == 0 or label.len > 63 or off + 1 + label.len + 5 > buf.len) break;
+        buf[off] = @intCast(label.len);
+        off += 1;
+        @memcpy(buf[off..][0..label.len], label);
+        off += label.len;
+    }
+    if (off >= buf.len) return off;
+    buf[off] = 0;
+    off += 1;
+    if (off + 4 > buf.len) return off;
+    std.mem.writeInt(u16, buf[off..][0..2], 28, .big); // AAAA
+    std.mem.writeInt(u16, buf[off + 2 ..][0..2], 1, .big); // IN
+    return off + 4;
+}
+
+/// 高层便捷接口：封装 Work 节点 + 自动探测 A/AAAA。
+/// 使用系统 resolver 配置（读 /etc/resolv.conf 或 Windows registry）。
+pub const GetAddressList = struct {
+    work: @import("completion.zig").Work,
+    host: []const u8,
+    port: u16,
+    allocator: std.mem.Allocator,
+    addresses: ?[]std.net.Address = null,
+    err: ?anyerror = null,
+
+    pub fn init(allocator: std.mem.Allocator, host: []const u8, port: u16) GetAddressList {
+        return .{
+            .work = @import("completion.zig").Work.init(run),
+            .allocator = allocator,
+            .host = host,
+            .port = port,
+        };
+    }
+
+    fn run(w: *@import("completion.zig").Work) void {
+        const self: *GetAddressList = @fieldParentPtr("work", w);
+        // 回落到系统 getaddrinfo（阻塞调用，运行在 Work 池线程）
+        self.addresses = std.net.getAddressList(self.allocator, self.host, self.port) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    pub fn deinit(self: *GetAddressList) void {
+        if (self.addresses) |addrs| {
+            self.allocator.free(addrs);
+            self.addresses = null;
+        }
+    }
+
+    pub fn getResult(self: *GetAddressList) ![]const std.net.Address {
+        if (self.err) |e| return e;
+        return self.addresses orelse error.NoAddresses;
+    }
+};
 
 test "DNS 查询报文格式与应答解析" {
     var buf: [512]u8 = undefined;
