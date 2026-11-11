@@ -39,8 +39,15 @@ pub const Signals = struct {
     pub const INT: u8 = 2;
     pub const QUIT: u8 = 3;
     pub const TERM: u8 = 15;
-    pub const USR1: u8 = 10;
-    pub const USR2: u8 = 12;
+    // USR1/USR2 的编号在 Linux（10/12）与 macOS/BSD（30/31）上不同。
+    pub const USR1: u8 = switch (builtin.os.tag) {
+        .linux => 10,
+        else => 30, // macOS / FreeBSD / NetBSD / OpenBSD / DragonFly
+    };
+    pub const USR2: u8 = switch (builtin.os.tag) {
+        .linux => 12,
+        else => 31,
+    };
 };
 
 /// 每种信号最多一个订阅：`sigaction` 是进程级单值，多订阅会互相覆盖。
@@ -126,6 +133,21 @@ pub const Signal = struct {
 
     /// 取消订阅并关闭读端。必须在 `Wait` 节点已从循环摘除之后调用。
     pub fn deinit(self: *Signal) void {
+        // 先原子置换写端 fd（信号处理器原子读取它，交换后见 -1 直接返回），
+        // 再向其写入哨兵字节（0），唤醒可能正阻塞于 read 的 Work 线程；
+        // 最后关读端。不论 Work 线程处于何种状态，deinit 后 pool.shutdown()
+        // 都能 join 到它，不会永久挂死。
+        const w = pipe_write_fd[self.sig].swap(-1, .acq_rel);
+        if (w >= 0) {
+            const sentinel: [1]u8 = .{0};
+            if (is_linux) {
+                _ = lx.write(@intCast(w), &sentinel, 1);
+                _ = lx.close(@intCast(w));
+            } else {
+                _ = sysc.write(w, &sentinel, 1);
+                _ = sysc.close(w);
+            }
+        }
         if (self.read_fd >= 0) {
             if (is_linux) {
                 _ = lx.close(@intCast(self.read_fd));
@@ -133,14 +155,6 @@ pub const Signal = struct {
                 _ = sysc.close(self.read_fd);
             }
             self.read_fd = -1;
-        }
-        const w = pipe_write_fd[self.sig].swap(-1, .acq_rel);
-        if (w >= 0) {
-            if (is_linux) {
-                _ = lx.close(@intCast(w));
-            } else {
-                _ = sysc.close(w);
-            }
         }
         // 恢复默认处置，避免处理器指向已释放的全局状态。
         if (is_linux) {
@@ -171,6 +185,8 @@ pub const Signal = struct {
             self.err = error.ReadFailed;
             return;
         }
+        // 哨兵字节（0 由 deinit 写入）：主动中止，非真实信号到达。
+        if (byte[0] == 0) { self.err = error.Aborted; return; }
         self.received = self.sig;
     }
 

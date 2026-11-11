@@ -243,12 +243,12 @@ pub const Loop = struct {
                 const t: *NetRecv = @fieldParentPtr("c", c);
                 const r = self.io.vtable.recv(self.io.userdata, t.socket, t.buffer, &c.ov) catch |e| {
                     c.err = e;
-                    self.pushReady(c);
+                    self.pushReadySync(c);
                     return;
                 };
                 if (r) |n| {
                     c.bytes = n;
-                    self.pushReady(c);
+                    self.pushReadySync(c);
                 }
             },
 
@@ -256,12 +256,12 @@ pub const Loop = struct {
                 const t: *NetSend = @fieldParentPtr("c", c);
                 const r = self.io.vtable.send(self.io.userdata, t.socket, t.bytes_buffer, &c.ov) catch |e| {
                     c.err = e;
-                    self.pushReady(c);
+                    self.pushReadySync(c);
                     return;
                 };
                 if (r) |n| {
                     c.bytes = n;
-                    self.pushReady(c);
+                    self.pushReadySync(c);
                 }
             },
 
@@ -269,17 +269,17 @@ pub const Loop = struct {
                 const t: *NetAccept = @fieldParentPtr("c", c);
                 const r = self.io.vtable.accept(self.io.userdata, t.listen, t.accept_socket, &t.addr_buf, &c.ov) catch |e| {
                     c.err = e;
-                    self.pushReady(c);
+                    self.pushReadySync(c);
                     return;
                 };
-                if (r) |_| self.pushReady(c); // pending is the normal case
+                if (r) |_| self.pushReadySync(c); // pending is the normal case
             },
 
             .net_connect => {
                 const t: *NetConnect = @fieldParentPtr("c", c);
                 self.io.vtable.connect(self.io.userdata, t.socket, t.address, &c.ov) catch |e| {
                     c.err = e;
-                    self.pushReady(c);
+                    self.pushReadySync(c);
                     return;
                 };
                 // 尚未完成是常态
@@ -288,52 +288,52 @@ pub const Loop = struct {
             .net_close => {
                 const t: *NetClose = @fieldParentPtr("c", c);
                 self.io.vtable.close(self.io.userdata, t.socket);
-                self.pushReady(c);
+                self.pushReadySync(c);
             },
 
             .file_read => {
                 const f: *root.ReadFileAsync = @fieldParentPtr("c", c);
                 const vf = self.io.vtable.readFileAsync orelse {
                     c.err = error.Unsupported;
-                    self.pushReady(c);
+                    self.pushReadySync(c);
                     return;
                 };
                 const r = vf(self.io.userdata, @ptrCast(f.path.ptr), f.offset, f.buf, &c.ov) catch |e| {
                     c.err = e;
-                    self.pushReady(c);
+                    self.pushReadySync(c);
                     return;
                 };
-                if (r) |_| self.pushReady(c);
+                if (r) |_| self.pushReadySync(c);
             },
 
             .file_write => {
                 const f: *root.WriteFileAsync = @fieldParentPtr("c", c);
                 const vf = self.io.vtable.writeFileAsync orelse {
                     c.err = error.Unsupported;
-                    self.pushReady(c);
+                    self.pushReadySync(c);
                     return;
                 };
                 const r = vf(self.io.userdata, @ptrCast(f.path.ptr), f.offset, f.bytes, &c.ov) catch |e| {
                     c.err = e;
-                    self.pushReady(c);
+                    self.pushReadySync(c);
                     return;
                 };
-                if (r) |_| self.pushReady(c);
+                if (r) |_| self.pushReadySync(c);
             },
 
             .watch_fd => {
                 const w: *root.WatchFd = @fieldParentPtr("c", c);
                 const vtable_fn = self.io.vtable.watchFd orelse {
                     c.err = error.Unsupported;
-                    self.pushReady(c);
+                    self.pushReadySync(c);
                     return;
                 };
                 const r = vtable_fn(self.io.userdata, w.fd, w.want, &c.ov) catch |e| {
                     c.err = e;
-                    self.pushReady(c);
+                    self.pushReadySync(c);
                     return;
                 };
-                if (r) |_| self.pushReady(c); // 立即就绪；否则等后端投递
+                if (r) |_| self.pushReadySync(c); // 立即就绪；否则等后端投递
             },
 
             .udp_recv, .udp_send => {
@@ -451,7 +451,6 @@ pub const Loop = struct {
         }
         return false;
     }
-    /// 停机后排空所有已登记的取消项：继续批量取完成包直到登记表为空。
     /// 停机后排空所有已登记的取消项：继续批量取完成包直到登记表为空。
     /// `Server` 的 `NetAccept` 在栈上，必须等它回收完才能让 `serve` 返回。
     ///
@@ -701,6 +700,19 @@ pub const Loop = struct {
     }
 
     fn pushReady(self: *Loop, c: *Completion) void {
+        self.ready.push(c);
+    }
+
+    /// addRaw 同步完成路径专用。
+    ///
+    /// `add` 对所有非 timer/work 操作预增 `inflight`，但 `inflight -= 1` 只发生
+    /// 在 `run` 主循环的 `completeOne` 路径（来自 `waitBatch` 的异步完成包）。
+    /// 同步完成的操作不进后端队列，永远不会出现在 `batch` 里，故必须在此补减，
+    /// 否则每次同步完成都泄漏 +1，最终堆满窗口导致循环冻结。
+    fn pushReadySync(self: *Loop, c: *Completion) void {
+        if (c.op != .timer and c.op != .work) {
+            if (self.inflight > 0) self.inflight -= 1;
+        }
         self.ready.push(c);
     }
 
