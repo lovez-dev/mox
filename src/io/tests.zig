@@ -2163,3 +2163,70 @@ test "io_uring: 一次提交超过 SQ 环容量不损坏环" {
     try std.testing.expectEqual(@as(usize, N), Ctx.ok + Ctx.bad);
     try std.testing.expectEqual(@as(usize, 0), Ctx.bad);
 }
+
+// ===== 批量提交：`add` 不得 eager flush =====
+//
+// 曾经的 bug：`getSqe` 里每个 `add` 各发一次 `io_uring_enter`。功能全对，
+// 但吞吐比 zio 低 22%（实测 25000 次往返 → 50101 次 enter，每操作 2 次）。
+// 这种退化没有任何功能测试能抓到，只能数 syscall。
+//
+// 断言形态选「只 add、不 run」：此时 enter 次数必须是 0，提交全部攒到
+// `waitBatch`。若有人把 eager flush 加回来，这里立刻等于 N。
+// 纯计数、无时序依赖，不会 flaky。
+test "io_uring 的 add 只排队不提交，enter 次数攒到 waitBatch" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (root.platform.chosen == .epoll) return error.SkipZigTest;
+
+    const uring = @import("backends/uring.zig");
+    const N = 64;
+
+    var loop = Loop.initWithAllocator(try platform.create(std.testing.allocator), std.testing.allocator);
+    defer loop.deinit();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    const listener = try platform.createTcpSocket(bind_addr);
+    defer platform.closeSocket(listener);
+    try platform.setReuseAddress(listener, true);
+    try platform.bindSocket(listener, bind_addr);
+    const bound = try platform.localAddress(listener);
+    try platform.listenSocket(listener, 16);
+
+    const Sender = struct {
+        fn run(addr: net.IpAddress) void {
+            const client = platform.createTcpSocket(addr) catch return;
+            defer platform.closeSocket(client);
+            platform.connectSocket(client, addr) catch return;
+            const start = platform.tickCount();
+            while (platform.tickCount() - start < 300) {}
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Sender.run, .{bound});
+
+    const accepted = try platform.acceptSocket(listener);
+    defer platform.closeSocket(accepted.socket);
+    try loop.associate(accepted.socket, 1);
+
+    const before = uring.enterCalls(loop.io.userdata);
+
+    // 连续排队 N 个操作，一个都不该被提交。
+    var nodes: [N]NetRecv = undefined;
+    var bufs: [N][64]u8 = undefined;
+    for (&nodes, &bufs) |*n, *b| {
+        n.* = NetRecv.init(accepted.socket, b);
+        n.c.callback = &noopCb;
+        loop.add(&n.c);
+    }
+
+    const after = uring.enterCalls(loop.io.userdata);
+    // 关键断言：add 期间一次 enter 都不该有。
+    try std.testing.expectEqual(before, after);
+
+    // 收尾：这些操作还在环里，deinit 前必须让后端清理干净。
+    for (&nodes) |*n| loop.cancel(&n.c, @ptrCast(n), noopDispose);
+    loop.drainRetired(1000);
+
+    thread.join();
+}
+
+fn noopCb(_: *Loop, _: *Completion) void {}
+fn noopDispose(_: *anyopaque) void {}

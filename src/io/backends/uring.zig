@@ -71,6 +71,10 @@ const State = struct {
     cq_mask: u32,
 
     sq_pending: u32 = 0,
+    /// 诊断计数器：`io_uring_enter` 的调用次数。批量提交是否真生效的唯一
+    /// 黑盒证据——曾经每操作一次 eager flush，把它从 50101 修到 1051。
+    /// 只做加法，不进任何热路径分支。
+    enter_calls: u64 = 0,
     ref: root.Ref = undefined,
 
     /// 把 CQ 环腾空，完成包搬进 `overflow`。
@@ -208,6 +212,7 @@ fn teardown(state: *State) void {
 fn flush(state: *State) void {
     while (state.sq_pending != 0) {
         const chunk = @min(state.sq_pending, state.sq_entries);
+        state.enter_calls += 1;
         const rc = linux.io_uring_enter(state.fd, chunk, 0, 0, null);
         const rc_s = signed(rc);
         if (rc_s <= 0) return; // 失败或无进展：留着下次再试
@@ -216,7 +221,10 @@ fn flush(state: *State) void {
 }
 
 fn getSqe(state: *State) *io_uring_sqe {
-    if (state.sq_pending != 0) flush(state);
+    // 不在这里提交：`add` 只往 SQ 环里排 SQE，真正提交交给 `waitBatch`
+    // 开头的 `flush` 一次性完成。早期版本在这里 eager flush，导致每个操作
+    // 各发一次 `io_uring_enter`——实测 25000 次往返产生 50101 次 enter，
+    // 批量提交的优势被完全抵消（比 zio 慢 22%）。
 
     var spins: usize = 0;
     while (true) {
@@ -224,7 +232,10 @@ fn getSqe(state: *State) *io_uring_sqe {
         const tail = @atomicLoad(u32, state.sq_tail, .monotonic);
         if (tail -% head < state.sq_entries) break;
 
-        // SQ 满：内核还没读走槽位。收一次 CQ 并进内核催一下。
+        // SQ 满：内核还没读走槽位。必须真的把待提交的 SQE 推下去，
+        // 否则下面的自旋永远等不到空位（`enter(0,0,GETEVENTS)` 不提交任何
+        // SQE）。先 flush 腾出槽位，顺带收一次 CQ。
+        flush(state);
         state.pumpCq();
         _ = linux.io_uring_enter(state.fd, 0, 0, linux.IORING_ENTER_GETEVENTS, null);
 
@@ -1069,6 +1080,15 @@ pub fn recvBlocking(h: Handle, buf: []u8) !usize {
 pub fn ringSizes(userdata: ?*anyopaque) [2]u32 {
     const state = stateOf(userdata);
     return .{ state.sq_entries, state.cq_entries };
+}
+
+/// 测试探针：返回累计 `io_uring_enter` 调用次数。
+///
+/// 用来证明「批量提交」真的生效。早期 `getSqe` 每次 eager flush，导致
+/// 每操作 2 次 enter（实测 25000 次往返 → 50101 次），吞吐比 zio 低 22%。
+/// 这是只能黑盒观测内部行为的正确性约束，故开只读钩子；生产代码不该调用。
+pub fn enterCalls(userdata: ?*anyopaque) u64 {
+    return stateOf(userdata).enter_calls;
 }
 
 pub fn tickCount() u64 {
