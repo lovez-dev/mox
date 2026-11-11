@@ -70,7 +70,27 @@ pub fn serveWith(config: Config, mount_hook: ?MountHook) !void {
         .max_conns = config.max_connections,
         .idle_timeout_ms = config.idle_timeout_ms,
         .backoff_ms = config.accept_backoff_ms,
+        .max_body_size = config.max_body_size,
     };
+    // 订阅停机信号（POSIX only；Windows 返回 Unsupported，comptime 跳过整段）。
+    // 信号到达时回调 `onSignal` → `loop.stop()`，`loop.run()` 返回后走优雅停机段。
+    const builtin = @import("builtin");
+    var sig_int: ?mox_io.Signal = null;
+    var sig_term: ?mox_io.Signal = null;
+    if (comptime builtin.os.tag != .windows) {
+        sig_int = mox_io.Signal.init(mox_io.Signals.INT) catch null;
+        sig_term = mox_io.Signal.init(mox_io.Signals.TERM) catch null;
+        defer if (sig_int) |*s| s.deinit();
+        defer if (sig_term) |*s| s.deinit();
+        if (sig_int) |*s| {
+            s.work.c.callback = onSignal;
+            loop.add(&s.work.c);
+        }
+        if (sig_term) |*s| {
+            s.work.c.callback = onSignal;
+            loop.add(&s.work.c);
+        }
+    }
     postAccept(&server);
     try loop.run();
 
@@ -103,6 +123,11 @@ pub fn serveWith(config: Config, mount_hook: ?MountHook) !void {
 /// 取消项 / 已交出所有权后的空操作回收。
 fn noopDispose(_: *anyopaque) void {}
 
+/// SIGINT / SIGTERM 回调：停止循环，触发优雅停机。
+fn onSignal(lp: *Loop, _: *Completion) void {
+    lp.stop();
+}
+
 // ---- server：持有监听套接字与待完成的 accept -------------------------------
 
 const Server = struct {
@@ -129,6 +154,8 @@ const Server = struct {
     idle_timeout_ms: u32 = 60_000,
     /// 优雅停机进行中：不再接受新连接。
     shutting_down: bool = false,
+    /// 请求体上限（字节）。来自 Config.max_body_size。0 = 不限。
+    max_body_size: usize = 4 * 1024 * 1024,
     /// 活跃连接的双向链表头（侵入式，`Connection.prev/next`）。
     conns: ?*Connection = null,
 
@@ -352,7 +379,8 @@ fn onRecv(loop: *Loop, c: *Completion) void {
     }
     conn.recv_len += n;
 
-    switch (http.parse(conn.recv_buf[0..conn.recv_len])) {
+    const max_body = if (conn.server) |s| s.max_body_size else 4 * 1024 * 1024;
+    switch (http.parseWithLimit(conn.recv_buf[0..conn.recv_len], max_body)) {
         .incomplete => {
             if (conn.recv_len == conn.recv_buf.len) {
                 respond(conn, .{ .status = .bad_request, .body = "request too large\n" }, false);
@@ -361,7 +389,14 @@ fn onRecv(loop: *Loop, c: *Completion) void {
             postRecv(conn);
         },
         .malformed => respond(conn, .{ .status = .bad_request, .body = "bad request\n" }, false),
-        .request => |req| handleRequest(conn, req),
+        .body_too_large => respond(conn, .{ .status = .payload_too_large, .body = "payload too large\n" }, false),
+        .request => |req| {
+            if (req.chunked) {
+                respond(conn, .{ .status = .not_implemented, .body = "chunked transfer not supported\n" }, false);
+                return;
+            }
+            handleRequest(conn, req);
+        },
     }
 }
 
@@ -372,7 +407,7 @@ fn handleRequest(conn: *Connection, req: http.Request) void {
         return;
     };
 
-    var ctx: Context = .{ .gpa = conn.alloc, .request = &req, .params = &params };
+    var ctx: Context = .{ .gpa = conn.alloc, .request = &req, .params = &params, .body = req.body };
     const response = handler(&ctx) catch {
         respond(conn, .{ .status = .internal_server_error, .body = "internal error\n" }, false);
         return;
@@ -433,6 +468,7 @@ fn onFileRead(loop: *Loop, c: *Completion) void {
         .status = conn.defer_status,
         .body = data,
         .content_type = conn.defer_ctype,
+        .headers = &.{},
     }, conn.keep_alive, wirebuf) catch {
         conn.alloc.free(wirebuf);
         conn.alloc.free(conn.file_buf);
@@ -451,6 +487,7 @@ fn respond(conn: *Connection, response: Response, keep_alive: bool) void {
         .status = response.status,
         .body = response.body,
         .content_type = response.content_type,
+        .headers = response.headers,
     }, keep_alive, &conn.send_buf) catch {
         // 序列化后的响应放不进每连接的缓冲区。
         const fallback = http.serialize(

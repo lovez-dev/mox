@@ -2,9 +2,11 @@
 //!
 //! 单独成文件是为了切断 `router`/`middleware` 对 `server` 的反向依赖：
 //! 这里只依赖 `std` 与 `http.zig`，因此任何层都能安全 import，不产生环。
-
 const std = @import("std");
 const http = @import("http.zig");
+
+/// 重导出 `http.Header`，让调用方只需 `mox.Header`，无需感知内部分层。
+pub const Header = http.Header;
 
 /// 单次请求捕获到的路径参数。值是指向
 /// 请求目标的切片，故仅在本次请求期间有效。
@@ -31,30 +33,70 @@ pub const Params = struct {
     }
 };
 
-/// 处理器的返回值。`body` 是借用的，必须存活到
-/// 响应写出完毕为止。
+/// 处理器的返回值。`body` 是借用的，必须存活到响应写出完毕为止。
 pub const Response = struct {
     status: std.http.Status = .ok,
     body: []const u8 = "",
     content_type: []const u8 = "text/plain; charset=utf-8",
+    /// 额外响应头（调用方拥有生命周期，仅在响应写出期间有效）。
+    headers: []const Header = &.{},
     /// 设置后，文件内容在 `Work` 池线程读取并作为 body 发送，
-    /// 此时忽略 `body`。路径会被复制，故该切片
-    /// 无需活过处理器调用。
+    /// 此时忽略 `body`。路径会被复制，故该切片无需活过处理器调用。
     file_path: []const u8 = "",
     /// `file_path` 由处理器堆分配时置位（由 mox 释放）。
     file_path_owned: bool = false,
+
+    /// 返回 JSON 响应：content_type 自动设为 application/json。
+    /// `json_body` 必须是已序列化的 JSON 字节切片。
+    pub fn withJson(json_body: []const u8) Response {
+        return .{
+            .body = json_body,
+            .content_type = "application/json; charset=utf-8",
+        };
+    }
+
+    /// 编译期 URL 重定向（适用于 URL 是常量的场景）。
+    /// 运行时 URL 场景：直接构造
+    ///   `var hdrs = [_]Header{.{ .name = "location", .value = url }};`
+    ///   `return .{ .status = s, .headers = &hdrs };`
+    pub fn redirect(comptime url: []const u8, status: std.http.Status) Response {
+        // 利用匿名 struct 把 headers 数组存入静态区，确保指针生命周期。
+        const S = struct {
+            const h = [_]Header{.{ .name = "location", .value = url }};
+        };
+        return .{ .status = status, .headers = &S.h };
+    }
 };
 
-/// 交给每个处理器与中间件的单次请求状态，仅在
-/// 调用期间有效——调用结束后 `request` 与 `params` 即销毁。
+/// 交给每个处理器与中间件的单次请求状态，仅在调用期间有效。
 pub const Context = struct {
     gpa: std.mem.Allocator,
     request: *const http.Request,
     /// 捕获到的路径参数，仅在本次请求期间有效。
     params: *const Params,
+    /// 已读完的请求体（空则为 ""）。指向 conn recv_buf，不额外分配。
+    body: []const u8 = "",
 
     pub fn param(self: *const Context, name: []const u8) ?[]const u8 {
         return self.params.get(name);
+    }
+
+    /// 读取 URL 查询参数（`?key=val&...`）。
+    /// 返回指向 request.target 的切片，不分配内存；值未 URL 解码。
+    pub fn query(self: *const Context, name: []const u8) ?[]const u8 {
+        const target = self.request.target;
+        const q_start = (std.mem.indexOfScalar(u8, target, '?') orelse return null) + 1;
+        var pairs = std.mem.splitScalar(u8, target[q_start..], '&');
+        while (pairs.next()) |pair| {
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+        }
+        return null;
+    }
+
+    /// 把请求体解析为 JSON 类型 `T`。调用方负责 `parsed.deinit()`。
+    pub fn json(self: *const Context, comptime T: type) !std.json.Parsed(T) {
+        return std.json.parseFromSlice(T, self.gpa, self.body, .{});
     }
 };
 
@@ -71,21 +113,95 @@ pub const Config = struct {
     address: std.Io.net.IpAddress,
     routes: []const Route,
 
-    /// 并发连接上限。达到上限后不再 `accept`，新连接在内核 listen backlog
-    /// 里排队（形成天然背压），而不是无限制地吃内存 / fd。默认 1024。
+    /// 并发连接上限。达到上限后不再 `accept`，新连接在内核 backlog 排队。
     max_connections: usize = 1024,
 
-    /// 空闲超时（毫秒）：一个已建立的连接在两次请求之间允许的最长静默时间。
-    /// 超时即关闭，防止半开连接 / 慢速攻击长期占用资源。0 表示不设超时。
-    /// 默认 60s。
+    /// 空闲超时（毫秒）：两次请求之间允许的最长静默时间。0 = 不设。
     idle_timeout_ms: u32 = 60_000,
 
-    /// `accept` 失败（典型是 EMFILE / ENFILE，fd 耗尽）后的退避毫秒数。
-    /// **不能立即重试**：失败→立即重试会在错误持续期间把 CPU 打满。
-    /// 默认 50ms。
+    /// `accept` 失败后的退避毫秒数。
     accept_backoff_ms: u32 = 50,
 
-    /// 优雅停机的总预算（毫秒）。停机时先关掉在飞连接、再等它们的完成包
-    /// 回来，超过这个时间仍未收尾就放弃等待直接返回。默认 5s。
+    /// 优雅停机总预算（毫秒）。
     shutdown_timeout_ms: u32 = 5_000,
+
+    /// 请求体上限（字节）。超出返回 413 Payload Too Large。0 = 不限。
+    max_body_size: usize = 4 * 1024 * 1024,
 };
+
+// ---- 测试 ------------------------------------------------------------------
+test "query 解析 URL 查询参数" {
+    const req: http.Request = .{
+        .method = .GET,
+        .target = "/path?name=alice&age=30",
+        .path = "/path",
+        .version = "HTTP/1.1",
+        .head = "",
+        .body = "",
+        .keep_alive = true,
+    };
+    var params: Params = .{};
+    const ctx: Context = .{
+        .gpa = std.testing.allocator,
+        .request = &req,
+        .params = &params,
+        .body = "",
+    };
+    try std.testing.expectEqualStrings("alice", ctx.query("name").?);
+    try std.testing.expectEqualStrings("30", ctx.query("age").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), ctx.query("missing"));
+    try std.testing.expectEqual(@as(?[]const u8, null), ctx.query("NAME")); // 大小写敏感，不匹配
+}
+test "query 无查询串返回 null" {
+    const req: http.Request = .{
+        .method = .GET,
+        .target = "/path",
+        .path = "/path",
+        .version = "HTTP/1.1",
+        .head = "",
+        .body = "",
+        .keep_alive = true,
+    };
+    var params: Params = .{};
+    const ctx: Context = .{
+        .gpa = std.testing.allocator,
+        .request = &req,
+        .params = &params,
+    };
+    try std.testing.expectEqual(@as(?[]const u8, null), ctx.query("key"));
+}
+test "Response.withJson 设置 application/json content_type" {
+    const r = Response.withJson("{\"ok\":true}");
+    try std.testing.expectEqualStrings("{\"ok\":true}", r.body);
+    try std.testing.expect(std.mem.startsWith(u8, r.content_type, "application/json"));
+}
+test "Response.redirect 生成 Location 头" {
+    const r = Response.redirect("/new-path", .moved_permanently);
+    try std.testing.expectEqual(std.http.Status.moved_permanently, r.status);
+    try std.testing.expectEqual(@as(usize, 1), r.headers.len);
+    try std.testing.expectEqualStrings("location", r.headers[0].name);
+    try std.testing.expectEqualStrings("/new-path", r.headers[0].value);
+}
+test "ctx.json 解析 JSON 请求体" {
+    const body = "{\"n\":42}";
+    const req: http.Request = .{
+        .method = .POST,
+        .target = "/",
+        .path = "/",
+        .version = "HTTP/1.1",
+        .head = "",
+        .body = body,
+        .keep_alive = false,
+    };
+    var params: Params = .{};
+    const ctx: Context = .{
+        .gpa = std.testing.allocator,
+        .request = &req,
+        .params = &params,
+        .body = body,
+    };
+    const T = struct { n: i64 };
+    const parsed = try ctx.json(T);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 42), parsed.value.n);
+}
