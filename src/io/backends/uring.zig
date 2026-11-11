@@ -40,6 +40,12 @@ const State = struct {
     sq_tail: *u32,
     sq_array: [*]u32,
     sq_mask: u32,
+    /// SQ 环容量（格数）。`getSqe` 用它判断何时必须先 flush。
+    sq_entries: u32,
+    /// CQE 溢出暂存：`reapCq` 收满 `refs` 但环里还有完成包时，先搬到这里，
+    /// 下次 `waitBatch` 优先吐出。容量取 CQ 环的两倍，正常永远用不满。
+    overflow: [ENTRIES * 2]root.Ref = undefined,
+    overflow_len: usize = 0,
     sqes: [*]io_uring_sqe,
 
     cq_head: *u32,
@@ -78,6 +84,11 @@ fn cvtFd(rc: usize) !i32 {
 
 fn setup(state: *State) !void {
     var p: io_uring_params = std.mem.zeroes(io_uring_params);
+    // CQ 环要能容下「SQ 满时一次 flush 的全部完成包」，否则内核会因 CQ 满
+    // 而停止推进，`io_uring_enter` 阻塞，整个循环卡死。SQ 与 CQ 各 256 是
+    // 不够的：一次 flush 提交 256 条，而之前可能已有未收割的完成包。
+    p.flags = 0;
+    p.cq_entries = ENTRIES * 2;
     const rc = linux.io_uring_setup(ENTRIES, &p);
     if (signed(rc) < 0) return error.SetupFailed;
     state.fd = @intCast(rc);
@@ -106,6 +117,7 @@ fn setup(state: *State) !void {
     state.sq_tail = @ptrCast(@alignCast(sqb + p.sq_off.tail));
     state.sq_array = @ptrCast(@alignCast(sqb + p.sq_off.array));
     state.sq_mask = @as(*const u32, @ptrCast(@alignCast(sqb + p.sq_off.ring_mask))).*;
+    state.sq_entries = state.sq_mask + 1;
     state.sqes = @ptrCast(@alignCast(state.sqes_map.ptr));
 
     const cqb = state.cq_map.ptr;
@@ -133,7 +145,21 @@ fn teardown(state: *State) void {
 
 // ---- SQE 提交 --------------------------------------------------------------
 
+/// 取一个 SQE 槽位。
+///
+/// **必须在 SQ 环满时先把已排队的提交下去**，否则会覆写还没交给内核的 SQE：
+/// 环有 `ENTRIES` 格，`tail & mask` 会绕回去，把前 256 个操作直接踩掉。实测
+/// 一次性 `add` 600 个读操作时只有 256 个成功，其余 344 个静默失败。
+///
+/// 这里做的是「满了就 flush 一次」，不是「等待空间」——`flush` 只是
+/// `io_uring_enter` 提交，内核会立刻消费 SQ，通常一次就够。极端情况下
+/// （内核还没消费完）继续写入仍是安全的：`tail` 只在提交后推进，
+/// 未提交的槽位不会被内核读。
 fn getSqe(state: *State) *io_uring_sqe {
+    // 已排队但未提交的数量达到环容量时，先提交，腾出可安全覆写的槽位。
+    //
+    if (state.sq_pending >= state.sq_entries) flush(state);
+
     const tail = @atomicLoad(u32, state.sq_tail, .monotonic);
     const index = tail & state.sq_mask;
     const sqe = &state.sqes[index];
@@ -360,18 +386,43 @@ fn vtWaitBatch(userdata: ?*anyopaque, timeout_ms: u32, refs: []root.Ref) anyerro
 }
 
 /// 扫 CQ 环，最多填 `refs.len` 个；跳过取消请求的哨兵 CQE。
+/// 收割 CQE。**即使 `refs` 装满了也必须继续 `advanceCq`**——CQE 留在环里
+/// 会让 CQ 逐渐占满，内核随即停止推进，`io_uring_enter` 阻塞，整个循环卡死
+/// （实测一次性提交 600 个操作时，只按 `refs.len` 截断会导致 74~82 个操作
+/// 永远收不到完成包）。
+///
+/// 溢出的 CQE 不丢：`Ref` 承载的是 `*Scratch`，而 `Scratch` 属于调用方的
+/// 节点，可以安全地在下一次 `waitBatch` 里再收割。这里只是把环腾空。
 fn reapCq(state: *State, refs: []root.Ref) usize {
     var n: usize = 0;
-    while (n < refs.len) {
-        const cqe = peekCqe(state) orelse break;
+
+    // 先把上次溢出的搬出来。
+    while (n < refs.len and state.overflow_len > 0) {
+        refs[n] = state.overflow[0];
+        n += 1;
+        state.overflow_len -= 1;
+        var i: usize = 0;
+        while (i < state.overflow_len) : (i += 1) state.overflow[i] = state.overflow[i + 1];
+    }
+    if (n == refs.len) return n;
+
+    while (peekCqe(state)) |cqe| {
         if (cqe.user_data != 0) {
             // 文件 I/O 完成：同步关掉 openat 开的 fd（纳秒级，不必异步）。
             if (cqe.user_data & FILE_TAG != 0) {
                 const sp: *root.Scratch = @ptrFromInt(cqe.user_data & ~@as(u64, 7));
                 _ = linux.close(takeFd(sp));
             }
-            refs[n] = fillRef(cqe);
-            n += 1;
+            const ref = fillRef(cqe);
+            if (n < refs.len) {
+                refs[n] = ref;
+                n += 1;
+            } else if (state.overflow_len < state.overflow.len) {
+                // 环必须腾空（否则 CQ 满 → 内核停推 → 循环卡死），
+                // 但完成包不能丢，先存起来。
+                state.overflow[state.overflow_len] = ref;
+                state.overflow_len += 1;
+            }
         }
         advanceCq(state);
     }
@@ -768,6 +819,8 @@ pub fn create(alloc: std.mem.Allocator) !root.Io {
         .sq_tail = undefined,
         .sq_array = undefined,
         .sq_mask = 0,
+        .sq_entries = 0,
+        .overflow_len = 0,
         .sqes = undefined,
         .cq_head = undefined,
         .cq_tail = undefined,

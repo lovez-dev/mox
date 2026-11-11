@@ -1928,3 +1928,67 @@ test "SendFile 把文件内容经 sendfile 送进 socket" {
     t.join();
     try std.testing.expectEqualStrings(payload, Reader.buf[0..Reader.n]);
 }
+
+test "io_uring: 一次提交超过 SQ 环容量不损坏环" {
+    var l = try testLoop();
+    defer l.deinit();
+    // 只在 io_uring 后端有意义（只有它把操作真正塞进 SQ 环）。
+    if (l.io.vtable.readFileAsync == null) return error.SkipZigTest;
+
+    // 建一个文件，然后一次性提交远超 ENTRIES(256) 的读操作。
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "sqfull");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var fbuf: [600]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&fbuf, "{s}/sq.txt", .{dir});
+    defer l.deleteFile(fpath);
+    try l.writeFileAll(fpath, "0123456789");
+
+    var zpath_buf: [700]u8 = undefined;
+    @memcpy(zpath_buf[0..fpath.len], fpath);
+    zpath_buf[fpath.len] = 0;
+    const zpath: [:0]const u8 = zpath_buf[0..fpath.len :0];
+
+    const Ctx = struct {
+        var ok: usize = 0;
+        var bad: usize = 0;
+        var remaining: usize = 0;
+        fn cb(lp: *Loop, c: *Completion) void {
+            if (c.err) |e| {
+                bad += 1;
+                if (bad <= 3) std.debug.print("ERR: {}\n", .{e});
+            } else ok += 1;
+            // 用饱和减法：看门狗超时与真实完成可能先后触发同一节点。
+            remaining -|= 1;
+            if (remaining == 0) lp.stop();
+        }
+    };
+
+    // 400 个 > 256(ENTRIES)，必然触发 SQ 环绕；又不会多到让 openat
+    // 本身耗时超过看门狗。
+    const N = 400;
+    var nodes: [N]root.ReadFileAsync = undefined;
+    var bufs: [N][16]u8 = undefined;
+    var wds: [N]Timer = undefined;
+    Ctx.remaining = N;
+    for (&nodes, 0..) |*f, i| {
+        f.* = root.ReadFileAsync.init(zpath, &bufs[i]);
+        f.c.callback = &Ctx.cb;
+    }
+    // **每个节点都挂看门狗**：SQ 环损坏会让操作永远收不到完成包，
+    // 没有看门狗就表现为挂死（CI 上只是超时 124），而挂死不算合格的
+    // 失败信号。挂上后超时会显式走到 `Ctx.bad`，测试明确变红。
+    for (&nodes, 0..) |*f, i| {
+        wds[i] = Timer.init(15000);
+        l.watchdog(&f.c, &wds[i], 15000);
+        l.add(&f.c);
+    }
+
+    try l.run();
+
+    std.debug.print("\nSQ 环压力: ok={d} bad={d} (N={d})\n", .{ Ctx.ok, Ctx.bad, N });
+    try std.testing.expectEqual(@as(usize, N), Ctx.ok + Ctx.bad);
+    try std.testing.expectEqual(@as(usize, 0), Ctx.bad);
+}
