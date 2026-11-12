@@ -312,10 +312,14 @@ pub const DeleteFile = @import("file.zig").DeleteFile;
 
 /// 编译期选定的本目标后端。新增后端 = 写一个导出 `create(allocator) !Io`
 /// 的文件，再在这里加一个分支。
+///
+/// kqueue 后端目前只在 Darwin 与 FreeBSD 上验证过可编译；NetBSD / OpenBSD /
+/// DragonFly 的 `Kevent.flags` 宽度与 `sendfile` 签名不同，且没有运行时验证，
+/// 所以不宣称支持——明确报错好过悄悄编译失败或给出「能跑」的假象。
 pub const platform = switch (builtin.os.tag) {
     .windows => @import("backends/windows.zig"),
     .linux => @import("backends/linux.zig"),
-    .macos, .freebsd, .netbsd, .openbsd, .dragonfly => @import("backends/kqueue.zig"),
+    .macos, .ios, .tvos, .watchos, .visionos, .freebsd => @import("backends/kqueue.zig"),
     else => @compileError("mox_io: no backend for this target yet"),
 };
 

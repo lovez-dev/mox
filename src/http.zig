@@ -155,8 +155,21 @@ fn reason(status: std.http.Status) []const u8 {
     };
 }
 
-/// 把 `resp` 序列化进 `buf`，返回写出的切片。若放不下返回 `error.NoSpaceLeft`。
-pub fn serialize(resp: Response, keep_alive: bool, buf: []u8) error{NoSpaceLeft}![]const u8 {
+/// 头名/头值里不允许出现 CR/LF：否则不可信输入（如 cookie 值、重定向 URL）
+/// 可以注入额外响应头甚至伪造第二个响应（响应拆分 / 缓存投毒）。
+fn hasCrlf(s: []const u8) bool {
+    return std.mem.indexOfScalar(u8, s, '\r') != null or
+        std.mem.indexOfScalar(u8, s, '\n') != null;
+}
+
+/// 把 `resp` 序列化进 `buf`，返回写出的切片。
+/// - `error.NoSpaceLeft`：响应放不下缓冲区。
+/// - `error.InvalidHeader`：头名或头值含 CR/LF（拒绝注入，不写出任何内容）。
+pub fn serialize(resp: Response, keep_alive: bool, buf: []u8) error{ NoSpaceLeft, InvalidHeader }![]const u8 {
+    if (hasCrlf(resp.content_type)) return error.InvalidHeader;
+    for (resp.headers) |h| {
+        if (hasCrlf(h.name) or hasCrlf(h.value)) return error.InvalidHeader;
+    }
     var pos: usize = 0;
     const prefix = std.fmt.bufPrint(buf, "HTTP/1.1 {d} {s}\r\ncontent-type: {s}\r\ncontent-length: {d}\r\nconnection: {s}\r\n", .{
         @backingInt(resp.status),
@@ -166,7 +179,7 @@ pub fn serialize(resp: Response, keep_alive: bool, buf: []u8) error{NoSpaceLeft}
         if (keep_alive) @as([]const u8, "keep-alive") else @as([]const u8, "close"),
     }) catch return error.NoSpaceLeft;
     pos += prefix.len;
-    // 写入额外响应头
+    // 写入额外响应头（已通过上面的 CRLF 校验）
     for (resp.headers) |h| {
         const hdr = std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ h.name, h.value }) catch return error.NoSpaceLeft;
         pos += hdr.len;
@@ -256,4 +269,27 @@ test "serialize writes extra response headers" {
     try std.testing.expect(std.mem.indexOf(u8, text, "x-request-id: abc\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "cache-control: no-cache\r\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, text, "\r\n\r\nok"));
+}
+
+
+// CRLF 注入回归：含 CR/LF 的头名或头值必须被拒绝，绝不能写出注入内容。
+// 这条测试的「牙」在于：临时去掉 serialize 里的校验，下面每一条都会变绿
+// 且输出里出现 X-Injected —— 即能伪造第二个响应。
+test "serialize 拒绝响应头 CRLF 注入（响应拆分防护）" {
+    var buf: [512]u8 = undefined;
+
+    const evil = "abc\r\nX-Injected: pwned\r\n\r\nHTTP/1.1 200 OK";
+    const cases = [_]Response{
+        .{ .body = "ok", .headers = &.{.{ .name = "x-user", .value = evil }} },
+        .{ .body = "ok", .headers = &.{.{ .name = "x-user\r\nX-Injected: 1", .value = "v" }} },
+        .{ .body = "ok", .headers = &.{.{ .name = "x-user", .value = "a\nb" }} },
+        .{ .body = "ok", .content_type = "text/plain\r\nX-Injected: 1" },
+    };
+    for (cases) |r| {
+        try std.testing.expectError(error.InvalidHeader, serialize(r, false, &buf));
+    }
+
+    // 正例：body 里含 CRLF 是合法的（不是头），不能被误判。
+    const ok_text = try serialize(.{ .body = "line1\r\nline2\n" }, false, &buf);
+    try std.testing.expect(std.mem.endsWith(u8, ok_text, "\r\n\r\nline1\r\nline2\n"));
 }

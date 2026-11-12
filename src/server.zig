@@ -1000,10 +1000,16 @@ fn respond(conn: *Connection, response: Response, keep_alive: bool) void {
         .body = response.body,
         .content_type = response.content_type,
         .headers = response.headers,
-    }, keep_alive, &conn.send_buf) catch {
-        // 序列化后的响应放不进每连接的缓冲区。
+    }, keep_alive, &conn.send_buf) catch |err| {
+        // NoSpaceLeft：响应放不下每连接缓冲。
+        // InvalidHeader：头名/头值含 CRLF，可能是注入尝试；绝不写出该响应，
+        // 统一回一个干净的 500（不回显攻击内容）。
+        const msg: []const u8 = switch (err) {
+            error.InvalidHeader => "invalid response header\n",
+            error.NoSpaceLeft => "response too large\n",
+        };
         const fallback = http.serialize(
-            .{ .status = .internal_server_error, .body = "response too large\n", .content_type = "text/plain" },
+            .{ .status = .internal_server_error, .body = msg, .content_type = "text/plain" },
             false,
             &conn.send_buf,
         ) catch {
@@ -2208,4 +2214,84 @@ test "每请求 arena 回收 ctx.gpa 分配，无泄漏" {
     // 驱动收尾完成包，确保连接对象与 arena 都已释放。
     loop.drainOpen(2000, @ptrCast(&srv), Server.allClosed);
     try std.testing.expectEqual(@as(usize, 0), srv.active_conns);
+}
+
+
+// 端到端响应拆分防护：handler 把含 CRLF 的不可信值放进响应头时，
+// server 必须回一个干净的 500，绝不能把注入的第二个响应/头写到线上。
+// 若 serialize 的校验被去掉，下面三条断言会全部变红（注入内容真的会发出）。
+test "CRLF 注入端到端被拒绝，不写出伪造响应" {
+    if (@import("builtin").os.tag == .windows) try mox_io.platform.startup();
+    const alloc = std.heap.page_allocator;
+
+    const S = struct {
+        var got: [1024]u8 = undefined;
+        var got_len: usize = 0;
+        var done: std.atomic.Value(bool) = .init(false);
+
+        fn handler(ctx: *Context) !Response {
+            // 模拟把用户输入直接塞进响应头
+            const hdrs = try ctx.gpa.alloc(types.Header, 1);
+            hdrs[0] = .{ .name = "x-user", .value = "a\r\nX-Injected: pwned\r\n\r\nHTTP/1.1 200 OK" };
+            return .{ .body = "ok", .headers = hdrs };
+        }
+        fn client(addr: std.Io.net.IpAddress) void {
+            const s = mox_io.platform.createTcpSocket(addr) catch return;
+            defer mox_io.platform.closeSocket(s);
+            mox_io.platform.connectSocket(s, addr) catch return;
+            const req = "GET /inject HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            _ = mox_io.platform.sendBlocking(s, req) catch return;
+            var n: usize = 0;
+            while (n < got.len) {
+                const r = mox_io.platform.recvBlocking(s, got[n..]) catch break;
+                if (r == 0) break;
+                n += r;
+            }
+            got_len = n;
+            done.store(true, .release);
+        }
+        fn tick(loop: *Loop, c: *Completion) void {
+            const t: *mox_io.Timer = @fieldParentPtr("c", c);
+            if (done.load(.acquire)) { loop.stop(); return; }
+            t.* = mox_io.Timer.init(20);
+            t.c.callback = tick;
+            loop.add(&t.c);
+        }
+    };
+
+    const l = try testListen();
+    const listener = l[0];
+    const bound = l[1];
+    defer mox_io.platform.closeSocket(listener);
+    S.done.store(false, .release);
+    S.got_len = 0;
+
+    const cli = try std.Thread.spawn(.{}, S.client, .{bound});
+    defer cli.join();
+
+    const accepted = try mox_io.platform.acceptSocket(listener);
+    defer mox_io.platform.closeSocket(accepted.socket);
+
+    var loop = try mox_io.open(alloc);
+    defer loop.deinit();
+    try loop.associate(accepted.socket, 1);
+
+    var router = try Router.init(alloc, &.{
+        .{ .method = .GET, .path = "/inject", .handler = S.handler },
+    });
+    defer router.deinit();
+
+    const conn = try alloc.create(Connection);
+    conn.* = .{ .alloc = alloc, .loop = &loop, .router = &router, .socket = accepted.socket };
+    postRecv(conn);
+
+    var hb = mox_io.Timer.init(20);
+    hb.c.callback = S.tick;
+    loop.add(&hb.c);
+    try loop.run();
+
+    const resp = S.got[0..S.got_len];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "500") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "X-Injected") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "HTTP/1.1 200 OK") == null);
 }

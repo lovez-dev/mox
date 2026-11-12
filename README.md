@@ -8,7 +8,7 @@
 - **自有 I/O 抽象**：`mox_io.Io{ userdata, vtable }`。上层只认这个接口，
   不接触任何平台类型；新增后端 = 填满一个 `VTable`。
 - **手写原生后端**：Linux `io_uring`（默认，失败自动回落 `epoll`）、
-  Linux `epoll`、BSD/Darwin `kqueue`、Windows `IOCP`。
+  Linux `epoll`、FreeBSD / Darwin `kqueue`、Windows `IOCP`。
   热路径（网络、定时器）走原生异步；文件等无可移植异步接口的操作走 `Work` 池兜底。
 - **不含 HTTPS**：TLS 由 nginx 等反向代理终止，框架只处理明文 HTTP/1.1。
 
@@ -279,6 +279,26 @@ try mox.serve(.{
     .request_timeout_ms = 10_000,        // 默认 30s
 });
 ```
+
+
+### HTTP/1.1 能力边界
+
+下面是**刻意的能力边界**，用之前请先看清楚，避免按完整 HTTP/1.1 服务器来预期：
+
+| 能力 | 现状 |
+|---|---|
+| 请求体 `Content-Length` | 支持；超出 `max_body_size` 返回 413；重复 `Content-Length` 返回 400 |
+| `Transfer-Encoding: chunked` 请求 | **不支持**，解析器识别后返回 501 |
+| HTTP pipelining | **不支持**。一次 `recv` 里带多个请求时只处理第一个，其余字节被丢弃；请逐个请求串行发送 |
+| `HEAD` | 能解析，但路由不会回退到 GET（未注册 HEAD 就是 404），且命中时响应**仍会带 body** |
+| `Expect: 100-continue` | 未实现 |
+| Range / 条件请求 | 未实现 |
+| 查询参数 | `ctx.query()` 返回原始切片，**未做 URL 解码**（`%20` 保持原样） |
+| 响应体大小 | 非文件响应受每连接 16 KB `send_buf` 限制，超出返回 500；文件响应走动态缓冲不受此限 |
+| 响应头 | 头名/头值含 CR/LF 会被 `http.serialize` 拒绝（`error.InvalidHeader` → 500），防响应拆分 |
+| HTTPS | 不内置，由 nginx 等反向代理终止 TLS |
+
+框架定位是「明文 HTTP/1.1 + 完成式 I/O」，不是全功能 HTTP 服务器。
 
 ## I/O 模型
 
@@ -587,7 +607,7 @@ loop.add(&s.work.c);
 关闭连接反复写，第二次写即死），因此设了两道防线：
 
 1. **每处发送带标志**：Linux 的 `send` SQE 与 `sendBlocking` 都带 `MSG_NOSIGNAL`；
-   BSD 没有这个标志，改为在 `createSocket` 时设 socket 级 `SO_NOSIGPIPE`，一次
+   Darwin / FreeBSD 没有这个标志，改为在 `createSocket` 时设 socket 级 `SO_NOSIGPIPE`，一次
    覆盖该 socket 的所有发送路径。
 2. **进程级兜底**：`Loop.init` 调用一次 `sigaction(SIGPIPE, SIG_IGN)`，让任何漏掉
    的写路径（标准库内部、第三方代码、写已关闭的管道）都只得到 `EPIPE` 错误。
@@ -659,8 +679,11 @@ UDP 数据报原先只能在 `Work` 池里用阻塞 `recvfrom` 实现。这个�
 | epoll | `EPOLL.IN` / `EPOLL.OUT` + 就地 `recvfrom` / `sendto` | WSL 实测通过 |
 | kqueue | `EVFILT_READ` / `EVFILT_WRITE` + 就地 `recvfrom` / `sendto` | macOS CI 实测通过 |
 
-四个后端都改走了内核异步，这个挂死在结构上被消除；四者都有运行时实测，
-其中 kqueue 的证据来自 macOS arm64 CI，BSD 目标仍只做编译校验。
+四个后端都改走了内核异步，这个挂死在结构上被消除；IOCP / epoll / kqueue
+（macOS）都有运行时实测。FreeBSD 只做交叉编译校验，**没有运行时验证**；
+NetBSD / OpenBSD / DragonFly 不提供支持（`io.zig` 会明确报
+`no backend for this target yet`），因为它们的 `Kevent.flags` 宽度与
+`sendfile` 签名不同，修到「能编译」不等于「能跑」。
 
 设计上沿用既有分层，没有侵入核心：
 
@@ -693,7 +716,7 @@ DNS 端到端实测：`example.com` 经 223.5.5.5 解析，Linux 20 ms、Windows
 `Loop.setSockOpt(socket, opt, value)` 暴露四个跨平台语义选项，后端各自映射到
 本平台的 `setsockopt`：
 
-| `SockOpt` | Linux | Windows | BSD/Darwin |
+| `SockOpt` | Linux | Windows | FreeBSD / Darwin |
 |---|---|---|---|
 | `tcp_nodelay` | `TCP_NODELAY` | `TCP_NODELAY` | `TCP_NODELAY` |
 | `keepalive_idle` | `TCP_KEEPIDLE` | `TCP_KEEPIDLE` | `TCP_KEEPIDLE` / Darwin `TCP_KEEPALIVE` |
@@ -709,7 +732,7 @@ DNS 端到端实测：`example.com` 经 223.5.5.5 解析，Linux 20 ms、Windows
 - **Winsock 的 `SO_*` / `TCP_*` 常量在 std 里没有导出**（`std.os.windows.ws2_32`
   只给了 `IPPROTO`），而且取值与 Linux 不同名同值的直觉相反。只能按 Windows
   SDK 补定义，不能借用 Linux 的编号。
-- **Darwin 的保活空闲选项叫 `TCP_KEEPALIVE`，FreeBSD/NetBSD 叫 `TCP_KEEPIDLE`**。
+- **Darwin 的保活空闲选项叫 `TCP_KEEPALIVE`，FreeBSD 叫 `TCP_KEEPIDLE`**。
   语义相同、常量名不同，按目标平台 `builtin.os.tag` 编译期分派。
 
 **半关闭**接在响应收尾路径上：决定不复用连接时，先 `shutdownSend`（`SHUT_WR` /
@@ -753,7 +776,8 @@ macOS arm64 kqueue 均在 CI 中跑全量测试。
 | Linux（io_uring + epoll） | x86_64 / arm64 | 同上；`zig build test` 同时跑 epoll 专属测试，WSL 开发机实跑 59/61（含子进程、信号与 WatchFd；uring 与 epoll 双后端各跑一遍） |
 | macOS（kqueue） | arm64 | CI 真跑全量 kqueue 运行时测试，逐条隔离 + 20 秒看门狗 |
 
-BSD 不在覆盖范围内。
+FreeBSD（x86_64 / arm64）只做交叉编译校验，没有运行时验证；NetBSD /
+OpenBSD / DragonFly 明确不支持，`io.zig` 会报 `no backend for this target yet`。
 
 CI（`.github/workflows/test.yml`）分两块：
 

@@ -8,9 +8,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# 平台覆盖：Windows / Linux 的 x86_64 与 arm64，加上 macOS。
-# 不做 BSD。运行时保证为 Windows IOCP 与 Linux io_uring；
-# macOS kqueue 运行时验证留待以后，这里只做原生构建与编译校验。
+# 平台覆盖：Windows / Linux 的 x86_64 与 arm64，加上 macOS arm64。
+# 运行时保证：Windows IOCP、Linux io_uring（含 epoll 专属测试）、
+# macOS kqueue（全量测试逐条隔离 + 看门狗）。
+# FreeBSD 仅交叉编译校验；NetBSD / OpenBSD / DragonFly 明确不支持。
 jobs:
   runtime:
     name: ${{ matrix.os }} ${{ matrix.arch }}（${{ matrix.runtime }}）
