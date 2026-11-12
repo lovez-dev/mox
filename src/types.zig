@@ -75,8 +75,8 @@ pub const Response = struct {
         return .{ .ws_handler = handler };
     }
 
-    /// 触发 SSE 流。发出 SSE 头后调用一次 handler（每次 send 的完成回调会再 pump）。
-    /// 已知缺口：只是返回 true 而没有 send 时，无定时/外部事件再次触发，见 README。
+    /// 触发 SSE 流。发出 SSE 头后开始 pump：handler 返回 true 时，
+    /// 由 send 完成回调或 `writer.setTick(ms)` 定时器驱动下一次调用。
     pub fn sse(handler: SseHandler) Response {
         return .{ .sse_handler = handler };
     }
@@ -137,6 +137,12 @@ pub const SseWriter = struct {
     pub fn send(self: SseWriter, event: []const u8, data: []const u8) void {
         self.vtable.send(self.ptr, event, data);
     }
+    /// 设置自动 pump 周期（毫秒）。handler 返回 true 且本次没有调用 send 时，
+    /// 框架按此周期重新调用 handler，用于心跳 / 轮询式推送。
+    /// 默认 1000ms；设为 0 关闭自动 tick（此时只有 send 完成回调能驱动下一次）。
+    pub fn setTick(self: SseWriter, interval_ms: u32) void {
+        self.vtable.set_tick(self.ptr, interval_ms);
+    }
     /// 关闭 SSE 流。
     pub fn close(self: SseWriter) void {
         self.vtable.close(self.ptr);
@@ -145,12 +151,14 @@ pub const SseWriter = struct {
 
 pub const SseVtable = struct {
     send: *const fn (ptr: *anyopaque, event: []const u8, data: []const u8) void,
+    set_tick: *const fn (ptr: *anyopaque, interval_ms: u32) void,
     close: *const fn (ptr: *anyopaque) void,
 };
 
-/// SSE handler 签名：返回 false 表示流结束。
-/// 当前实现仅保证首次调用；返回 true 须配合本次调用内的 `writer.send()`
-/// 才能触发下一次（见 server.zig 的 ssePump 缺口说明）。
+/// SSE handler 签名：返回 true 保持流，false 结束流。
+/// 返回 true 后，若本次调用了 `writer.send()`，发送完成回调会重新 pump；
+/// 若本次没有 send，则按 `writer.setTick(ms)` 的周期由定时器重新 pump
+/// （默认 1s，`setTick(0)` 可关闭）。
 pub const SseHandler = *const fn (writer: SseWriter) bool;
 
 /// 交给每个处理器与中间件的单次请求状态，仅在调用期间有效。

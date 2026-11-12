@@ -398,6 +398,11 @@ const Connection = struct {
     sse_handler: ?types.SseHandler = null,
     /// SSE 发送缓冲区。
     sse_send_buf: [4096]u8 = undefined,
+    /// 自动 pump 周期（毫秒）。0 = 关闭，由 handler 用 writer.setTick 调整。
+    sse_tick_ms: u32 = 1000,
+    /// 每连接独占的 tick 定时器节点（原地重新武装，不能在栈上新建）。
+    sse_tick: Timer = undefined,
+    sse_tick_armed: bool = false,
 };
 
 fn postRecv(conn: *Connection) void {
@@ -775,8 +780,11 @@ const SSE_HEADERS =
 fn sseStart(conn: *Connection, req: *const http.Request, handler: types.SseHandler) void {
     _ = req;
     conn.sse_handler = handler;
+    conn.sse_tick_ms = 1000;
+    conn.sse_tick_armed = false;
     conn.state = .sse;
     disarmIdle(conn);
+    disarmRequestTimeout(conn); // SSE 是长连接，不能被单次请求超时打断
 
     const wire = conn.alloc.dupe(u8, SSE_HEADERS) catch {
         respond(conn, .{ .status = .internal_server_error, .body = "out of memory\n" }, false);
@@ -789,47 +797,84 @@ fn sseStart(conn: *Connection, req: *const http.Request, handler: types.SseHandl
     conn.send.c.callback = sseOnHeadersSent;
     conn.loop.add(&conn.send.c);
 }
-
 fn sseOnHeadersSent(loop: *Loop, c: *Completion) void {
     _ = loop;
     const conn: *Connection = @fieldParentPtr("send", @as(*NetSend, @fieldParentPtr("c", c)));
     if (conn.send_owned) |b| { conn.alloc.free(b); conn.send_owned = null; }
     conn.send_wire = &.{};
     _ = conn.send.getResult() catch { destroyConn(conn); return; };
-    // 发完头后调用一次 SSE handler（当前实现没有定时/外部 pump 机制，
-    // 见 ssePump 下方说明：返回 true 不会自动再次调用）
+    conn.state = .sse;
     ssePump(conn);
 }
 
-/// 调用一次 sse_handler。已知能力缺口：handler 返回 true 且本次未调用
-/// writer.send() 时，没有定时器或外部事件会再次触发 pump，连接会一直挂着。
-/// 真正需要持续推送的场景应在 handler 内连续 send（链式完成回调）或
-/// 等待后续版本提供 tick 钩子。这里如实标注，避免给出虚假的"循环推送"承诺。
+/// 撤销 SSE tick 定时器。定时器还在堆里时 `Loop.cancel` 会同步摘除并回收，
+/// 不会留下指向已释放 conn 的完成包；`noopDispose` 不触碰连接对象。
+fn disarmSseTick(conn: *Connection) void {
+    if (!conn.sse_tick_armed) return;
+    conn.sse_tick_armed = false;
+    conn.loop.cancel(&conn.sse_tick.c, @ptrCast(conn), noopDispose);
+}
+
+/// 武装一次 SSE tick：原地复用每连接的 `sse_tick` 节点（栈上新建会悬空）。
+fn armSseTick(conn: *Connection) void {
+    if (conn.sse_tick_ms == 0) return;
+    disarmSseTick(conn);
+    conn.sse_tick = Timer.init(conn.sse_tick_ms);
+    conn.sse_tick.c.callback = onSseTick;
+    conn.sse_tick_armed = true;
+    conn.loop.add(&conn.sse_tick.c);
+}
+
+/// tick 到点：重新 pump 一次 handler。
+fn onSseTick(loop: *Loop, c: *Completion) void {
+    _ = loop;
+    const t: *Timer = @fieldParentPtr("c", c);
+    const conn: *Connection = @fieldParentPtr("sse_tick", t);
+    conn.sse_tick_armed = false; // 已从定时器堆弹出
+    if (conn.state != .sse or conn.sse_handler == null) {
+        destroyConn(conn);
+        return;
+    }
+    ssePump(conn);
+}
+
+/// 调用一次 sse_handler，并按结果安排下一步：
+/// - 返回 false：结束流（若 send 在飞则延迟到发送完成再关）。
+/// - 返回 true 且本次调用了 writer.send()：由 sseOnEventSent 重新 pump。
+/// - 返回 true 且本次没有 send：武装 tick 定时器，到点重新 pump。
 fn ssePump(conn: *Connection) void {
+    disarmSseTick(conn); // 每次 pump 先撤掉上一轮可能残留的 tick
     if (conn.sse_handler == null or conn.state != .sse) {
-        // handler 已清空（延迟关闭信号）或状态异常 → 关连接
         if (conn.state != .closing) destroyConn(conn);
         return;
     }
     const writer = types.SseWriter{ .ptr = conn, .vtable = &sse_vtable };
+    // 记录调用前的状态：send 会把 state 改成 .sending。
+    const state_before = conn.state;
     const keep_going = conn.sse_handler.?(writer);
     if (!keep_going) {
-        if (conn.state == .sse) {
+        if (conn.state == state_before) {
             // 没有发送在飞：立即关
             destroyConn(conn);
         } else {
-            // send 在飞（handler 已调用 writer.send()）：
-            // 清 sse_handler，sseOnEventSent 看到 null 后关闭。
+            // send 在飞：清 handler，sseOnEventSent 看到 null 后关闭。
             conn.sse_handler = null;
         }
+        return;
     }
-    // keep_going=true 且没有 send：handler 应由外部事件（定时器）触发下一次 pump。
+    if (conn.state == .sse) {
+        // handler 返回 true 但本次没有 send：靠 tick 定时器驱动下一次。
+        armSseTick(conn);
+    }
+    // 否则 send 在飞，由 sseOnEventSent 驱动下一次 pump。
 }
 
 /// SseVtable 实现：推送一个 event。
 fn sseSend(ptr: *anyopaque, event: []const u8, data: []const u8) void {
     const conn: *Connection = @ptrCast(@alignCast(ptr));
     if (conn.state != .sse) return;
+    // 本次 pump 内已有 send 提交，撤销可能存在的 tick（到点回调会重复 pump）。
+    disarmSseTick(conn);
     // 格式：event: <name>\r\ndata: <data>\r\n\r\n
     // 若 event 为空只写 data: 行
     var buf = &conn.sse_send_buf;
@@ -856,14 +901,22 @@ fn sseOnEventSent(loop: *Loop, c: *Completion) void {
     const conn: *Connection = @fieldParentPtr("send", @as(*NetSend, @fieldParentPtr("c", c)));
     if (conn.send_owned) |b| { conn.alloc.free(b); conn.send_owned = null; }
     conn.send_wire = &.{};
-    _ = conn.send.getResult() catch { destroyConn(conn); return; };
+    _ = conn.send.getResult() catch { disarmSseTick(conn); destroyConn(conn); return; };
     conn.state = .sse;
-    if (conn.sse_handler == null) { destroyConn(conn); return; }
+    if (conn.sse_handler == null) { disarmSseTick(conn); destroyConn(conn); return; }
     ssePump(conn);
+}
+
+fn sseSetTick(ptr: *anyopaque, interval_ms: u32) void {
+    const conn: *Connection = @ptrCast(@alignCast(ptr));
+    conn.sse_tick_ms = interval_ms;
+    // 若当前正挂着一个 tick，用新周期立即重挂，避免旧周期再触发一次。
+    if (conn.sse_tick_armed) armSseTick(conn);
 }
 
 fn sseClose(ptr: *anyopaque) void {
     const conn: *Connection = @ptrCast(@alignCast(ptr));
+    disarmSseTick(conn);
     if (conn.state == .sending) {
         // 发送在飞，推迟到 sseOnEventSent
         conn.sse_handler = null;
@@ -874,6 +927,7 @@ fn sseClose(ptr: *anyopaque) void {
 
 const sse_vtable = types.SseVtable{
     .send = sseSend,
+    .set_tick = sseSetTick,
     .close = sseClose,
 };
 
@@ -1035,6 +1089,8 @@ fn destroyConn(conn: *Connection) void {
     if (conn.state == .closing) return;
     conn.state = .closing;
     disarmIdle(conn);
+    disarmRequestTimeout(conn);
+    disarmSseTick(conn); // SSE tick 到点回调不能再触碰正在关闭的连接
     conn.close = NetClose.init(conn.socket);
     conn.close.c.callback = onClose;
     conn.loop.add(&conn.close.c);
@@ -1080,7 +1136,8 @@ fn abortConn(conn: *Connection) void {
             conn.loop.cancel(&conn.recv.c, @ptrCast(conn), freeConnCtx);
         },
         .sse => {
-            // SSE 状态：没有在飞 recv，直接同步关闭
+            // SSE 状态：可能挂着 tick 定时器（已由 destroyConn 撤销），
+            // 没有在飞 recv；若恰好在 send 中则交给 sending 分支处理。
             destroyConn(conn);
         },
         .closing => {},
@@ -1097,6 +1154,8 @@ fn freeConnCtx(ctx: *anyopaque) void {
 /// 释放连接：从 Server 的活跃链表摘除、归还缓冲区与对象本身、恢复 accept。
 /// 调用前必须保证该连接的 socket 已被关闭、且没有后端在飞 op 指向它。
 fn releaseConn(conn: *Connection) void {
+    // 兜底：任何绕过 destroyConn 的释放路径都不能留下在飞 tick 定时器。
+    disarmSseTick(conn);
     const server = conn.server;
     if (server) |s| unregisterConn(s, conn);
     if (conn.file_buf.len != 0) conn.alloc.free(conn.file_buf);
@@ -1713,6 +1772,293 @@ test "SSE 响应头包含 text/event-stream 且推送首条事件" {
     try std.testing.expect(std.mem.indexOf(u8, resp, "text/event-stream") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "data: hello-sse") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "event: msg") != null);
+}
+
+
+// tick 钩子回归测试：handler 每次返回 true 且**不调用 send**，仅靠
+// setTick(30) 的定时器驱动；第 3 次时发一条数据并结束。
+// 若 tick 没接线，客户端永远等不到 "tick-3"，测试会超时失败。
+test "SSE setTick 在无 send 时自动重新 pump" {
+    if (@import("builtin").os.tag == .windows) try mox_io.platform.startup();
+    const alloc = std.heap.page_allocator;
+
+    const S = struct {
+        var got: [2048]u8 = undefined;
+        var got_len: usize = 0;
+        var done: std.atomic.Value(bool) = .init(false);
+        var calls: std.atomic.Value(u32) = .init(0);
+
+        fn sseHandler(w: types.SseWriter) bool {
+            w.setTick(30);
+            const n = calls.fetchAdd(1, .monotonic) + 1;
+            if (n < 3) return true; // 关键：本次不 send，只能靠 tick 再次触发
+            w.send("done", "tick-3");
+            w.close();
+            return false;
+        }
+        fn handler(ctx: *Context) !Response {
+            _ = ctx;
+            return Response.sse(sseHandler);
+        }
+        fn client(addr: std.Io.net.IpAddress) void {
+            const s = mox_io.platform.createTcpSocket(addr) catch return;
+            defer mox_io.platform.closeSocket(s);
+            mox_io.platform.connectSocket(s, addr) catch return;
+            const req = "GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            _ = mox_io.platform.sendBlocking(s, req) catch return;
+            var n: usize = 0;
+            while (n < got.len) {
+                const r = mox_io.platform.recvBlocking(s, got[n..]) catch break;
+                if (r == 0) break;
+                n += r;
+                if (std.mem.indexOf(u8, got[0..n], "tick-3") != null) break;
+            }
+            got_len = n;
+            done.store(true, .release);
+        }
+        fn tick(loop: *Loop, c: *Completion) void {
+            const t: *mox_io.Timer = @fieldParentPtr("c", c);
+            if (done.load(.acquire)) { loop.stop(); return; }
+            t.* = mox_io.Timer.init(20);
+            t.c.callback = tick;
+            loop.add(&t.c);
+        }
+    };
+
+    const l = try testListen();
+    const listener = l[0];
+    const bound = l[1];
+    defer mox_io.platform.closeSocket(listener);
+    S.done.store(false, .release);
+    S.got_len = 0;
+    S.calls.store(0, .release);
+
+    const cli = try std.Thread.spawn(.{}, S.client, .{bound});
+    defer cli.join();
+
+    const accepted = try mox_io.platform.acceptSocket(listener);
+    defer mox_io.platform.closeSocket(accepted.socket);
+
+    var loop = try mox_io.open(alloc);
+    defer loop.deinit();
+    try loop.associate(accepted.socket, 1);
+
+    var router = try Router.init(alloc, &.{
+        .{ .method = .GET, .path = "/events", .handler = S.handler },
+    });
+    defer router.deinit();
+
+    const conn = try alloc.create(Connection);
+    conn.* = .{ .alloc = alloc, .loop = &loop, .router = &router, .socket = accepted.socket };
+    postRecv(conn);
+
+    var hb = mox_io.Timer.init(20);
+    hb.c.callback = S.tick;
+    loop.add(&hb.c);
+    try loop.run();
+
+    const resp = S.got[0..S.got_len];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "data: tick-3") != null);
+    // 确证 handler 被定时器驱动了多次，而不是一次就发出数据
+    try std.testing.expectEqual(@as(u32, 3), S.calls.load(.acquire));
+}
+
+// setTick(0) 关闭自动 pump：handler 返回 true 但不 send 时不再被调用，
+// 连接保持空闲（不崩溃、不重复 pump）。这里用 drainOpen 主动收尾验证
+// tick 定时器确实没有被武装。
+test "SSE setTick(0) 关闭自动 pump 且不泄漏定时器" {
+    if (@import("builtin").os.tag == .windows) try mox_io.platform.startup();
+    const alloc = std.testing.allocator;
+
+    const S = struct {
+        var calls: std.atomic.Value(u32) = .init(0);
+        var client_done: std.atomic.Value(bool) = .init(false);
+        var ready: std.atomic.Value(bool) = .init(false);
+
+        fn sseHandler(w: types.SseWriter) bool {
+            w.setTick(0);
+            _ = calls.fetchAdd(1, .monotonic);
+            ready.store(true, .release);
+            return true; // 不 send、不 close，故意让连接挂着
+        }
+        fn handler(ctx: *Context) !Response {
+            _ = ctx;
+            return Response.sse(sseHandler);
+        }
+        fn client(addr: std.Io.net.IpAddress) void {
+            const s = mox_io.platform.createTcpSocket(addr) catch return;
+            defer mox_io.platform.closeSocket(s);
+            mox_io.platform.connectSocket(s, addr) catch return;
+            const req = "GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            _ = mox_io.platform.sendBlocking(s, req) catch return;
+            var tmp: [256]u8 = undefined;
+            _ = mox_io.platform.recvBlocking(s, &tmp) catch {}; // 收到 SSE 头
+            // 等一小段时间，让潜在的 tick 有机会触发
+            var spins: usize = 0;
+            while (spins < 200) : (spins += 1) std.Thread.yield() catch {};
+            client_done.store(true, .release);
+        }
+        fn tick(loop: *Loop, c: *Completion) void {
+            const t: *mox_io.Timer = @fieldParentPtr("c", c);
+            if (!ready.load(.acquire)) {
+                t.* = mox_io.Timer.init(20);
+                t.c.callback = tick;
+                loop.add(&t.c);
+                return;
+            }
+            // 再给 200ms 让（若存在的）tick 触发几次
+            if (mox_io.platform.tickCount() >= deadline) { loop.stop(); return; }
+            t.* = mox_io.Timer.init(20);
+            t.c.callback = tick;
+            loop.add(&t.c);
+        }
+        var deadline: u64 = 0;
+    };
+
+    const l = try testListen();
+    const listener = l[0];
+    const bound = l[1];
+    defer mox_io.platform.closeSocket(listener);
+    S.calls.store(0, .release);
+    S.client_done.store(false, .release);
+    S.ready.store(false, .release);
+
+    const cli = try std.Thread.spawn(.{}, S.client, .{bound});
+    defer cli.join();
+
+    const accepted = try mox_io.platform.acceptSocket(listener);
+
+    var loop = try mox_io.open(alloc);
+    defer loop.deinit();
+    try loop.associate(accepted.socket, 1);
+
+    var router = try Router.init(alloc, &.{
+        .{ .method = .GET, .path = "/events", .handler = S.handler },
+    });
+    defer router.deinit();
+
+    var srv = Server{
+        .alloc = alloc,
+        .loop = &loop,
+        .router = &router,
+        .address = bound,
+        .listener = listener,
+        .idle_timeout_ms = 0,
+        .request_timeout_ms = 0,
+        .shutting_down = true,
+    };
+    const conn = try alloc.create(Connection);
+    conn.* = .{ .alloc = alloc, .loop = &loop, .router = &router, .socket = accepted.socket };
+    registerConn(&srv, conn);
+    postRecv(conn);
+
+    var hb = mox_io.Timer.init(20);
+    hb.c.callback = S.tick;
+    S.deadline = mox_io.platform.tickCount() + 300;
+    loop.add(&hb.c);
+    try loop.run();
+
+    // 只应调用一次：setTick(0) 后没有定时器重新 pump
+    try std.testing.expectEqual(@as(u32, 1), S.calls.load(.acquire));
+
+    // 主动收尾：撤销可能残留的定时器、释放连接，testing.allocator 记账无泄漏。
+    abortConn(conn);
+    loop.drainOpen(2000, @ptrCast(&srv), Server.allClosed);
+    try std.testing.expectEqual(@as(usize, 0), srv.active_conns);
+}
+
+
+// tick 定时器在飞时中止连接：验证 disarmSseTick 会同步摘除定时器，
+// 完成包不会打到已释放的 conn（UAF 回归）。用 testing.allocator 记账，
+// 若残留定时器或连接没释放都会失败。
+test "SSE tick 在飞时中止连接不 UAF、不泄漏" {
+    if (@import("builtin").os.tag == .windows) try mox_io.platform.startup();
+    const alloc = std.testing.allocator;
+
+    const S = struct {
+        var ready: std.atomic.Value(bool) = .init(false);
+        var deadline: u64 = 0;
+
+        fn sseHandler(w: types.SseWriter) bool {
+            w.setTick(5000); // 长周期，保证中止时定时器仍在堆里
+            ready.store(true, .release);
+            return true;
+        }
+        fn handler(ctx: *Context) !Response {
+            _ = ctx;
+            return Response.sse(sseHandler);
+        }
+        fn client(addr: std.Io.net.IpAddress) void {
+            const s = mox_io.platform.createTcpSocket(addr) catch return;
+            defer mox_io.platform.closeSocket(s);
+            mox_io.platform.connectSocket(s, addr) catch return;
+            const req = "GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            _ = mox_io.platform.sendBlocking(s, req) catch return;
+            var tmp: [256]u8 = undefined;
+            _ = mox_io.platform.recvBlocking(s, &tmp) catch {};
+        }
+        fn tick(loop: *Loop, c: *Completion) void {
+            const t: *mox_io.Timer = @fieldParentPtr("c", c);
+            if (!ready.load(.acquire)) {
+                t.* = mox_io.Timer.init(10);
+                t.c.callback = tick;
+                loop.add(&t.c);
+                return;
+            }
+            // handler 已运行、tick 已武装：再跑一小会儿后停机
+            if (mox_io.platform.tickCount() >= deadline) { loop.stop(); return; }
+            t.* = mox_io.Timer.init(10);
+            t.c.callback = tick;
+            loop.add(&t.c);
+        }
+    };
+
+    const l = try testListen();
+    const listener = l[0];
+    const bound = l[1];
+    defer mox_io.platform.closeSocket(listener);
+    S.ready.store(false, .release);
+
+    const cli = try std.Thread.spawn(.{}, S.client, .{bound});
+    defer cli.join();
+
+    const accepted = try mox_io.platform.acceptSocket(listener);
+
+    var loop = try mox_io.open(alloc);
+    defer loop.deinit();
+    try loop.associate(accepted.socket, 1);
+
+    var router = try Router.init(alloc, &.{
+        .{ .method = .GET, .path = "/events", .handler = S.handler },
+    });
+    defer router.deinit();
+
+    var srv = Server{
+        .alloc = alloc,
+        .loop = &loop,
+        .router = &router,
+        .address = bound,
+        .listener = listener,
+        .idle_timeout_ms = 0,
+        .request_timeout_ms = 0,
+        .shutting_down = true,
+    };
+    const conn = try alloc.create(Connection);
+    conn.* = .{ .alloc = alloc, .loop = &loop, .router = &router, .socket = accepted.socket };
+    registerConn(&srv, conn);
+    postRecv(conn);
+
+    var hb = mox_io.Timer.init(10);
+    hb.c.callback = S.tick;
+    S.deadline = mox_io.platform.tickCount() + 120;
+    loop.add(&hb.c);
+    try loop.run();
+
+    try std.testing.expect(S.ready.load(.acquire));
+    // 关键：此时 SSE tick（5s）仍在定时器堆里。中止连接必须同步摘掉它。
+    abortConn(conn);
+    loop.drainOpen(2000, @ptrCast(&srv), Server.allClosed);
+    try std.testing.expectEqual(@as(usize, 0), srv.active_conns);
 }
 
 test "metrics 计数器在每次请求后递增" {

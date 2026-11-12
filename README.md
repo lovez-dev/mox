@@ -203,22 +203,42 @@ fn handler(ctx: *mox.Context) !mox.Response {
 ### SSE（Server-Sent Events）
 
 ```zig
-fn sseHandler(w: mox.SseWriter) bool {
+// 例 1：一次性推送后关闭
+fn once(w: mox.SseWriter) bool {
     w.send("update", "data payload");
-    w.close();      // 结束流
-    return false;   // 当前实现的 pump 无定时/外部触发，返回 true 不会再次调用
+    w.close();
+    return false;
 }
+
+// 例 2：定时心跳（本次不 send，靠 tick 按周期再次调用）
+var counter: u32 = 0;
+fn heartbeat(w: mox.SseWriter) bool {
+    w.setTick(1000);            // 每 1s 自动 pump 一次（默认就是 1000ms）
+    counter += 1;
+    if (counter >= 10) { w.close(); return false; }
+    if (counter % 2 == 0) w.send("tick", "ping"); // 有 send 时本轮立即再 pump
+    return true;
+}
+
 fn handler(ctx: *mox.Context) !mox.Response {
     _ = ctx;
-    return mox.Response.sse(sseHandler);
+    return mox.Response.sse(heartbeat);
 }
 ```
 
-**已知能力缺口**：当前 SSE 只会在 HTTP 头发完后调用一次 handler。若 handler
-返回 `true` 且本次没有 `w.send()`，没有定时器或外部事件会再次触发推送，连接会
-一直挂着。需要持续推送的场景，请在一次 handler 调用内连续 `w.send()`（每次
-send 的完成回调会重新 pump），或等后续版本提供 tick 钩子。不要按"自动循环"
-来理解 `true`。
+**驱动规则**（`handler` 返回 `true` 时）：
+
+| 本次 handler 内 | 下一次 pump 由谁触发 |
+|---|---|
+| 调用了 `w.send()` | 发送完成回调（数据写完立即再调用） |
+| 没有调用 `w.send()` | `w.setTick(ms)` 定时器，到点再调用 |
+
+`w.setTick(ms)` 可在任意一次调用里改周期；`setTick(0)` 关闭自动 tick
+（此时只有 `send` 能驱动下一次，适合纯事件驱动）。**注意**：本轮调用了
+`send()` 时，发送完成回调会立即重新 pump，不等 tick；所以想严格按周期
+推送就不要在同一轮里 send 后续数据。SSE 是长连接，框架会自动撤掉 HTTP
+请求超时定时器；连接关闭时会同步撤销在飞的 tick，不会留下指向已释放连接
+的完成包。
 
 ### Multipart
 
