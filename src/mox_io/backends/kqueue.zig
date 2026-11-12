@@ -14,7 +14,7 @@
 const std = @import("std");
 const c = std.c;
 const builtin = @import("builtin");
-const root = @import("../io.zig");
+const root = @import("../mox_io.zig");
 const net = std.Io.net;
 
 const Handle = root.Handle;

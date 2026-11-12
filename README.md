@@ -37,7 +37,7 @@ curl http://127.0.0.1:18080/static/hello.txt
 | 模块 | 根文件 | 内容 |
 |---|---|---|
 | `mox` | `src/root.zig` | 路由、中间件、HTTP、服务端 |
-| `mox_io` | `src/io/io.zig` | 独立的完成式 I/O 运行时 |
+| `mox_io` | `src/mox_io/mox_io.zig` | 独立的完成式 I/O 运行时 |
 
 在你的项目里：
 
@@ -48,7 +48,7 @@ const mox = b.addModule("mox", .{
     .target = target,
 });
 const mox_io = b.addModule("mox_io", .{
-    .root_source_file = b.path("path/to/mox/src/io/io.zig"),
+    .root_source_file = b.path("path/to/mox/src/mox_io/mox_io.zig"),
     .target = target,
 });
 mox.addImport("mox_io", mox_io);
@@ -442,7 +442,7 @@ Work 唤醒、异步 connect、ONESHOT 重挂、后端选择），因此无论 C
 ## 新增一个后端
 
 写一个导出 `create(allocator) !Io` 的文件，填满 `mox_io.VTable` 的全部字段，
-再在 `src/io/io.zig` 的 `platform` 选择器里加一个分支即可。`VTable` 覆盖：
+再在 `src/mox_io/mox_io.zig` 的 `platform` 选择器里加一个分支即可。`VTable` 覆盖：
 生命周期、时钟、socket 建立/绑定/监听、文件查询与阻塞读、关联、
 收发/接受/连接及其收尾、取消、关闭、批量等待（`waitBatch`）、唤醒。
 
@@ -452,7 +452,7 @@ Work 唤醒、异步 connect、ONESHOT 重挂、后端选择），因此无论 C
 编译期算出 ID；新增能力不改变主 `VTable` 布局，也不打断 TCP / timer 热路径。
 未注册的能力返回 `null`。
 
-`src/io/udp.zig` 与 `src/io/dns.zig` 是这套机制的**两个已落地实例**，也同时
+`src/mox_io/udp.zig` 与 `src/mox_io/dns.zig` 是这套机制的**两个已落地实例**，也同时
 是扩展模板：加第三个能力只需「一个 `cap("...")` 常量 + 一张函数表 + 一个
 节点类型」，`VTable` 与 `Loop` 都不动。**注意**：进程、信号、select、group
 等都只是在设计上被这套机制覆盖；**进程（spawn / 异步等退出 / 进程组）已落地**，
@@ -471,12 +471,12 @@ Work 唤醒、异步 connect、ONESHOT 重挂、后端选择），因此无论 C
 「把任意 fd 挂进循环等可读」这个真需求，正确形状是跨后端统一的 `WatchFd`，
 已落地（见下文「任意 fd 就绪监视」）。
 
-UDP 已作为第一个能力落地（`src/io/udp.zig`）：`Udp.get(loop.io)` 取句柄，
+UDP 已作为第一个能力落地（`src/mox_io/udp.zig`）：`Udp.get(loop.io)` 取句柄，
 `Udp.Recv` / `Udp.Send` 优先走后端原生异步数据报（细节见下文「UDP 与 DNS」
 一节）；后端没有异步入口时自动回落到 `Work` 池的阻塞 `recvfrom` / `sendto`，
 两条路径对调用方同义，回调都落在循环线程。
 
-DNS 是第二个能力（`src/io/dns.zig`），**建立在 UDP 之上**：构造 A 查询报文、
+DNS 是第二个能力（`src/mox_io/dns.zig`），**建立在 UDP 之上**：构造 A 查询报文、
 经 UDP 能力收发、解析应答里的 IPv4 地址。能力表现在同时容纳两个 ID，
 未注册的 ID 返回 `null`。目前只支持单条 A 查询、无 TCP 回退、不读系统
 resolver 配置（由调用方传入 server 地址）。加第三个能力仍然只是加一行
@@ -513,7 +513,7 @@ loop.add(&req.work.c);
 
 ## 子进程
 
-`src/io/process.zig` 是**手写平台层**，不借 `std.Io`：POSIX 用 `fork` +
+`src/mox_io/process.zig` 是**手写平台层**，不借 `std.Io`：POSIX 用 `fork` +
 `execve` + `waitpid`，Windows 用 `CreateProcessW` + `WaitForSingleObject` +
 `TerminateProcess`。标准库只当 syscall / kernel32 绑定用，和 epoll / kqueue /
 IOCP 三个后端的做法一致。
@@ -587,7 +587,7 @@ loop.add(&w.c);
 
 ## 信号
 
-`src/io/signal.zig`。信号不能「异步等」，只能阻塞等，因此 `Signal` 内嵌一个
+`src/mox_io/signal.zig`。信号不能「异步等」，只能阻塞等，因此 `Signal` 内嵌一个
 `Work` 节点，由池线程阻塞在 self-pipe 读端；信号到达时处理器写入一个字节，
 读端返回，回调回到循环线程。
 
@@ -624,7 +624,7 @@ loop.add(&s.work.c);
 
 ## TTY / 终端
 
-`src/io/tty.zig`。只暴露同步接口（终端操作微秒级完成，不需要异步化）：
+`src/mox_io/tty.zig`。只暴露同步接口（终端操作微秒级完成，不需要异步化）：
 `isTty` / `getSize` / `save` / `restore` / `setMode`（`cooked` / `raw` / `cbreak`）。
 
 Zig 0.17.1 的 `std.os.windows` 只声明了 `CreateProcessW`，**没有任何 Console API**，

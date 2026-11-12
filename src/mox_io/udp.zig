@@ -10,7 +10,7 @@
 //! 主 `VTable` 与 `Loop.add` 的热路径完全不动。
 
 const std = @import("std");
-const root = @import("io.zig");
+const root = @import("mox_io.zig");
 const Loop = @import("loop.zig").Loop;
 const Work = @import("completion.zig").Work;
 

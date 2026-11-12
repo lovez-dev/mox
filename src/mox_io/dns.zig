@@ -9,7 +9,7 @@
 //! 应答里名字字段用压缩指针，这里只跳过固定 12 字节头部后逐条解析）。
 
 const std = @import("std");
-const root = @import("io.zig");
+const root = @import("mox_io.zig");
 const Loop = @import("loop.zig").Loop;
 const Completion = @import("completion.zig").Completion;
 const udp = @import("udp.zig");

@@ -31,7 +31,7 @@ pub fn build(b: *std.Build) void {
     // I/O 层是独立模块（`mox_io`），既可单独导入，
     // 也可供框架导入。
     const mox_io = b.addModule("mox_io", .{
-        .root_source_file = b.path("src/io/io.zig"),
+        .root_source_file = b.path("src/mox_io/mox_io.zig"),
         .target = target,
         .optimize = optimize,
     });

@@ -5,7 +5,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const net = std.Io.net;
-const root = @import("io.zig");
+const root = @import("mox_io.zig");
 
 const Loop = root.Loop;
 // 文件句柄层（阶段 A）

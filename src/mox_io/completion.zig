@@ -4,7 +4,7 @@
 //! 两边都只持有指针，Zig 的惰性分析下完全合法。
 
 const std = @import("std");
-const root = @import("io.zig");
+const root = @import("mox_io.zig");
 const Loop = @import("loop.zig").Loop;
 
 const Handle = root.Handle;

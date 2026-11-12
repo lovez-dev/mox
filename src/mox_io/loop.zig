@@ -4,7 +4,7 @@
 //! 分别委托给 `timer.zig` / `queue.zig` / `pool.zig`。
 const std = @import("std");
 const net = std.Io.net;
-const root = @import("io.zig");
+const root = @import("mox_io.zig");
 const completion = @import("completion.zig");
 const queue_mod = @import("queue.zig");
 const timer_mod = @import("timer.zig");

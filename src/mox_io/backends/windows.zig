@@ -716,7 +716,7 @@ pub fn updateConnectContext(s: SOCKET) void {
 //
 // 上面是裸 Win32/IOCP 接口，下面把它映射到与平台无关的 `root.Io`，
 // 使 `root.zig`（进而整个框架）永远看不到 Windows 类型。本文件即完整的 Windows 后端。
-const root = @import("../io.zig");
+const root = @import("../mox_io.zig");
 
 /// `Io.userdata` 背后的后端状态：完成端口 + 持有它的分配器。
 const State = struct {

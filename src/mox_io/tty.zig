@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const root = @import("io.zig");
+const root = @import("mox_io.zig");
 
 const is_windows = builtin.os.tag == .windows;
 const is_posix = !is_windows;

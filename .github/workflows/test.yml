@@ -111,7 +111,7 @@ jobs:
         run: zig build test --summary all
 
       - name: 单独跑 io 模块根测试
-        run: zig test src/io/io.zig
+        run: zig test src/mox_io/mox_io.zig
 
       - name: 构建示例
         run: zig build
@@ -127,7 +127,7 @@ jobs:
 
       # ARM runner 上顺带验证 x86 目标的交叉编译没被写坏。
       - name: 交叉编译校验（另一架构）
-        run: zig test src/io/io.zig -target ${{ matrix.cross }} --test-no-exec
+        run: zig test src/mox_io/mox_io.zig -target ${{ matrix.cross }} --test-no-exec
 
   macos:
     name: macOS arm64（kqueue 运行时）
@@ -175,7 +175,7 @@ jobs:
           secs() { echo "$(($(date +%s) - $1))"; }
           echo "== 编译 io 测试二进制 =="
           t0=$(date +%s)
-          zig test src/io/io.zig --test-no-exec -femit-bin=/tmp/io-test
+          zig test src/mox_io/mox_io.zig --test-no-exec -femit-bin=/tmp/io-test
           cbuild=$?
           echo "compile_rc=$cbuild compile_seconds=$(secs "$t0")"
           pass=0
@@ -184,12 +184,12 @@ jobs:
           total=0
           report=/tmp/kqueue-report.txt
           : >"$report"
-          names=$(sed -n 's/^test "\(.*\)" {$/\1/p' src/io/tests.zig)
+          names=$(sed -n 's/^test "\(.*\)" {$/\1/p' src/mox_io/tests.zig)
           while IFS= read -r name; do
             [ -z "$name" ] && continue
             total=$((total + 1))
             one=/tmp/kqueue-one.log
-            zig test src/io/io.zig --test-filter "$name" >"$one" 2>&1 &
+            zig test src/mox_io/mox_io.zig --test-filter "$name" >"$one" 2>&1 &
             runner=$!
             ( sleep 20; kill -9 "$runner" 2>/dev/null ) &
             watchdog=$!
@@ -231,7 +231,7 @@ jobs:
 
 
       - name: 单独跑 io 模块根测试
-        run: zig test src/io/io.zig
+        run: zig test src/mox_io/mox_io.zig
 
       - name: 原生构建示例（kqueue 代码路径编译）
         run: zig build
@@ -243,4 +243,4 @@ jobs:
       # （本机 kqueue 的运行时行为已由上面的全量测试覆盖，不再需要
       #   「只编译不执行」那一步。）
       - name: 交叉编译校验（x86_64 macOS）
-        run: zig test src/io/io.zig -target x86_64-macos --test-no-exec
+        run: zig test src/mox_io/mox_io.zig -target x86_64-macos --test-no-exec

@@ -11,7 +11,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const root = @import("../io.zig");
+const root = @import("../mox_io.zig");
 const uring = @import("uring.zig");
 const net = std.Io.net;
 

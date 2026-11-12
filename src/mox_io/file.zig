@@ -9,7 +9,7 @@
 //! 阻塞 I/O，回调照旧在循环线程触发，因此 `server.zig` 的静态路由形状不变。
 
 const std = @import("std");
-const root = @import("io.zig");
+const root = @import("mox_io.zig");
 
 const Io = root.Io;
 const Work = root.Work;

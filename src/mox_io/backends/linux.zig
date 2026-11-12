@@ -9,7 +9,7 @@
 //! 真正的后端差异只在 `create()` 返回的 `Io.vtable` 里。
 
 const std = @import("std");
-const root = @import("../io.zig");
+const root = @import("../mox_io.zig");
 const uring = @import("uring.zig");
 const epoll = @import("epoll.zig");
 
