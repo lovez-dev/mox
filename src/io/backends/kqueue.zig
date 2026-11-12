@@ -1281,86 +1281,52 @@ pub fn readLink(link_path: []const u8, buf: []u8) !usize {
 pub fn openDir(path: []const u8) !root.Handle {
     var zbuf: [1024]u8 = undefined;
     const z = try zpath(path, &zbuf);
-    const fd = c.open(z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, @as(c.mode_t, 0));
-    if (fd < 0) {
+    // 直接 `opendir` 并把 `DIR*` 本身当句柄：`readdir` 是逐条推进的
+    // 有状态游标，天然没有「整批前移丢条目」的问题。这比 open(2) + 手工
+    // getdirentries 解析更稳——实测 macOS 上后者用 seekoff + lseek 回退
+    // 会无限重复同一批条目（CI 抓到 expected 5, found 40）。
+    const d = c.opendir(z.ptr) orelse {
         return switch (std.posix.errno(@as(isize, -1))) {
             .NOENT => error.FileNotFound,
             .ACCES => error.AccessDenied,
             .NOTDIR => error.NotDir,
             else => error.OpenFailed,
         };
-    }
-    return @intCast(fd);
+    };
+    return @intFromPtr(d);
 }
 
 /// 从目录句柄读下一批条目。
 ///
-///
-/// 与 Linux 侧一样存在「一批被内核整体前移」的问题：`getdirentries` 一次
-/// 填一整块缓冲并把文件偏移推到块尾。缓冲装不下整批时，剩下的条目会丢。
-/// 解法同 Linux：消费完能放下的条目后，把偏移 `lseek` 回最后一个已消费
-/// 条目记录的偏移字段（Darwin 是 `seekoff`，FreeBSD 是 `off`）。
+/// 用 `readdir` 逐条推进：每次调用只消耗一条，游标状态由 `DIR*` 自己
+/// 维护在堆上，跨 `readDirHandle` 调用持续有效。因此不存在 Linux
+/// `getdents64` 那种「整批前移、缓冲装不下就丢」的问题，也不需要任何
+/// 偏移回退技巧。
 pub fn readDirHandle(dir: root.Handle, buf: []root.DirEntry) !usize {
     if (buf.len == 0) return 0;
-    const fd: c.fd_t = @intCast(dir);
+    const d: *c.DIR = @ptrFromInt(dir);
 
-    var raw: [4096]u8 = undefined;
-    var base: i64 = 0;
-    const rc = c.getdirentries(fd, &raw, raw.len, &base);
-    if (rc < 0) {
-        return switch (std.posix.errno(@as(isize, -1))) {
-            .BADF => error.InvalidHandle,
-            .NOTDIR => error.NotDir,
-            else => error.ReadDirFailed,
-        };
-    }
-    if (rc == 0) return 0; // 读完
-
-    const got: usize = @intCast(rc);
-    var off: usize = 0;
     var count: usize = 0;
-    var resume_off: ?i64 = null;
-
-    while (off < got) {
-        const ent: *align(1) const c.dirent = @ptrCast(raw[off..].ptr);
-        const rec_len: usize = ent.reclen;
-        if (rec_len == 0 or off + rec_len > got) break;
+    while (count < buf.len) {
+        const ent = c.readdir(d) orelse break; // 读完（或出错）
         // Darwin 的名字是定长数组按 NUL 截断；FreeBSD 是 [255:0]。
         const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.name)), 0);
-
-        const is_dot = std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..");
-        if (!is_dot) {
-            if (count >= buf.len) break; // 缓冲满：回退到当前条目重读
-            if (name.len <= buf[count].name.len) {
-                @memcpy(buf[count].name[0..name.len], name);
-                buf[count].len = name.len;
-                buf[count].is_dir = ent.type == c.DT.DIR;
-                count += 1;
-            }
-            resume_off = direntOffset(ent);
-        }
-        off += rec_len;
-    }
-
-    if (off < got) {
-        if (resume_off) |r| _ = c.lseek(fd, @intCast(r), c.SEEK.SET);
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        if (name.len > buf[count].name.len) continue; // 名字超长，跳过
+        @memcpy(buf[count].name[0..name.len], name);
+        buf[count].len = name.len;
+        buf[count].is_dir = ent.type == c.DT.DIR;
+        count += 1;
     }
     return count;
 }
 
-/// 取目录条目的「下一条偏移」。Darwin 用 `seekoff`，FreeBSD 用 `off`。
-/// 两者语义相同（该条目之后的位置），字段名不同。
-fn direntOffset(ent: *align(1) const c.dirent) i64 {
-    if (@hasField(c.dirent, "seekoff")) return @intCast(ent.seekoff);
-    if (@hasField(c.dirent, "off")) return @intCast(ent.off);
-    return 0;
+/// 关闭目录句柄。幂等（同一实例重复调用由节点层保证）。
+pub fn closeDir(dir: root.Handle) void {
+    const d: *c.DIR = @ptrFromInt(dir);
+    _ = c.closedir(d);
 }
 
-/// 关闭目录句柄。幂等。
-pub fn closeDir(dir: root.Handle) void {
-    const fd: c.fd_t = @intCast(dir);
-    if (fd >= 0) _ = c.close(fd);
-}
 
 test "kqueue backend type-checks end to end" {
     // 强制分析整个后端（根测试文件若无 test 块则什么也不分析）。
