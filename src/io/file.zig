@@ -603,6 +603,276 @@ pub const CloseDir = struct {
     }
 };
 
+// ---- 元数据写入、路径解析与硬链接节点（阶段 F）------------------------------
+// 与 `StatFile`/`SetFileSize`/`SyncFile` 同类：全部走 `Work` 池线程。
+
+/// 改文件权限位（句柄级）。Windows 为 `Unsupported`。
+pub const SetFilePermissions = struct {
+    work: Work,
+    io: Io,
+    file: Handle,
+    mode: u32,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, file: Handle, mode: u32) SetFilePermissions {
+        return .{ .work = Work.init(run), .io = io, .file = file, .mode = mode };
+    }
+
+    fn run(w: *Work) void {
+        const self: *SetFilePermissions = @fieldParentPtr("work", w);
+        const vt = self.io.vtable.setFilePermissions orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        vt(self.io.userdata, self.file, self.mode) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    pub fn getResult(self: *const SetFilePermissions) !void {
+        if (self.err) |e| return e;
+    }
+};
+
+/// 改文件属主（句柄级）。Windows 为 `Unsupported`。
+pub const SetFileOwner = struct {
+    work: Work,
+    io: Io,
+    file: Handle,
+    uid: u32,
+    gid: u32,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, file: Handle, uid: u32, gid: u32) SetFileOwner {
+        return .{ .work = Work.init(run), .io = io, .file = file, .uid = uid, .gid = gid };
+    }
+
+    fn run(w: *Work) void {
+        const self: *SetFileOwner = @fieldParentPtr("work", w);
+        const vt = self.io.vtable.setFileOwner orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        vt(self.io.userdata, self.file, self.uid, self.gid) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    pub fn getResult(self: *const SetFileOwner) !void {
+        if (self.err) |e| return e;
+    }
+};
+
+/// 改文件时间戳（句柄级）。时间是 Unix 纪元纳秒。
+pub const SetFileTimestamps = struct {
+    work: Work,
+    io: Io,
+    file: Handle,
+    atime_ns: i64,
+    mtime_ns: i64,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, file: Handle, atime_ns: i64, mtime_ns: i64) SetFileTimestamps {
+        return .{ .work = Work.init(run), .io = io, .file = file, .atime_ns = atime_ns, .mtime_ns = mtime_ns };
+    }
+
+    fn run(w: *Work) void {
+        const self: *SetFileTimestamps = @fieldParentPtr("work", w);
+        const vt = self.io.vtable.setFileTimestamps orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        vt(self.io.userdata, self.file, self.atime_ns, self.mtime_ns) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    pub fn getResult(self: *const SetFileTimestamps) !void {
+        if (self.err) |e| return e;
+    }
+};
+
+/// 按路径改权限位。Windows 为 `Unsupported`。
+pub const SetPermissions = struct {
+    work: Work,
+    io: Io,
+    path: []const u8,
+    mode: u32,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, path: []const u8, mode: u32) SetPermissions {
+        return .{ .work = Work.init(run), .io = io, .path = path, .mode = mode };
+    }
+
+    fn run(w: *Work) void {
+        const self: *SetPermissions = @fieldParentPtr("work", w);
+        const vt = self.io.vtable.setPermissions orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        vt(self.io.userdata, self.path, self.mode) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    pub fn getResult(self: *const SetPermissions) !void {
+        if (self.err) |e| return e;
+    }
+};
+
+/// 按路径改属主。Windows 为 `Unsupported`。
+pub const SetOwner = struct {
+    work: Work,
+    io: Io,
+    path: []const u8,
+    uid: u32,
+    gid: u32,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, path: []const u8, uid: u32, gid: u32) SetOwner {
+        return .{ .work = Work.init(run), .io = io, .path = path, .uid = uid, .gid = gid };
+    }
+
+    fn run(w: *Work) void {
+        const self: *SetOwner = @fieldParentPtr("work", w);
+        const vt = self.io.vtable.setOwner orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        vt(self.io.userdata, self.path, self.uid, self.gid) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    pub fn getResult(self: *const SetOwner) !void {
+        if (self.err) |e| return e;
+    }
+};
+
+/// 按路径改时间戳。时间是 Unix 纪元纳秒。
+pub const SetTimestamps = struct {
+    work: Work,
+    io: Io,
+    path: []const u8,
+    atime_ns: i64,
+    mtime_ns: i64,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, path: []const u8, atime_ns: i64, mtime_ns: i64) SetTimestamps {
+        return .{ .work = Work.init(run), .io = io, .path = path, .atime_ns = atime_ns, .mtime_ns = mtime_ns };
+    }
+
+    fn run(w: *Work) void {
+        const self: *SetTimestamps = @fieldParentPtr("work", w);
+        const vt = self.io.vtable.setTimestamps orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        vt(self.io.userdata, self.path, self.atime_ns, self.mtime_ns) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    pub fn getResult(self: *const SetTimestamps) !void {
+        if (self.err) |e| return e;
+    }
+};
+
+/// 检查路径可达性（`access`）。`mode`: 0=存在、4=可读、2=可写、1=可执行。
+pub const Access = struct {
+    work: Work,
+    io: Io,
+    path: []const u8,
+    mode: u32,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, path: []const u8, mode: u32) Access {
+        return .{ .work = Work.init(run), .io = io, .path = path, .mode = mode };
+    }
+
+    fn run(w: *Work) void {
+        const self: *Access = @fieldParentPtr("work", w);
+        const vt = self.io.vtable.access orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        vt(self.io.userdata, self.path, self.mode) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    pub fn getResult(self: *const Access) !void {
+        if (self.err) |e| return e;
+    }
+};
+
+/// 解析符号链接拿绝对路径（`realpath`）。结果写入 `buf`。
+pub const RealPath = struct {
+    work: Work,
+    io: Io,
+    path: []const u8,
+    buf: []u8,
+    len: usize = 0,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, path: []const u8, buf: []u8) RealPath {
+        return .{ .work = Work.init(run), .io = io, .path = path, .buf = buf };
+    }
+
+    fn run(w: *Work) void {
+        const self: *RealPath = @fieldParentPtr("work", w);
+        const vt = self.io.vtable.realPath orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        self.len = vt(self.io.userdata, self.path, self.buf) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    pub fn getResult(self: *const RealPath) !usize {
+        if (self.err) |e| return e;
+        return self.len;
+    }
+};
+
+/// 创建硬链接（`linkat`）。两个路径指向同一 inode。
+pub const HardLink = struct {
+    work: Work,
+    io: Io,
+    old_path: []const u8,
+    new_path: []const u8,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, old_path: []const u8, new_path: []const u8) HardLink {
+        return .{ .work = Work.init(run), .io = io, .old_path = old_path, .new_path = new_path };
+    }
+
+    fn run(w: *Work) void {
+        const self: *HardLink = @fieldParentPtr("work", w);
+        const vt = self.io.vtable.hardLink orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        vt(self.io.userdata, self.old_path, self.new_path) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    pub fn getResult(self: *const HardLink) !void {
+        if (self.err) |e| return e;
+    }
+};
+
 test "MemoryFs 查找与覆盖" {
     var fs = MemoryFs.init(std.testing.allocator);
     defer fs.deinit();

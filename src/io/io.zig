@@ -230,6 +230,35 @@ pub const VTable = struct {
     readDirHandle: ?*const fn (userdata: ?*anyopaque, dir: Handle, buf: []DirEntry) anyerror!usize = null,
     /// 关闭目录句柄。幂等。
     closeDir: ?*const fn (userdata: ?*anyopaque, dir: Handle) void = null,
+
+    // ---- 元数据写入、路径解析与硬链接（阶段 F）------------------------------
+    // 与上面 `statFile`/`setFileSize`/`syncFile` 同类：全部走 `Work` 池线程，
+    // 可空 = 后端可不实现（如 Windows 没有 POSIX 权限位）。
+
+    /// 改文件权限位（`fchmod` / `chmod`）。`mode` 是 POSIX 权限位（如 `0o644`）。
+    /// Windows 没有 POSIX 权限位，该槽位为 `null`。
+    setFilePermissions: ?*const fn (userdata: ?*anyopaque, file: Handle, mode: u32) anyerror!void = null,
+    /// 改文件属主（`fchown`）。`uid`/`gid` 是 POSIX 用户/组 ID。
+    /// Windows 没有 uid/gid，该槽位为 `null`。
+    setFileOwner: ?*const fn (userdata: ?*anyopaque, file: Handle, uid: u32, gid: u32) anyerror!void = null,
+    /// 改文件时间戳（`futimens` / `SetFileTime`）。时间是 Unix 纪元纳秒。
+    setFileTimestamps: ?*const fn (userdata: ?*anyopaque, file: Handle, atime_ns: i64, mtime_ns: i64) anyerror!void = null,
+    /// 按路径改权限位（`fchmodat` / `chmod`）。句柄版本更安全（无竞态），
+    /// 但调用方不一定持有句柄。
+    setPermissions: ?*const fn (userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void = null,
+    /// 按路径改属主（`fchownat` / `chown`）。Windows 为 `null`。
+    setOwner: ?*const fn (userdata: ?*anyopaque, path: []const u8, uid: u32, gid: u32) anyerror!void = null,
+    /// 按路径改时间戳（`utimensat` / `SetFileTime`）。
+    setTimestamps: ?*const fn (userdata: ?*anyopaque, path: []const u8, atime_ns: i64, mtime_ns: i64) anyerror!void = null,
+    /// 检查路径可达性（`access`）。`mode` 是 POSIX 检查位：
+    /// `0`=存在、`4`=可读、`2`=可写、`1`=可执行（可按位或）。
+    /// 不可达时报具体错误（`FileNotFound` / `AccessDenied`）。
+    access: ?*const fn (userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void = null,
+    /// 解析符号链接拿绝对路径（`realpath`）。结果写入 `buf`，返回长度。
+    /// 路径不存在时报 `FileNotFound`。
+    realPath: ?*const fn (userdata: ?*anyopaque, path: []const u8, buf: []u8) anyerror!usize = null,
+    /// 创建硬链接（`linkat`）。两个路径指向同一 inode。
+    hardLink: ?*const fn (userdata: ?*anyopaque, old_path: []const u8, new_path: []const u8) anyerror!void = null,
     /// 取路径元数据（跟随符号链接）。
     statPath: *const fn (userdata: ?*anyopaque, path: []const u8) anyerror!Stat,
     /// 列目录项。`buf` 由调用方提供，返回条目数（超出时截断）。
@@ -434,6 +463,15 @@ pub const CloseFile = @import("file.zig").CloseFile;
 pub const StatFile = @import("file.zig").StatFile;
 pub const SetFileSize = @import("file.zig").SetFileSize;
 pub const SyncFile = @import("file.zig").SyncFile;
+pub const SetFilePermissions = @import("file.zig").SetFilePermissions;
+pub const SetFileOwner = @import("file.zig").SetFileOwner;
+pub const SetFileTimestamps = @import("file.zig").SetFileTimestamps;
+pub const SetPermissions = @import("file.zig").SetPermissions;
+pub const SetOwner = @import("file.zig").SetOwner;
+pub const SetTimestamps = @import("file.zig").SetTimestamps;
+pub const Access = @import("file.zig").Access;
+pub const RealPath = @import("file.zig").RealPath;
+pub const HardLink = @import("file.zig").HardLink;
 pub const ReadLink = @import("file.zig").ReadLink;
 pub const OpenDir = @import("file.zig").OpenDir;
 pub const ReadDirHandle = @import("file.zig").ReadDirHandle;

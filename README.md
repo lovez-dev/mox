@@ -1111,6 +1111,54 @@ socket 能收了」而不是「等这个 fd 的 read 位」。
 把结果投回循环——那等于塞第二条事件循环，与「单线程事件循环 + 完成包」的
 架构冲突。零字节重叠 I/O 没有这个问题。
 
+## 元数据写入、路径解析与硬链接
+
+```zig
+// 改权限位（句柄级 / 路径级）
+var sp = mox_io.SetPermissions.init(io, "config.json", 0o644);
+var sp2 = mox_io.SetFilePermissions.init(io, handle, 0o755);
+
+// 改属主（Linux/BSD；Windows 为 Unsupported）
+var so = mox_io.SetOwner.init(io, "data.db", uid, gid);
+
+// 改时间戳（纳秒，Unix 纪元）
+var ts = mox_io.SetTimestamps.init(io, "log.txt", atime_ns, mtime_ns);
+var ts2 = mox_io.SetFileTimestamps.init(io, handle, atime_ns, mtime_ns);
+
+// 检查路径可达性（0=存在、4=可读、2=可写、1=可执行）
+var acc = mox_io.Access.init(io, "/etc/passwd", 4); // 可读？
+
+// 解析符号链接拿绝对路径
+var buf: [1024]u8 = undefined;
+var rp = mox_io.RealPath.init(io, "symlink_to_file", &buf);
+
+// 创建硬链接
+var hl = mox_io.HardLink.init(io, "original.txt", "hardlink.txt");
+```
+
+**后端支持矩阵**：
+
+| 原语 | Linux (uring/epoll) | BSD/Darwin (kqueue) | Windows (IOCP) |
+|---|---|---|---|
+| `SetFilePermissions` / `SetPermissions` | `fchmod` / `fchmodat` | `c.fchmod` / `c.fchmodat` | ❌ 无 POSIX 权限位 |
+| `SetFileOwner` / `SetOwner` | `fchown` / `fchownat` | `c.fchown` / `c.fchownat` | ❌ 无 uid/gid |
+| `SetFileTimestamps` / `SetTimestamps` | `futimens` / `utimensat` | `c.futimens` / `c.utimensat` | `SetFileTime` |
+| `Access` | `access` | `c.access` | `GetFileAttributesW`（存在性检查） |
+| `RealPath` | `open` + `readlink /proc/self/fd/N` | `c.realpath` | `CreateFileW` + `GetFinalPathNameByHandleW` |
+| `HardLink` | `linkat` | `c.linkat` | `CreateHardLinkW` |
+
+**Linux 上为什么不用 `realpath(3)`**：mox 在 Linux 不链 libc，没有 `realpath` 可用。
+替代方案是 `open(O_PATH)` 拿 fd，再 `readlinkat("/proc/self/fd/N")` 读内核记录的
+已解析路径。前提是 `/proc` 已挂载（Linux 上始终如此）。
+
+**Windows `Access` 的诚实说明**：用 `GetFileAttributesW` 做存在性检查，
+`W_OK` 用 `FILE_ATTRIBUTE_READONLY` 近似判断——**不是真正的 ACL 检查**，
+只能覆盖最常见的只读场景。`X_OK` 在 Windows 上无意义，忽略。
+
+**`SetTimestamps` 在 Windows 上为什么用 `GENERIC_WRITE` 而非 `FILE_WRITE_ATTRIBUTES`**：
+实测 `FILE_WRITE_ATTRIBUTES` 打开的句柄调 `SetFileTime` 失败（Windows 10 实测）。
+用 `GENERIC_WRITE` 稳定通过。
+
 ## 内存文件（VFS）
 
 `Loop.memory_fs` 可以挂载编译期资源或测试替身，静态文件路由会优先命中它，

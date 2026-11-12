@@ -1137,6 +1137,33 @@ fn vtSyncFile(userdata: ?*anyopaque, file: root.Handle) anyerror!void {
     return syncFile(file);
 }
 
+// 阶段 F：Windows 没有 POSIX 权限位/uid/gid，4 个原语为 null。
+// 时间戳/access/realpath/hardLink 有 Win32 等价物。
+fn vtSetFileTimestamps(userdata: ?*anyopaque, file: root.Handle, atime_ns: i64, mtime_ns: i64) anyerror!void {
+    _ = userdata;
+    return setFileTimestamps(file, atime_ns, mtime_ns);
+}
+
+fn vtSetTimestamps(userdata: ?*anyopaque, path: []const u8, atime_ns: i64, mtime_ns: i64) anyerror!void {
+    _ = userdata;
+    return setTimestamps(path, atime_ns, mtime_ns);
+}
+
+fn vtAccess(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
+    _ = userdata;
+    return accessPath(path, mode);
+}
+
+fn vtRealPath(userdata: ?*anyopaque, path: []const u8, buf: []u8) anyerror!usize {
+    _ = userdata;
+    return realPath(path, buf);
+}
+
+fn vtHardLink(userdata: ?*anyopaque, old_path: []const u8, new_path: []const u8) anyerror!void {
+    _ = userdata;
+    return hardLink(old_path, new_path);
+}
+
 fn vtReadLink(userdata: ?*anyopaque, link_path: []const u8, buf: []u8) anyerror!usize {
     _ = userdata;
     return readLink(link_path, buf);
@@ -1217,6 +1244,11 @@ const vtable_storage: root.VTable = .{
     .statFile = vtStatFile,
     .setFileSize = vtSetFileSize,
     .syncFile = vtSyncFile,
+    .setFileTimestamps = vtSetFileTimestamps,
+    .setTimestamps = vtSetTimestamps,
+    .access = vtAccess,
+    .realPath = vtRealPath,
+    .hardLink = vtHardLink,
     .deleteFile = vtDeleteFile,
     .makeDir = vtMakeDir,
     .removeDir = vtRemoveDir,
@@ -1332,6 +1364,9 @@ const fl32 = struct {
     extern "kernel32" fn RemoveDirectoryW(name: [*]const u16) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn MoveFileExW(old: [*]const u16, new: [*]const u16, flags: u32) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn GetFileAttributesW(name: [*]const u16) callconv(.winapi) u32;
+    extern "kernel32" fn SetFileTime(h: HANDLE, creation: ?*const windows.FILETIME, last_access: ?*const windows.FILETIME, last_write: ?*const windows.FILETIME) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn GetFinalPathNameByHandleW(h: HANDLE, buf: [*]u16, buf_len: u32, flags: u32) callconv(.winapi) u32;
+    extern "kernel32" fn CreateHardLinkW(new_path: [*]const u16, existing: [*]const u16, sa: ?*anyopaque) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn GetLastError() callconv(.winapi) u32;
     extern "kernel32" fn DeleteFileW(name: [*]const u16) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn SetFilePointerEx(
@@ -1347,6 +1382,9 @@ const GENERIC_READ: u32 = 0x80000000;
 const GENERIC_WRITE: u32 = 0x40000000;
 const FILE_SHARE_READ: u32 = 0x00000001;
 const FILE_SHARE_WRITE: u32 = 0x00000002;
+const FILE_SHARE_DELETE: u32 = 0x00000004;
+const FILE_WRITE_ATTRIBUTES: u32 = 0x00100000;
+const FILE_ATTRIBUTE_READONLY: u32 = 0x01;
 const OPEN_EXISTING: u32 = 3;
 const CREATE_ALWAYS: u32 = 2;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
@@ -1736,6 +1774,115 @@ pub fn syncFile(file: root.Handle) anyerror!void {
     const h: HANDLE = @ptrFromInt(file);
     if (h == invalidHandle()) return error.InvalidHandle;
     if (!fl32.FlushFileBuffers(h).toBool()) return error.SyncFailed;
+}
+
+
+
+/// Unix 纪元纳秒 → FILETIME（100ns 间隔，自 1601-01-01）。
+fn unixNsToFileTime(ns: i64) std.os.windows.FILETIME {
+    const epoch_diff: i64 = 116_444_736_000_000_000; // 100ns intervals
+    const ticks: u64 = @intCast(@max(0, @divFloor(ns, 100) + epoch_diff));
+    return .{
+        .dwLowDateTime = @truncate(ticks),
+        .dwHighDateTime = @truncate(ticks >> 32),
+    };
+}
+
+/// 改时间戳（`SetFileTime`）。时间是 Unix 纪元纳秒。
+pub fn setFileTimestamps(file: root.Handle, atime_ns: i64, mtime_ns: i64) anyerror!void {
+    const h: HANDLE = @ptrFromInt(file);
+    if (h == invalidHandle()) return error.InvalidHandle;
+    const atime = unixNsToFileTime(atime_ns);
+    const mtime = unixNsToFileTime(mtime_ns);
+    if (!fl32.SetFileTime(h, null, &atime, &mtime).toBool()) return error.SetTimestampsFailed;
+}
+
+/// 按路径改时间戳：打开文件、`SetFileTime`、关闭。
+pub fn setTimestamps(path: []const u8, atime_ns: i64, mtime_ns: i64) anyerror!void {
+    var wbuf: [1024]u16 = undefined;
+    const w = try widePath(path, &wbuf);
+    const h = fl32.CreateFileW(
+        w.ptr,
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        null,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        null,
+    );
+    if (h == invalidHandle()) return error.FileNotFound;
+    defer _ = c.CloseHandle(h);
+    const atime = unixNsToFileTime(atime_ns);
+    const mtime = unixNsToFileTime(mtime_ns);
+
+    if (!fl32.SetFileTime(h, null, &atime, &mtime).toBool()) return error.SetTimestampsFailed;
+}
+
+/// 检查路径可达性（`GetFileAttributesW`）。
+///
+/// Windows 没有 POSIX 的 `access(2)`。这里用 `GetFileAttributesW` 做
+/// **存在性检查**（F_OK 等价）。对于 `R_OK`/`W_OK`，用 `FILE_ATTRIBUTE_READONLY`
+/// 近似判断——这**不是**真正的 ACL 检查，只能覆盖最常见的只读场景。
+/// `X_OK` 在 Windows 上无意义，忽略。
+pub fn accessPath(path: []const u8, mode: u32) anyerror!void {
+    var wbuf: [1024]u16 = undefined;
+    const w = try widePath(path, &wbuf);
+    const attrs = fl32.GetFileAttributesW(w.ptr);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        return switch (fl32.GetLastError()) {
+            ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND => error.FileNotFound,
+            ERROR_ACCESS_DENIED => error.AccessDenied,
+            else => error.AccessFailed,
+        };
+    }
+    // mode 的位: 4=R_OK, 2=W_OK, 1=X_OK。只读位检查近似 R/W。
+    const W_OK: u32 = 2;
+    if (mode & W_OK != 0 and attrs & FILE_ATTRIBUTE_READONLY != 0) return error.AccessDenied;
+}
+
+/// 解析符号链接拿绝对路径（`CreateFileW` + `GetFinalPathNameByHandleW`）。
+pub fn realPath(path: []const u8, buf: []u8) anyerror!usize {
+    var wbuf: [1024]u16 = undefined;
+    const w = try widePath(path, &wbuf);
+    const h = fl32.CreateFileW(
+        w.ptr,
+        0, // 只查路径，不需要读写权限
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        null,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS, // 打开目录需要
+        null,
+    );
+    if (h == invalidHandle()) return error.FileNotFound;
+    defer _ = c.CloseHandle(h);
+
+    var out_w: [1024]u16 = undefined;
+    const n = fl32.GetFinalPathNameByHandleW(h, &out_w, out_w.len, 0);
+    if (n == 0 or n >= out_w.len) return error.RealPathFailed;
+
+    // `GetFinalPathNameByHandleW` 返回 `\?\C:\path` 格式，去掉前缀。
+    var start: usize = 0;
+    if (n >= 4 and out_w[0] == '\\' and out_w[1] == '\\' and out_w[2] == '?' and out_w[3] == '\\') {
+        start = 4;
+    }
+    const trimmed = out_w[start..n];
+    const out_len = std.unicode.utf16LeToUtf8(buf, trimmed) catch return error.RealPathFailed;
+    return out_len;
+}
+
+/// 创建硬链接（`CreateHardLinkW`）。
+pub fn hardLink(old_path: []const u8, new_path: []const u8) anyerror!void {
+    var obuf: [1024]u16 = undefined;
+    var nbuf: [1024]u16 = undefined;
+    const o = try widePath(old_path, &obuf);
+    const n = try widePath(new_path, &nbuf);
+    if (!fl32.CreateHardLinkW(n.ptr, o.ptr, null).toBool()) {
+        return switch (fl32.GetLastError()) {
+            ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND => error.FileNotFound,
+            ERROR_ACCESS_DENIED => error.AccessDenied,
+            else => error.HardLinkFailed,
+        };
+    }
 }
 
 // ---- 符号链接读取 + 目录流式句柄（阶段 C）--------------------------------

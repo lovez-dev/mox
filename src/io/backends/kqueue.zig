@@ -685,6 +685,51 @@ fn vtSyncFile(userdata: ?*anyopaque, file: root.Handle) anyerror!void {
     return syncFile(file);
 }
 
+fn vtSetFilePermissions(userdata: ?*anyopaque, file: root.Handle, mode: u32) anyerror!void {
+    _ = userdata;
+    return setFilePermissions(file, mode);
+}
+
+fn vtSetFileOwner(userdata: ?*anyopaque, file: root.Handle, uid: u32, gid: u32) anyerror!void {
+    _ = userdata;
+    return setFileOwner(file, uid, gid);
+}
+
+fn vtSetFileTimestamps(userdata: ?*anyopaque, file: root.Handle, atime_ns: i64, mtime_ns: i64) anyerror!void {
+    _ = userdata;
+    return setFileTimestamps(file, atime_ns, mtime_ns);
+}
+
+fn vtSetPermissions(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
+    _ = userdata;
+    return setPermissions(path, mode);
+}
+
+fn vtSetOwner(userdata: ?*anyopaque, path: []const u8, uid: u32, gid: u32) anyerror!void {
+    _ = userdata;
+    return setOwner(path, uid, gid);
+}
+
+fn vtSetTimestamps(userdata: ?*anyopaque, path: []const u8, atime_ns: i64, mtime_ns: i64) anyerror!void {
+    _ = userdata;
+    return setTimestamps(path, atime_ns, mtime_ns);
+}
+
+fn vtAccess(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
+    _ = userdata;
+    return access(path, mode);
+}
+
+fn vtRealPath(userdata: ?*anyopaque, path: []const u8, buf: []u8) anyerror!usize {
+    _ = userdata;
+    return realPath(path, buf);
+}
+
+fn vtHardLink(userdata: ?*anyopaque, old_path: []const u8, new_path: []const u8) anyerror!void {
+    _ = userdata;
+    return hardLink(old_path, new_path);
+}
+
 fn vtReadLink(userdata: ?*anyopaque, link_path: []const u8, buf: []u8) anyerror!usize {
     _ = userdata;
     return readLink(link_path, buf);
@@ -766,6 +811,15 @@ const vtable_storage: root.VTable = .{
     .statFile = vtStatFile,
     .setFileSize = vtSetFileSize,
     .syncFile = vtSyncFile,
+    .setFilePermissions = vtSetFilePermissions,
+    .setFileOwner = vtSetFileOwner,
+    .setFileTimestamps = vtSetFileTimestamps,
+    .setPermissions = vtSetPermissions,
+    .setOwner = vtSetOwner,
+    .setTimestamps = vtSetTimestamps,
+    .access = vtAccess,
+    .realPath = vtRealPath,
+    .hardLink = vtHardLink,
     .deleteFile = vtDeleteFile,
     .makeDir = vtMakeDir,
     .removeDir = vtRemoveDir,
@@ -1386,6 +1440,95 @@ pub fn setFileSize(file: root.Handle, size: u64) !void {
 pub fn syncFile(file: root.Handle) !void {
     const fd: c.fd_t = @intCast(file);
     if (c.fsync(fd) != 0) return error.SyncFailed;
+}
+
+// ---- 元数据写入、路径解析与硬链接（阶段 F）--------------------------------
+
+/// 改权限位（`fchmod`）。`mode` 是 POSIX 权限位。
+pub fn setFilePermissions(file: root.Handle, mode: u32) !void {
+    const fd: c.fd_t = @intCast(file);
+    if (c.fchmod(fd, @intCast(mode)) != 0) return error.SetPermissionsFailed;
+}
+
+/// 改属主（`fchown`）。
+pub fn setFileOwner(file: root.Handle, uid: u32, gid: u32) !void {
+    const fd: c.fd_t = @intCast(file);
+    if (c.fchown(fd, uid, gid) != 0) return error.SetOwnerFailed;
+}
+
+/// 改时间戳（`futimens`）。时间是 Unix 纪元纳秒。
+pub fn setFileTimestamps(file: root.Handle, atime_ns: i64, mtime_ns: i64) !void {
+    const fd: c.fd_t = @intCast(file);
+    const times = [_]c.timespec{
+        .{ .sec = @divFloor(atime_ns, 1_000_000_000), .nsec = @mod(atime_ns, 1_000_000_000) },
+        .{ .sec = @divFloor(mtime_ns, 1_000_000_000), .nsec = @mod(mtime_ns, 1_000_000_000) },
+    };
+    if (c.futimens(fd, &times) != 0) return error.SetTimestampsFailed;
+}
+
+/// 按路径改权限位（`fchmodat`）。
+pub fn setPermissions(path: []const u8, mode: u32) !void {
+    var zbuf: [1024]u8 = undefined;
+    const z = try zpath(path, &zbuf);
+    if (c.fchmodat(std.posix.AT.FDCWD, z.ptr, @intCast(mode), 0) != 0) return error.SetPermissionsFailed;
+}
+
+/// 按路径改属主（`fchownat`）。
+pub fn setOwner(path: []const u8, uid: u32, gid: u32) !void {
+    var zbuf: [1024]u8 = undefined;
+    const z = try zpath(path, &zbuf);
+    if (c.fchownat(std.posix.AT.FDCWD, z.ptr, uid, gid, 0) != 0) return error.SetOwnerFailed;
+}
+
+/// 按路径改时间戳（`utimensat`）。
+pub fn setTimestamps(path: []const u8, atime_ns: i64, mtime_ns: i64) !void {
+    var zbuf: [1024]u8 = undefined;
+    const z = try zpath(path, &zbuf);
+    const times = [_]c.timespec{
+        .{ .sec = @divFloor(atime_ns, 1_000_000_000), .nsec = @mod(atime_ns, 1_000_000_000) },
+        .{ .sec = @divFloor(mtime_ns, 1_000_000_000), .nsec = @mod(mtime_ns, 1_000_000_000) },
+    };
+    if (c.utimensat(std.posix.AT.FDCWD, z.ptr, &times, 0) != 0) return error.SetTimestampsFailed;
+}
+
+/// 检查路径可达性（`access`）。`mode`: 0=存在、4=可读、2=可写、1=可执行。
+pub fn access(path: []const u8, mode: u32) !void {
+    var zbuf: [1024]u8 = undefined;
+    const z = try zpath(path, &zbuf);
+    if (c.access(z.ptr, mode) != 0) {
+        return switch (std.posix.errno(@as(isize, -1))) {
+            .NOENT => error.FileNotFound,
+            .ACCES => error.AccessDenied,
+            else => error.AccessFailed,
+        };
+    }
+}
+
+/// 解析符号链接拿绝对路径（`realpath`）。
+/// BSD/Darwin 有 libc 的 `realpath(3)`，直接用。
+pub fn realPath(path: []const u8, buf: []u8) !usize {
+    var zbuf: [1024]u8 = undefined;
+    const z = try zpath(path, &zbuf);
+    const result = c.realpath(z.ptr, buf.ptr) orelse {
+        return switch (std.posix.errno(@as(isize, -1))) {
+            .NOENT => error.FileNotFound,
+            else => error.RealPathFailed,
+        };
+    };
+    _ = result;
+    // realpath 写入 buf，返回长度 = strlen(buf)
+    var n: usize = 0;
+    while (n < buf.len and buf[n] != 0) n += 1;
+    return n;
+}
+
+/// 创建硬链接（`linkat`）。两个路径指向同一 inode。
+pub fn hardLink(old_path: []const u8, new_path: []const u8) !void {
+    var obuf: [1024]u8 = undefined;
+    var nbuf: [1024]u8 = undefined;
+    const o = try zpath(old_path, &obuf);
+    const n = try zpath(new_path, &nbuf);
+    if (c.linkat(std.posix.AT.FDCWD, o.ptr, std.posix.AT.FDCWD, n.ptr, 0) != 0) return error.HardLinkFailed;
 }
 
 // ---- 符号链接读取 + 目录流式句柄（阶段 C）--------------------------------

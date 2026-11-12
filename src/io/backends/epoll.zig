@@ -294,6 +294,52 @@ fn vtSyncFile(userdata: ?*anyopaque, file: root.Handle) anyerror!void {
     return uring.syncFile(file);
 }
 
+// 阶段 F：与 uring 后端共用同一套实现（同属 Linux）。
+fn vtSetFilePermissions(userdata: ?*anyopaque, file: root.Handle, mode: u32) anyerror!void {
+    _ = userdata;
+    return uring.setFilePermissions(file, mode);
+}
+
+fn vtSetFileOwner(userdata: ?*anyopaque, file: root.Handle, uid: u32, gid: u32) anyerror!void {
+    _ = userdata;
+    return uring.setFileOwner(file, uid, gid);
+}
+
+fn vtSetFileTimestamps(userdata: ?*anyopaque, file: root.Handle, atime_ns: i64, mtime_ns: i64) anyerror!void {
+    _ = userdata;
+    return uring.setFileTimestamps(file, atime_ns, mtime_ns);
+}
+
+fn vtSetPermissions(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
+    _ = userdata;
+    return uring.setPermissions(path, mode);
+}
+
+fn vtSetOwner(userdata: ?*anyopaque, path: []const u8, uid: u32, gid: u32) anyerror!void {
+    _ = userdata;
+    return uring.setOwner(path, uid, gid);
+}
+
+fn vtSetTimestamps(userdata: ?*anyopaque, path: []const u8, atime_ns: i64, mtime_ns: i64) anyerror!void {
+    _ = userdata;
+    return uring.setTimestamps(path, atime_ns, mtime_ns);
+}
+
+fn vtAccess(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
+    _ = userdata;
+    return uring.access(path, mode);
+}
+
+fn vtRealPath(userdata: ?*anyopaque, path: []const u8, buf: []u8) anyerror!usize {
+    _ = userdata;
+    return uring.realPath(path, buf);
+}
+
+fn vtHardLink(userdata: ?*anyopaque, old_path: []const u8, new_path: []const u8) anyerror!void {
+    _ = userdata;
+    return uring.hardLink(old_path, new_path);
+}
+
 // 阶段 C：与 uring 后端共用同一套实现（同属 Linux）。
 fn vtReadLink(userdata: ?*anyopaque, link_path: []const u8, buf: []u8) anyerror!usize {
     _ = userdata;
@@ -690,6 +736,15 @@ const vtable_storage: root.VTable = .{
     .statFile = vtStatFile,
     .setFileSize = vtSetFileSize,
     .syncFile = vtSyncFile,
+    .setFilePermissions = vtSetFilePermissions,
+    .setFileOwner = vtSetFileOwner,
+    .setFileTimestamps = vtSetFileTimestamps,
+    .setPermissions = vtSetPermissions,
+    .setOwner = vtSetOwner,
+    .setTimestamps = vtSetTimestamps,
+    .access = vtAccess,
+    .realPath = vtRealPath,
+    .hardLink = vtHardLink,
     .deleteFile = vtDeleteFile,
     .makeDir = vtMakeDir,
     .removeDir = vtRemoveDir,

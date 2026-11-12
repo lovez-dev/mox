@@ -3410,3 +3410,230 @@ test "NetPoll 真的会等：无数据时不完成，来了数据才完成" {
     try std.testing.expect(Ctx.poll_done);
     try std.testing.expect(poll.ready().read);
 }
+
+// ---- 元数据写入、路径解析与硬链接（阶段 F）--------------------------------
+
+test "SetTimestamps：设 mtime 后 statFile 能读回来" {
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var path_buf: [512]u8 = undefined;
+    var fbuf: [512]u8 = undefined;
+    const path = try tmpDir(&path_buf, "setts");
+    const file_path = try std.fmt.bufPrint(&fbuf, "{s}/f.txt", .{path});
+    try l.makeDir(path, 0o755);
+    defer l.deleteFile(file_path);
+
+    // 创建文件
+    var content = "hello".*;
+    var wf = root.WriteFile.init(l.io, file_path, &content);
+    wf.work.c.callback = stopCb;
+    l.add(&wf.work.c);
+    try l.run();
+    _ = try wf.getResult();
+
+    // 设 mtime 为某个固定值（2020-01-01 00:00:00 UTC = 1577836800 秒）
+    const target_ns: i64 = 1_577_836_800_000_000_000;
+    var ts = root.SetTimestamps.init(l.io, file_path, target_ns, target_ns);
+    ts.work.c.callback = stopCb;
+    l.add(&ts.work.c);
+    try l.run();
+    try ts.getResult();
+
+    // statFile 读回 mtime，验证真的改了
+    var open_node = root.OpenFile.init(l.io, file_path, .read_only);
+    open_node.work.c.callback = stopCb;
+    l.add(&open_node.work.c);
+    try l.run();
+    const h = try open_node.getResult();
+    var cf_close = root.CloseFile.init(l.io, h);
+    defer cf_close.close();
+    var st = root.StatFile.init(l.io, h);
+    st.work.c.callback = stopCb;
+    l.add(&st.work.c);
+    try l.run();
+    const s = try st.getResult();
+
+    // mtime 精度：Linux/BSD 是纳秒，Windows 是 100ns；statFile 报毫秒
+    const expected_ms = target_ns / 1_000_000;
+    try std.testing.expectEqual(expected_ms, s.mtime_ms);
+}
+
+test "Access：存在的文件通过，不存在的报 FileNotFound" {
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var path_buf: [512]u8 = undefined;
+    var fbuf: [512]u8 = undefined;
+    const path = try tmpDir(&path_buf, "access");
+    const file_path = try std.fmt.bufPrint(&fbuf, "{s}/a.txt", .{path});
+    try l.makeDir(path, 0o755);
+    defer l.deleteFile(file_path);
+
+    // 创建文件
+    var content = "x".*;
+    var wf = root.WriteFile.init(l.io, file_path, &content);
+    wf.work.c.callback = stopCb;
+    l.add(&wf.work.c);
+    try l.run();
+    _ = try wf.getResult();
+
+    // 存在 → 通过
+    var acc1 = root.Access.init(l.io, file_path, 0); // F_OK
+    acc1.work.c.callback = stopCb;
+    l.add(&acc1.work.c);
+    try l.run();
+    try acc1.getResult();
+
+    // 不存在 → FileNotFound
+    const missing = try std.fmt.bufPrint(&fbuf, "{s}/nope.txt", .{path});
+    var acc2 = root.Access.init(l.io, missing, 0);
+    acc2.work.c.callback = stopCb;
+    l.add(&acc2.work.c);
+    try l.run();
+    try std.testing.expectError(error.FileNotFound, acc2.getResult());
+}
+
+test "RealPath：解析出的路径与输入一致（无符号链接时）" {
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var path_buf: [512]u8 = undefined;
+    var fbuf: [512]u8 = undefined;
+    const path = try tmpDir(&path_buf, "realpath");
+    const file_path = try std.fmt.bufPrint(&fbuf, "{s}/r.txt", .{path});
+    try l.makeDir(path, 0o755);
+    defer l.deleteFile(file_path);
+
+    var content = "y".*;
+    var wf = root.WriteFile.init(l.io, file_path, &content);
+    wf.work.c.callback = stopCb;
+    l.add(&wf.work.c);
+    try l.run();
+    _ = try wf.getResult();
+
+    var out: [1024]u8 = undefined;
+    var rp = root.RealPath.init(l.io, file_path, &out);
+    rp.work.c.callback = stopCb;
+    l.add(&rp.work.c);
+    try l.run();
+    const n = try rp.getResult();
+
+    // 解析结果应包含文件名（Windows 返回反斜杠，输入可能是正斜杠，不逐字比较）
+    const resolved = out[0..n];
+    try std.testing.expect(resolved.len > 0);
+    // 文件名 "r.txt" 应出现在解析结果中
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "r.txt") != null);
+}
+
+test "HardLink：创建链接后两个路径指向同一文件" {
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var path_buf: [512]u8 = undefined;
+    var fbuf: [512]u8 = undefined;
+    var fbuf2: [512]u8 = undefined;
+    const path = try tmpDir(&path_buf, "hardlink");
+    const orig = try std.fmt.bufPrint(&fbuf, "{s}/orig.txt", .{path});
+    const link = try std.fmt.bufPrint(&fbuf2, "{s}/link.txt", .{path});
+    try l.makeDir(path, 0o755);
+    defer l.deleteFile(orig);
+    defer l.deleteFile(link);
+
+    var content = "shared".*;
+    var wf = root.WriteFile.init(l.io, orig, &content);
+    wf.work.c.callback = stopCb;
+    l.add(&wf.work.c);
+    try l.run();
+    _ = try wf.getResult();
+
+    // 创建硬链接
+    var hl = root.HardLink.init(l.io, orig, link);
+    hl.work.c.callback = stopCb;
+    l.add(&hl.work.c);
+    try l.run();
+    try hl.getResult();
+
+    // 通过链接读，应拿到相同内容
+    var buf: [64]u8 = undefined;
+    _ = try l.io.vtable.readFileInto(l.io.userdata, link, &buf);
+    try std.testing.expectEqualStrings("shared", buf[0..6]);
+}
+
+test "SetPermissions + Access：chmod 0o000 后读被拒绝，恢复后通过" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var path_buf: [512]u8 = undefined;
+    var fbuf: [512]u8 = undefined;
+    const path = try tmpDir(&path_buf, "chmod");
+    const file_path = try std.fmt.bufPrint(&fbuf, "{s}/c.txt", .{path});
+    try l.makeDir(path, 0o755);
+    defer l.deleteFile(file_path);
+
+    var content = "secret".*;
+    var wf = root.WriteFile.init(l.io, file_path, &content);
+    wf.work.c.callback = stopCb;
+    l.add(&wf.work.c);
+    try l.run();
+    _ = try wf.getResult();
+
+    // chmod 0o000：所有人无权限
+    var sp = root.SetPermissions.init(l.io, file_path, 0o000);
+    sp.work.c.callback = stopCb;
+    l.add(&sp.work.c);
+    try l.run();
+    try sp.getResult();
+
+    // Access(R_OK=4) 应失败（root 除外，但 CI 不是 root）
+    var acc = root.Access.init(l.io, file_path, 4);
+    acc.work.c.callback = stopCb;
+    l.add(&acc.work.c);
+    try l.run();
+    try std.testing.expectError(error.AccessDenied, acc.getResult());
+
+    // 恢复 0o644
+    var sp2 = root.SetPermissions.init(l.io, file_path, 0o644);
+    sp2.work.c.callback = stopCb;
+    l.add(&sp2.work.c);
+    try l.run();
+    try sp2.getResult();
+
+    // Access(R_OK) 应通过
+    var acc2 = root.Access.init(l.io, file_path, 4);
+    acc2.work.c.callback = stopCb;
+    l.add(&acc2.work.c);
+    try l.run();
+    try acc2.getResult();
+}
