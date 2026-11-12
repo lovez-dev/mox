@@ -2881,3 +2881,273 @@ test "CloseDir 同一实例重复关闭不 panic" {
     cd.close();
     cd.close();
 }
+
+// ---- 跨线程投递 Async / 批量等待 Group（阶段 D）--------------------------
+
+test "Async：从另一个线程投递回调，在循环线程上执行" {
+    var l = try testLoop();
+    defer l.deinit();
+
+    const Ctx = struct {
+        var ran: bool = false;
+        var on_loop_thread: bool = false;
+        var loop_thread_id: std.Thread.Id = undefined;
+
+        fn cb(ctx: ?*anyopaque, a: *root.Async) void {
+            _ = ctx;
+            _ = a;
+            ran = true;
+            // 记录执行时所在线程，稍后与主线程比较。
+            on_loop_thread = std.Thread.getCurrentId() == loop_thread_id;
+        }
+
+        fn worker(loop: *Loop, node: *root.Async) void {
+            loop.postAsync(node);
+        }
+    };
+    Ctx.ran = false;
+    Ctx.loop_thread_id = std.Thread.getCurrentId();
+
+    var node = root.Async.init(&Ctx.cb, null);
+
+    // 起一个真实线程去投递：这条测试的意义就在于跨线程，同线程调用
+    // 证明不了任何事。
+    const t = try std.Thread.spawn(.{}, Ctx.worker, .{ &l, &node });
+    t.join();
+
+    // 线程已 join，投递一定发生了；现在驱动循环把回调跑掉。
+    // 用一个短定时器让 run 有机会处理完就停。
+    var stop_timer = root.Timer.init(30);
+    stop_timer.c.callback = &struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    l.add(&stop_timer.c);
+    try l.run();
+
+    try std.testing.expect(Ctx.ran);
+    // 回调必须在循环线程执行（就是本测试线程）。
+    try std.testing.expect(Ctx.on_loop_thread);
+}
+
+test "Async：投递后在回调里可以继续 add 操作" {
+    var l = try testLoop();
+    defer l.deinit();
+
+    const Ctx = struct {
+        var chained: bool = false;
+        var timer: root.Timer = undefined;
+
+        fn cb(ctx: ?*anyopaque, a: *root.Async) void {
+            _ = a;
+            const loop: *Loop = @ptrCast(@alignCast(ctx.?));
+            // 在 Async 回调里再挂一个定时器：证明 postAsync 的回调
+            // 是在正常的循环上下文里，可以继续提交操作。
+            const S = @This();
+            S.timer = root.Timer.init(5);
+            S.timer.c.callback = &onTimer;
+            loop.add(&S.timer.c);
+        }
+
+        fn onTimer(loop: *Loop, c: *Completion) void {
+            _ = c;
+            chained = true;
+            loop.stop();
+        }
+    };
+    Ctx.chained = false;
+
+    var node = root.Async.init(&Ctx.cb, &l);
+    l.postAsync(&node);
+    try l.run();
+
+    try std.testing.expect(Ctx.chained);
+}
+
+test "Async：多个线程并发投递，全部回调都执行" {
+    var l = try testLoop();
+    defer l.deinit();
+
+    const N = 8;
+    const Ctx = struct {
+        var count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+        var nodes: [N]root.Async = undefined;
+
+        fn cb(ctx: ?*anyopaque, a: *root.Async) void {
+            _ = ctx;
+            _ = a;
+            _ = count.fetchAdd(1, .monotonic);
+        }
+
+        fn worker(loop: *Loop, node: *root.Async) void {
+            loop.postAsync(node);
+        }
+    };
+    Ctx.count.store(0, .monotonic);
+    for (&Ctx.nodes) |*n| n.* = root.Async.init(&Ctx.cb, null);
+
+    var threads: [N]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, Ctx.worker, .{ &l, &Ctx.nodes[i] });
+    }
+    for (threads) |t| t.join();
+
+    // 全部投递完毕，用一个定时器给循环一个截止点。
+    var stop_timer = root.Timer.init(50);
+    stop_timer.c.callback = &struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    l.add(&stop_timer.c);
+    try l.run();
+
+    // 8 个投递全部执行（MPSC 栈不会丢项）。
+    try std.testing.expectEqual(@as(usize, N), Ctx.count.load(.monotonic));
+}
+
+test "Group：两个子操作都完成才回调一次" {
+    var l = try testLoop();
+    defer l.deinit();
+
+    const Ctx = struct {
+        var fired: usize = 0;
+        var group: root.Group = undefined;
+        var t1: root.Timer = undefined;
+        var t2: root.Timer = undefined;
+
+        fn onAll(ctx: ?*anyopaque, g: *root.Group) void {
+            _ = ctx;
+            _ = g;
+            fired += 1;
+        }
+
+        fn onStop(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    };
+    Ctx.fired = 0;
+    Ctx.group = root.Group.init(&Ctx.onAll, null, 2);
+
+    // 两个不同时长的定时器当作子操作：先完成一个不该触发 group。
+    Ctx.t1 = root.Timer.init(5);
+    Ctx.t1.c.callback = &root.Group.childCallback;
+    Ctx.t1.c.group_ctx = &Ctx.group;
+
+    Ctx.t2 = root.Timer.init(15);
+    Ctx.t2.c.callback = &root.Group.childCallback;
+    Ctx.t2.c.group_ctx = &Ctx.group;
+
+    l.add(&Ctx.t1.c);
+    l.add(&Ctx.t2.c);
+
+    var stop_timer = root.Timer.init(60);
+    stop_timer.c.callback = &Ctx.onStop;
+    l.add(&stop_timer.c);
+    try l.run();
+
+    // 两个子操作都完成，group 只回调一次（不是两次）。
+    try std.testing.expectEqual(@as(usize, 1), Ctx.fired);
+    try std.testing.expect(Ctx.group.done());
+}
+
+test "Group：子操作失败也不提前结束，等其他子操作都完成" {
+    var l = try testLoop();
+    defer l.deinit();
+
+    const Ctx = struct {
+        var fired: usize = 0;
+        var group: root.Group = undefined;
+        var t1: root.Timer = undefined;
+        var t2: root.Timer = undefined;
+
+        fn onAll(ctx: ?*anyopaque, g: *root.Group) void {
+            _ = ctx;
+            _ = g;
+            fired += 1;
+        }
+
+        fn onStop(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    };
+    Ctx.fired = 0;
+    Ctx.group = root.Group.init(&Ctx.onAll, null, 2);
+
+    // 第一个子操作人为标成失败。group 的语义是「等其他都结束」，
+    // 而不是「一有错就短路」——所以 fired 仍应为 1。
+    Ctx.t1 = root.Timer.init(5);
+    Ctx.t1.c.callback = &root.Group.childCallback;
+    Ctx.t1.c.group_ctx = &Ctx.group;
+    Ctx.t1.c.err = error.IoFailed;
+
+    Ctx.t2 = root.Timer.init(10);
+    Ctx.t2.c.callback = &root.Group.childCallback;
+    Ctx.t2.c.group_ctx = &Ctx.group;
+
+    l.add(&Ctx.t1.c);
+    l.add(&Ctx.t2.c);
+
+    var stop_timer = root.Timer.init(60);
+    stop_timer.c.callback = &Ctx.onStop;
+    l.add(&stop_timer.c);
+    try l.run();
+
+    try std.testing.expectEqual(@as(usize, 1), Ctx.fired);
+}
+
+test "Async：循环已阻塞在 waitBatch 时，notify 立刻唤醒（不等 200ms）" {
+    var l = try testLoop();
+    defer l.deinit();
+
+    // 关键点：投递必须发生在循环**已经阻塞在 waitBatch 里**的时刻，
+    // 而且不能借助任何别的唤醒源（Work 池完成、定时器都会顺带 notify，
+    // 那样就分不清是谁叫醒的）。
+    //
+    // 做法：起一个裸线程，先睡 40ms（确保循环进了 waitBatch），
+    // 再 postAsync。循环唯一可能的唤醒源就是这个 notify。
+    const Ctx = struct {
+        var fired_at_ms: u64 = 0;
+        var post_at_ms: u64 = 0;
+        var node: root.Async = undefined;
+        var loop_ref: ?*Loop = null;
+
+        fn cb(ctx: ?*anyopaque, a: *root.Async) void {
+            _ = a;
+            const loop: *Loop = @ptrCast(@alignCast(ctx.?));
+            @This().fired_at_ms = loop.io.vtable.now(loop.io.userdata);
+            loop.stop();
+        }
+
+        fn worker(loop: *Loop) void {
+            if (builtin.os.tag == .windows) {
+                const k32 = struct {
+                    extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
+                };
+                k32.Sleep(40);
+            } else {
+                var fds: [0]std.posix.pollfd = .{};
+                _ = std.posix.poll(&fds, 40) catch {};
+            }
+            @This().post_at_ms = loop.io.vtable.now(loop.io.userdata);
+            loop.postAsync(&@This().node);
+        }
+    };
+    Ctx.node = root.Async.init(&Ctx.cb, &l);
+    Ctx.loop_ref = &l;
+
+    const t = try std.Thread.spawn(.{}, Ctx.worker, .{&l});
+    defer t.join();
+
+    try l.run();
+
+    const elapsed = Ctx.fired_at_ms - Ctx.post_at_ms;
+    // 没有 notify 时，投递只能等 waitBatch 的 200ms 超时到点才被处理。
+    // 有 notify 时应该在个位数毫秒内被叫醒。
+    try std.testing.expect(elapsed < 60);
+}

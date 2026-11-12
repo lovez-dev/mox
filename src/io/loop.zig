@@ -65,6 +65,7 @@ const NetClose = completion.NetClose;
 const NetAccept = completion.NetAccept;
 const NetConnect = completion.NetConnect;
 const Work = completion.Work;
+const Async = completion.Async;
 
 /// 一次 `waitBatch` 最多收割的完成包数。
 pub const batch_size = 256;
@@ -170,6 +171,17 @@ pub const Loop = struct {
         self.io.vtable.notify(self.io.userdata);
     }
 
+    /// 从**任意线程**把一个回调投递到循环线程执行。
+    ///
+    /// 内部就是 `submit` + `notify`：压进 MPSC 栈，然后唤醒可能正在
+    /// `waitBatch` 里阻塞的循环。`node` 必须在回调触发前一直有效
+    /// （通常是调用方的成员变量；栈上的临时值只在其作用域内有效）。
+    ///
+    /// 回调里拿到的是 `Loop` 与 `*Async` 本身，可以继续 `add` 别的操作。
+    pub fn postAsync(self: *Loop, node: *Async) void {
+        self.submit(&node.c);
+    }
+
     /// 循环线程取走跨线程提交项，按入队顺序逐个 `add`。
     /// 把一个操作压进跨线程待提交栈（`add` 超窗口时用）。
     fn enqueueSubmitted(self: *Loop, c: *Completion) void {
@@ -220,7 +232,7 @@ pub const Loop = struct {
     pub fn add(self: *Loop, c: *Completion) void {
         // 在飞窗口满了：压进待提交栈，由 `run` 下一轮再处理。
         // 计时器与 work 不占窗口（它们不进后端环）。
-        if (c.op != .timer and c.op != .work) {
+        if (c.op != .timer and c.op != .work and c.op != .async) {
             if (self.inflight >= self.inflight_max) {
                 self.enqueueSubmitted(c);
                 return;
@@ -346,6 +358,13 @@ pub const Loop = struct {
             .work => {
                 const w: *Work = @fieldParentPtr("c", c);
                 self.submitWork(w);
+            },
+
+            .async => {
+                // 跨线程投递：已经在循环线程上了（走到 addRaw 说明是循环
+                // 线程自己 add，或 drainSubmitted 搬进来的），直接排进就绪
+                // 队列，下一轮 drainReady 执行回调。
+                self.pushReadySync(c);
             },
         }
     }
@@ -681,6 +700,13 @@ pub const Loop = struct {
         // 操作正常完成：先撤销它的截止时间定时器，再回调。
         // 「先撤销」保证回调里可安全释放对象（watchdog 不会再碰到它）。
         self.unwatchdog(c);
+        // `.async` 走自己的函数指针（签名不同：不带 Loop 参数，
+        // 而是 user ctx）。其余操作走统一的 `callback`。
+        if (c.op == .async) {
+            const a: *Async = @fieldParentPtr("c", c);
+            a.func(a.ctx, a);
+            return;
+        }
         if (c.callback) |cb| cb(self, c);
     }
 
@@ -725,7 +751,7 @@ pub const Loop = struct {
     /// 同步完成的操作不进后端队列，永远不会出现在 `batch` 里，故必须在此补减，
     /// 否则每次同步完成都泄漏 +1，最终堆满窗口导致循环冻结。
     fn pushReadySync(self: *Loop, c: *Completion) void {
-        if (c.op != .timer and c.op != .work) {
+        if (c.op != .timer and c.op != .work and c.op != .async) {
             if (self.inflight > 0) self.inflight -= 1;
         }
         self.ready.push(c);

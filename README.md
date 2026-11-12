@@ -960,6 +960,55 @@ const target = try rl.getResult();
 Windows 侧读链接走 `FSCTL_GET_REPARSE_POINT`，同时支持
 `IO_REPARSE_TAG_SYMLINK`（符号链接）与 `IO_REPARSE_TAG_MOUNT_POINT`（junction）。
 
+## 跨线程投递与批量等待
+
+### `Async`：从任意线程把回调送回循环线程
+
+```zig
+var node = mox_io.Async.init(&onWorkDone, my_ctx);
+
+// 在别的线程里：
+loop.postAsync(&node);          // 线程安全，内部压栈 + 唤醒循环
+```
+
+回调在**循环线程**上执行，因此可以放心 `loop.add(...)` 继续提交操作，
+不需要任何额外同步。
+
+与 `Work` 的分工：
+
+| | 在哪个线程跑 | 用途 |
+|---|---|---|
+| `Work.func` | 池线程 | 阻塞 I/O（文件、DNS 等） |
+| `Async.func` | 循环线程 | 「必须串行在循环线程上」的动作 |
+
+没有 `Async` 时，别的线程想让循环做点事只能绕 `Work` 池——多一次线程切换，
+而且语义上是「去池里干活」而不是「回循环线程」。
+
+**`notify` 的真实作用**：`run` 里 `waitBatch` 的超时被钳在 200ms（这是 HTTP
+高并发不断崖的关键），所以即使完全不唤醒，循环也会在 200ms 内自己醒来处理
+投递项。`notify` 的价值是把延迟从「最多 200ms」压到接近 0，不是正确性必需。
+测试里专门有一条要求「循环已阻塞在 waitBatch 时，投递在 60ms 内生效」——
+删掉 `notify` 这条就红。
+
+### `Group`：并发发起、只被通知一次
+
+```zig
+var group = mox_io.Group.init(&onAllDone, ctx, 2);
+
+recv1.c.callback = &mox_io.Group.childCallback;
+recv1.c.group_ctx = &group;
+recv2.c.callback = &mox_io.Group.childCallback;
+recv2.c.group_ctx = &group;
+
+loop.add(&recv1.c);
+loop.add(&recv2.c);
+// 两个都完成后 onAllDone 被调用一次
+```
+
+**语义**：子操作出错**不会**让 group 提前结束——即使某个失败，也等其余都
+结束才回调。调用方在回调里自己检查各子操作的结果。这是刻意的：批量场景下
+「一个失败就放弃」通常不是想要的，而且提前回调会让调用方读到还没填好的结果。
+
 ## 内存文件（VFS）
 
 `Loop.memory_fs` 可以挂载编译期资源或测试替身，静态文件路由会优先命中它，

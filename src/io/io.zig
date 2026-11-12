@@ -358,6 +358,8 @@ pub const NetClose = completion_mod.NetClose;
 pub const NetAccept = completion_mod.NetAccept;
 pub const NetConnect = completion_mod.NetConnect;
 pub const Work = completion_mod.Work;
+pub const Async = completion_mod.Async;
+pub const Group = completion_mod.Group;
 pub const Loop = loop_mod.Loop;
 
 pub const ReadFile = @import("file.zig").ReadFile;

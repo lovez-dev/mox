@@ -27,6 +27,8 @@ pub const Op = enum {
     file_read,
     file_write,
     work,
+    /// 跨线程投递：别的线程把回调塞进循环，循环线程上执行。
+    async,
 };
 
 /// 所有操作的基类。具体完成体把它作为第一个字段 `c` 内嵌，
@@ -66,6 +68,10 @@ pub const Completion = struct {
     /// 降为 O(log n)。不在堆中时值为 `std.math.maxInt(usize)`，避免
     /// 误用；同步完成 / 就绪队列路径不触碰它。
     heap_index: usize = std.math.maxInt(usize),
+
+    /// 所属 `Group`（批量等待）。非空时 `Group.childCallback` 会在本操作
+    /// 完成时递减计数。不影响操作本身的语义，纯粹是回调路由信息。
+    group_ctx: ?*anyopaque = null,
 };
 
 /// 就绪方向。`watchFd` 用它在回调里告诉调用方「哪个方向就绪了」。
@@ -266,5 +272,76 @@ pub const Work = struct {
 
     pub fn init(func: *const fn (*Work) void) Work {
         return .{ .func = func };
+    }
+};
+
+/// 跨线程投递一个回调到循环线程执行。
+///
+/// 用途：任意线程（工作线程、信号处理旁路、别的服务线程）想把「某件事
+/// 该在循环线程做了」告诉循环。没有它就只能靠 `Work` 池绕一圈——那要多
+/// 一次线程切换，而且语义上是「去池里干活」而不是「回循环线程」。
+///
+/// 与 `Work` 的区别：`Work.func` 在**池线程**跑；`Async.func` 在**循环
+/// 线程**跑。前者用于阻塞 I/O，后者用于「必须串行在循环线程上」的动作。
+///
+/// 线程安全：`Loop.postAsync` 可从任意线程调用；节点必须在回调触发前
+/// 一直有效（通常是调用方的栈变量或成员）。
+pub const Async = struct {
+    c: Completion = .{ .op = .async },
+    /// 在循环线程执行。参数是 `Loop` 与自身完成体。
+    func: *const fn (?*anyopaque, *Async) void,
+    /// 传给 `func` 的用户上下文。
+    ctx: ?*anyopaque = null,
+    /// 侵入式链接，串起跨线程投递栈。
+    next: ?*Async = null,
+
+    pub fn init(func: *const fn (?*anyopaque, *Async) void, ctx: ?*anyopaque) Async {
+        return .{ .func = func, .ctx = ctx };
+    }
+};
+
+/// 批量等待：把 N 个操作当成一个整体，全部完成时触发一次回调。
+///
+/// 用途：并发发起多个 I/O 后只想被通知一次（「全部好了告诉我」），而不是
+/// 自己维护计数器、自己判断最后一个是谁。
+///
+/// 用法：
+/// ```zig
+/// var group = mox_io.Group.init(&onAllDone, ctx, 2);
+/// recv1.c.callback = &Group.childCallback; recv1.c.group_ctx = &group;
+/// recv2.c.callback = &Group.childCallback; recv2.c.group_ctx = &group;
+/// loop.add(&recv1.c);
+/// loop.add(&recv2.c);
+/// ```
+///
+/// **语义要点**：
+/// - 每个子操作完成时计数器递减；减到 0 时调用 `func`。
+/// - 子操作的错误**不会**让 group 提前结束——即使某个子操作失败，也等其他
+///   子操作都结束才回调。调用方要在回调里自己检查各子操作的结果。
+/// - `pending` 只由循环线程访问（子操作回调都在循环线程），所以不需要原子。
+pub const Group = struct {
+    /// 还剩几个子操作未完成。
+    pending: usize,
+    /// 全部完成时调用。`ctx` 是构造时传进来的用户上下文。
+    func: *const fn (?*anyopaque, *Group) void,
+    ctx: ?*anyopaque = null,
+
+    pub fn init(func: *const fn (?*anyopaque, *Group) void, ctx: ?*anyopaque, count: usize) Group {
+        return .{ .pending = count, .func = func, .ctx = ctx };
+    }
+
+    /// 子操作的完成回调：递减计数，减到 0 时触发 group 回调。
+    ///
+    /// 直接把它赋给每个子操作的 `c.callback`，并设置 `c.group_ctx`。
+    pub fn childCallback(loop: *@import("loop.zig").Loop, c: *Completion) void {
+        _ = loop;
+        const g: *Group = @ptrCast(@alignCast(c.group_ctx orelse return));
+        if (g.pending > 0) g.pending -= 1;
+        if (g.pending == 0) g.func(g.ctx, g);
+    }
+
+    /// 是否全部完成。
+    pub fn done(self: *const Group) bool {
+        return self.pending == 0;
     }
 };
