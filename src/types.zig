@@ -8,6 +8,64 @@ const http = @import("http.zig");
 /// 重导出 `http.Header`，让调用方只需 `mox.Header`，无需感知内部分层。
 pub const Header = http.Header;
 
+/// 对 URL 编码的切片做解码，结果由 `gpa` 分配（通常传 `ctx.gpa`，即每请求
+/// arena，无需调用方释放）。
+///
+/// - `%XX` 解成对应字节，十六进制大小写均可。
+/// - `+` 解成空格（application/x-www-form-urlencoded 约定）。
+/// - 非法序列（`%` 后不足两位、或非十六进制）返回 `error.InvalidEncoding`，
+///   不静默丢弃——静默会把畸形输入变成另一种合法输入，比报错更危险。
+///
+/// 返回的切片长度精确等于解码结果（不是输入长度），调用方可以安全 free。
+pub fn urlDecode(gpa: std.mem.Allocator, s: []const u8) ![]const u8 {
+    // 没有 `%` 和 `+` 时原样返回，避免无谓分配。
+    if (std.mem.indexOfScalar(u8, s, '%') == null and std.mem.indexOfScalar(u8, s, '+') == null) {
+        return s;
+    }
+    // 第一遍：只校验并算出精确长度。先算长度再分配，避免「按输入长度分配、
+    // 返回缩短切片」——那种切片的 len 与底层分配对不上，调用方 free 会 panic。
+    var out_len: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '+') {
+            out_len += 1;
+            i += 1;
+        } else if (s[i] == '%') {
+            if (i + 2 >= s.len) return error.InvalidEncoding;
+            _ = std.fmt.charToDigit(s[i + 1], 16) catch return error.InvalidEncoding;
+            _ = std.fmt.charToDigit(s[i + 2], 16) catch return error.InvalidEncoding;
+            out_len += 1;
+            i += 3;
+        } else {
+            out_len += 1;
+            i += 1;
+        }
+    }
+    // 第二遍：按精确长度分配并解码。
+    const out = try gpa.alloc(u8, out_len);
+    errdefer gpa.free(out);
+    var w: usize = 0;
+    i = 0;
+    while (i < s.len) {
+        if (s[i] == '+') {
+            out[w] = ' ';
+            w += 1;
+            i += 1;
+        } else if (s[i] == '%') {
+            const hi = std.fmt.charToDigit(s[i + 1], 16) catch unreachable; // 第一遍已校验
+            const lo = std.fmt.charToDigit(s[i + 2], 16) catch unreachable;
+            out[w] = (hi << 4) | lo;
+            w += 1;
+            i += 3;
+        } else {
+            out[w] = s[i];
+            w += 1;
+            i += 1;
+        }
+    }
+    return out;
+}
+
 /// 单次请求捕获到的路径参数。值是指向
 /// 请求目标的切片，故仅在本次请求期间有效。
 pub const Params = struct {
@@ -170,12 +228,21 @@ pub const Context = struct {
     /// 已读完的请求体（空则为 ""）。指向 conn recv_buf，不额外分配。
     body: []const u8 = "",
 
+    /// 读取路径参数，返回原始（未解码）切片。
     pub fn param(self: *const Context, name: []const u8) ?[]const u8 {
         return self.params.get(name);
     }
 
+    /// 读取路径参数并做 URL 解码（`%XX` 与 `+` → 空格）。
+    /// 结果由 `ctx.gpa` 分配（每请求 arena），生命周期到本次请求结束。
+    pub fn paramDecoded(self: *const Context, name: []const u8) !?[]const u8 {
+        const raw = self.params.get(name) orelse return null;
+        return try urlDecode(self.gpa, raw);
+    }
+
     /// 读取 URL 查询参数（`?key=val&...`）。
-    /// 返回指向 request.target 的切片，不分配内存；值未 URL 解码。
+    /// 返回指向 request.target 的切片，不分配内存；值**未** URL 解码
+    /// （`%20` 保持原样、`+` 不转空格）。需要解码后的值用 `queryDecoded`。
     pub fn query(self: *const Context, name: []const u8) ?[]const u8 {
         const target = self.request.target;
         const q_start = (std.mem.indexOfScalar(u8, target, '?') orelse return null) + 1;
@@ -185,6 +252,14 @@ pub const Context = struct {
             if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
         }
         return null;
+    }
+
+    /// 读取查询参数并做 URL 解码（`%XX` 与 `+` → 空格）。
+    /// 结果由 `ctx.gpa` 分配（每请求 arena），生命周期到本次请求结束。
+    /// 参数不存在返回 null；解码失败（非法 `%` 序列）返回 error.InvalidEncoding。
+    pub fn queryDecoded(self: *const Context, name: []const u8) !?[]const u8 {
+        const raw = self.query(name) orelse return null;
+        return try urlDecode(self.gpa, raw);
     }
 
     /// 把请求体解析为 JSON 类型 `T`。返回 `std.json.Parsed(T)`；
@@ -481,4 +556,78 @@ test "ctx.json 解析 JSON 请求体" {
     const parsed = try ctx.json(T);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(i64, 42), parsed.value.n);
+}
+
+test "urlDecode 解码 %XX 与 +" {
+    const gpa = std.testing.allocator;
+    // %20 → 空格，%2F → /，+ → 空格，大小写十六进制都要认。
+    const a = try urlDecode(gpa, "hello%20world+again");
+    defer gpa.free(a);
+    try std.testing.expectEqualStrings("hello world again", a);
+
+    const b = try urlDecode(gpa, "a%2Fb%3Dc%25d");
+    defer gpa.free(b);
+    try std.testing.expectEqualStrings("a/b=c%d", b);
+
+    // 大小写混写
+    const c = try urlDecode(gpa, "%4a%4A");
+    defer gpa.free(c);
+    try std.testing.expectEqualStrings("JJ", c);
+}
+
+test "urlDecode 无编码时原样返回（零分配）" {
+    const gpa = std.testing.allocator;
+    // 没有 % 和 + 时直接返回入参切片，不分配——testing.allocator 会证明这点。
+    const s = "plain-ascii-only";
+    const out = try urlDecode(gpa, s);
+    try std.testing.expectEqualStrings(s, out);
+    try std.testing.expect(out.ptr == s.ptr);
+}
+
+test "urlDecode 非法序列返回 InvalidEncoding" {
+    const gpa = std.testing.allocator;
+    // 截断：% 后面不足两位
+    try std.testing.expectError(error.InvalidEncoding, urlDecode(gpa, "abc%2"));
+    try std.testing.expectError(error.InvalidEncoding, urlDecode(gpa, "abc%"));
+    // 非十六进制
+    try std.testing.expectError(error.InvalidEncoding, urlDecode(gpa, "abc%zz"));
+    try std.testing.expectError(error.InvalidEncoding, urlDecode(gpa, "abc%g1"));
+}
+
+test "ctx.queryDecoded 与 paramDecoded 解码" {
+    const gpa = std.testing.allocator;
+    const req = http.Request{
+        .method = .GET,
+        .target = "/u/john%20doe?name=Jane+Doe&city=%E5%8C%97%E4%BA%AC",
+        .path = "/u/john%20doe",
+        .version = "HTTP/1.1",
+        .head = "GET /u/john%20doe?name=Jane+Doe HTTP/1.1\r\n",
+        .body = "",
+        .keep_alive = true,
+    };
+    var params: Params = .{};
+    _ = params.push("user", "john%20doe");
+    var ctx = Context{ .gpa = gpa, .request = &req, .params = &params };
+
+    // query 保持原始（未解码）
+    try std.testing.expectEqualStrings("Jane+Doe", ctx.query("name").?);
+
+    // queryDecoded 解码 + → 空格
+    const name = (try ctx.queryDecoded("name")).?;
+    defer gpa.free(name);
+    try std.testing.expectEqualStrings("Jane Doe", name);
+
+    // 多字节 UTF-8：%E5%8C%97%E4%BA%AC = 北京
+    const city = (try ctx.queryDecoded("city")).?;
+    defer gpa.free(city);
+    try std.testing.expectEqualStrings("北京", city);
+
+    // paramDecoded 解码路径参数
+    const user = (try ctx.paramDecoded("user")).?;
+    defer gpa.free(user);
+    try std.testing.expectEqualStrings("john doe", user);
+
+    // 不存在的参数返回 null（不是错误）
+    try std.testing.expect((try ctx.queryDecoded("nope")) == null);
+    try std.testing.expect((try ctx.paramDecoded("nope")) == null);
 }

@@ -99,6 +99,11 @@ ctx.request.header("x-token") // 请求头
 ctx.json(MyStruct)         // 解析 JSON → std.json.Parsed(T)（框架在请求末统一回收）
 ctx.cookie("session")      // 读 Cookie  ?[]const u8（零拷贝）
 
+// URL 解码版本（%XX 与 + → 空格；结果由 ctx.gpa 分配，请求末自动回收）
+try ctx.queryDecoded("q")   // !?[]const u8
+try ctx.paramDecoded("name")// !?[]const u8
+// 非法 % 序列返回 error.InvalidEncoding（不静默丢弃畸形输入）
+
 // 必填版本（缺失时返回对应 error）
 try ctx.requireParam("id")   // error.MissingParam
 try ctx.requireQuery("q")    // error.MissingQuery
@@ -289,11 +294,11 @@ try mox.serve(.{
 |---|---|
 | 请求体 `Content-Length` | 支持；超出 `max_body_size` 返回 413；重复 `Content-Length` 返回 400 |
 | `Transfer-Encoding: chunked` 请求 | **不支持**，解析器识别后返回 501 |
-| HTTP pipelining | **不支持**。一次 `recv` 里带多个请求时只处理第一个，其余字节被丢弃；请逐个请求串行发送 |
-| `HEAD` | 能解析，但路由不会回退到 GET（未注册 HEAD 就是 404），且命中时响应**仍会带 body** |
+| HTTP pipelining | **支持**。一次 `recv` 里的多个请求按序处理，响应同序返回；剩余字节在本次响应发完后继续解析 |
+| `HEAD` | **支持**。未注册 HEAD 时自动回退到 GET handler，只发头部、不发 body，`content-length` 仍是真实长度 |
 | `Expect: 100-continue` | 未实现 |
 | Range / 条件请求 | 未实现 |
-| 查询参数 | `ctx.query()` 返回原始切片，**未做 URL 解码**（`%20` 保持原样） |
+| 查询参数 | `ctx.query()` 返回原始切片（未解码）；需要解码用 `ctx.queryDecoded()`，路径参数用 `ctx.paramDecoded()` |
 | 响应体大小 | 非文件响应受每连接 16 KB `send_buf` 限制，超出返回 500；文件响应走动态缓冲不受此限 |
 | 响应头 | 头名/头值含 CR/LF 会被 `http.serialize` 拒绝（`error.InvalidHeader` → 500），防响应拆分 |
 | HTTPS | 不内置，由 nginx 等反向代理终止 TLS |

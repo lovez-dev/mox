@@ -356,6 +356,12 @@ const Connection = struct {
     send_buf: [16 * 1024]u8 = undefined,
     recv_len: usize = 0,
     keep_alive: bool = false,
+    /// 当前请求是否为 HEAD：响应照常生成头部（含真实 content-length），
+    /// 但 `respond()` / `onFileRead()` 不写出 body 字节。
+    head_only: bool = false,
+    /// 当前请求在 recv_buf 中占用的字节数（HTTP pipelining 用）。
+    /// 响应发完后按它前移剩余字节，继续解析下一个请求。
+    consumed: usize = 0,
 
     /// 每请求 arena：handler 通过 ctx.gpa 分配的内存在此统一回收。
     /// 惰性创建，keep-alive 下每个请求开始时 reset（retain_capacity 复用大块）。
@@ -483,7 +489,15 @@ fn onRecv(loop: *Loop, c: *Completion) void {
         return;
     }
     conn.recv_len += n;
+    tryParseAndHandle(conn);
+}
 
+/// 从 `conn.recv_buf[0..recv_len]` 尝试解析并处理一个请求。
+///
+/// HTTP pipelining：客户端可能在一个 TCP 段里塞多个请求。处理完一个后
+/// 由 `onSend`（发送彻底结束、`send_buf` 可安全复用）调回这里继续解析
+/// 缓冲区里剩下的字节，而不是像以前那样直接 `recv_len = 0` 丢掉。
+fn tryParseAndHandle(conn: *Connection) void {
     const max_body = if (conn.server) |s| s.max_body_size else 4 * 1024 * 1024;
     switch (http.parseWithLimit(conn.recv_buf[0..conn.recv_len], max_body)) {
         .incomplete => {
@@ -500,9 +514,23 @@ fn onRecv(loop: *Loop, c: *Completion) void {
                 respond(conn, .{ .status = .not_implemented, .body = "chunked transfer not supported\n" }, false);
                 return;
             }
+            // 记下本请求占用的字节数；handleRequest 异步完成，剩余字节
+            // 要等响应发完才能安全处理（否则会覆写 send_buf）。
+            conn.consumed = req.consumed;
             handleRequest(conn, req);
         },
     }
+}
+
+/// 把缓冲区里剩下的字节（pipelining 的后续请求）前移覆盖已消费部分。
+fn shiftRemaining(conn: *Connection) void {
+    const used = @min(conn.consumed, conn.recv_len);
+    const remaining = conn.recv_len - used;
+    if (remaining > 0) {
+        std.mem.copyForwards(u8, conn.recv_buf[0..remaining], conn.recv_buf[used..conn.recv_len]);
+    }
+    conn.recv_len = remaining;
+    conn.consumed = 0;
 }
 
 fn handleRequest(conn: *Connection, req: http.Request) void {
@@ -523,6 +551,9 @@ fn handleRequest(conn: *Connection, req: http.Request) void {
     if (srv) |s| {
         if (s.request_timeout_ms > 0) armRequestTimeout(conn, s.request_timeout_ms);
     }
+
+    // HEAD 请求：路由回退到 GET handler（见 router.entryAt），响应只发头部。
+    conn.head_only = req.method == .HEAD;
 
     // 全局请求计数
     _ = metrics_total_requests.fetchAdd(1, .monotonic);
@@ -981,7 +1012,7 @@ fn onFileRead(loop: *Loop, c: *Completion) void {
         .body = data,
         .content_type = conn.defer_ctype,
         .headers = &.{},
-    }, conn.keep_alive, wirebuf) catch {
+    }, conn.keep_alive, conn.head_only, wirebuf) catch {
         conn.alloc.free(wirebuf);
         conn.alloc.free(conn.file_buf);
         conn.file_buf = &.{};
@@ -1000,7 +1031,7 @@ fn respond(conn: *Connection, response: Response, keep_alive: bool) void {
         .body = response.body,
         .content_type = response.content_type,
         .headers = response.headers,
-    }, keep_alive, &conn.send_buf) catch |err| {
+    }, keep_alive, conn.head_only, &conn.send_buf) catch |err| {
         // NoSpaceLeft：响应放不下每连接缓冲。
         // InvalidHeader：头名/头值含 CRLF，可能是注入尝试；绝不写出该响应，
         // 统一回一个干净的 500（不回显攻击内容）。
@@ -1011,6 +1042,7 @@ fn respond(conn: *Connection, response: Response, keep_alive: bool) void {
         const fallback = http.serialize(
             .{ .status = .internal_server_error, .body = msg, .content_type = "text/plain" },
             false,
+            conn.head_only,
             &conn.send_buf,
         ) catch {
             destroyConn(conn);
@@ -1020,6 +1052,7 @@ fn respond(conn: *Connection, response: Response, keep_alive: bool) void {
         startSend(conn, fallback);
         return;
     };
+
     conn.keep_alive = keep_alive;
     conn.send_owned = null;
     startSend(conn, wire);
@@ -1067,8 +1100,15 @@ fn onSend(loop: *Loop, c: *Completion) void {
 
     releaseWire(conn);
     if (conn.keep_alive) {
-        conn.recv_len = 0;
-        postRecv(conn);
+        // pipelining：本次响应已彻底发完，send_buf 可安全复用。
+        // 先把已消费的字节移出缓冲区，若还剩完整请求就接着处理，
+        // 否则重新挂 recv 等下一批数据。
+        shiftRemaining(conn);
+        if (conn.recv_len > 0) {
+            tryParseAndHandle(conn);
+        } else {
+            postRecv(conn);
+        }
     } else {
         // 不再复用连接：先半关闭发送方向，让对端把响应读完再收到 FIN，
         // 直接 close 有可能在响应还在内核缓冲里时被 RST 掉。
@@ -2294,4 +2334,193 @@ test "CRLF 注入端到端被拒绝，不写出伪造响应" {
     try std.testing.expect(std.mem.indexOf(u8, resp, "500") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "X-Injected") == null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "HTTP/1.1 200 OK") == null);
+}
+
+// HTTP pipelining 端到端：一次 write 塞两个完整请求进同一个 TCP 段，
+// 两个响应都必须回来。修复前 onSend 里 `recv_len = 0` 会丢掉第二个请求，
+// 第二条断言会变红（只收到一个响应）。
+test "HTTP pipelining：一次写入两个请求都得到响应" {
+    if (@import("builtin").os.tag == .windows) try mox_io.platform.startup();
+    const alloc = std.heap.page_allocator;
+
+    const S = struct {
+        var got: [4096]u8 = undefined;
+        var got_len: usize = 0;
+        var done: std.atomic.Value(bool) = .init(false);
+        // 看门狗：最多等 5 秒。旧行为（丢弃第二个请求）会让客户端永远等不到
+        // 第二个响应；没有上限时测试会挂死而不是失败，挂死比失败更难定位。
+        var ticks: usize = 0;
+
+        fn first(ctx: *Context) !Response {
+            _ = ctx;
+            return .{ .body = "AAA" };
+        }
+        fn second(ctx: *Context) !Response {
+            _ = ctx;
+            return .{ .body = "BBB" };
+        }
+        fn client(addr: std.Io.net.IpAddress) void {
+            const s = mox_io.platform.createTcpSocket(addr) catch return;
+            defer mox_io.platform.closeSocket(s);
+            mox_io.platform.connectSocket(s, addr) catch return;
+            // 两个请求拼成一次 send，尽量落在同一个段里。
+            const reqs = "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+            _ = mox_io.platform.sendBlocking(s, reqs) catch return;
+            var n: usize = 0;
+            // 读满两个响应（或对端关闭）为止。
+            while (n < got.len) {
+                const r = mox_io.platform.recvBlocking(s, got[n..]) catch break;
+                if (r == 0) break;
+                n += r;
+                const have = got[0..n];
+                // 两个响应都到齐就退出，不必等对端关闭。
+                const c = std.mem.count(u8, have, "HTTP/1.1 200");
+                if (c >= 2) break;
+            }
+            got_len = n;
+            done.store(true, .release);
+        }
+        fn tick(loop: *Loop, c: *Completion) void {
+            const t: *mox_io.Timer = @fieldParentPtr("c", c);
+            ticks += 1;
+            // 5 秒上限（20ms × 250）：旧行为下第二个响应永远不来，
+            // 没有上限测试会挂死而不是失败，挂死更难定位。
+            if (done.load(.acquire) or ticks > 250) {
+                loop.stop();
+                return;
+            }
+            t.* = mox_io.Timer.init(20);
+            t.c.callback = tick;
+            loop.add(&t.c);
+        }
+    };
+
+    const l = try testListen();
+    const listener = l[0];
+    const bound = l[1];
+    defer mox_io.platform.closeSocket(listener);
+    S.done.store(false, .release);
+    S.got_len = 0;
+    S.ticks = 0;
+
+    const cli = try std.Thread.spawn(.{}, S.client, .{bound});
+    defer cli.join();
+
+    const accepted = try mox_io.platform.acceptSocket(listener);
+    defer mox_io.platform.closeSocket(accepted.socket);
+
+    var loop = try mox_io.open(alloc);
+    defer loop.deinit();
+    try loop.associate(accepted.socket, 1);
+
+    var router = try Router.init(alloc, &.{
+        .{ .method = .GET, .path = "/a", .handler = S.first },
+        .{ .method = .GET, .path = "/b", .handler = S.second },
+    });
+    defer router.deinit();
+
+    const conn = try alloc.create(Connection);
+    conn.* = .{ .alloc = alloc, .loop = &loop, .router = &router, .socket = accepted.socket };
+    postRecv(conn);
+
+    var hb = mox_io.Timer.init(20);
+    hb.c.callback = S.tick;
+    loop.add(&hb.c);
+    try loop.run();
+
+    const resp = S.got[0..S.got_len];
+    try std.testing.expect(std.mem.count(u8, resp, "HTTP/1.1 200") == 2);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "AAA") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "BBB") != null);
+    // 顺序必须保持（HTTP/1.1 要求响应与请求同序）。
+    const ia = std.mem.indexOf(u8, resp, "AAA").?;
+    const ib = std.mem.indexOf(u8, resp, "BBB").?;
+    try std.testing.expect(ia < ib);
+}
+
+// HEAD 端到端：未注册 HEAD 路由时回退到 GET handler，响应只发头部、
+// 但 content-length 必须等于同一 GET 的真实 body 长度（RFC 9110 §9.3.2）。
+test "HEAD 回退 GET 路由且不发送 body" {
+    if (@import("builtin").os.tag == .windows) try mox_io.platform.startup();
+    const alloc = std.heap.page_allocator;
+
+    const S = struct {
+        var got: [2048]u8 = undefined;
+        var got_len: usize = 0;
+        var done: std.atomic.Value(bool) = .init(false);
+        var ticks: usize = 0;
+
+        fn onlyGet(ctx: *Context) !Response {
+            _ = ctx;
+            return .{ .body = "body-must-not-be-sent" }; // 21 字节
+        }
+        fn client(addr: std.Io.net.IpAddress) void {
+            const s = mox_io.platform.createTcpSocket(addr) catch return;
+            defer mox_io.platform.closeSocket(s);
+            mox_io.platform.connectSocket(s, addr) catch return;
+            _ = mox_io.platform.sendBlocking(s, "HEAD /only-get HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n") catch return;
+            var n: usize = 0;
+            while (n < got.len) {
+                const r = mox_io.platform.recvBlocking(s, got[n..]) catch break;
+                if (r == 0) break;
+                n += r;
+            }
+            got_len = n;
+            done.store(true, .release);
+        }
+        fn tick(loop: *Loop, c: *Completion) void {
+            const t: *mox_io.Timer = @fieldParentPtr("c", c);
+            ticks += 1;
+            if (done.load(.acquire) or ticks > 250) {
+                loop.stop();
+                return;
+            }
+            t.* = mox_io.Timer.init(20);
+            t.c.callback = tick;
+            loop.add(&t.c);
+        }
+    };
+
+    const l = try testListen();
+    const listener = l[0];
+    const bound = l[1];
+    defer mox_io.platform.closeSocket(listener);
+    S.done.store(false, .release);
+    S.got_len = 0;
+    S.ticks = 0;
+
+    const cli = try std.Thread.spawn(.{}, S.client, .{bound});
+    defer cli.join();
+
+    const accepted = try mox_io.platform.acceptSocket(listener);
+    defer mox_io.platform.closeSocket(accepted.socket);
+
+    var loop = try mox_io.open(alloc);
+    defer loop.deinit();
+    try loop.associate(accepted.socket, 1);
+
+    // 只注册 GET，故意不注册 HEAD：验证路由器回退。
+    var router = try Router.init(alloc, &.{
+        .{ .method = .GET, .path = "/only-get", .handler = S.onlyGet },
+    });
+    defer router.deinit();
+
+    const conn = try alloc.create(Connection);
+    conn.* = .{ .alloc = alloc, .loop = &loop, .router = &router, .socket = accepted.socket };
+    postRecv(conn);
+
+    var hb = mox_io.Timer.init(20);
+    hb.c.callback = S.tick;
+    loop.add(&hb.c);
+    try loop.run();
+
+    const resp = S.got[0..S.got_len];
+    // 1) 回退到 GET handler：不是 404。
+    try std.testing.expect(std.mem.indexOf(u8, resp, "200 OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "404") == null);
+    // 2) content-length 是真实长度 21，不是 0。
+    try std.testing.expect(std.mem.indexOf(u8, resp, "content-length: 21\r\n") != null);
+    // 3) body 一个字节都没发。
+    try std.testing.expect(std.mem.indexOf(u8, resp, "body-must-not-be-sent") == null);
+    try std.testing.expect(std.mem.endsWith(u8, resp, "\r\n\r\n"));
 }

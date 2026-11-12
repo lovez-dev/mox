@@ -43,6 +43,9 @@ pub const Request = struct {
     keep_alive: bool,
     /// 是否收到 Transfer-Encoding: chunked。服务层应返回 501。
     chunked: bool = false,
+    /// 本请求在输入缓冲区里占用的字节数（头部 + 空行 + body）。
+    /// 用于 HTTP pipelining：处理完一个请求后从这里之后继续解析。
+    consumed: usize = 0,
 
     /// 大小写不敏感的头部查找，返回值已去掉首尾空白。
     pub fn header(self: *const Request, name: []const u8) ?[]const u8 {
@@ -119,6 +122,7 @@ pub fn parseWithLimit(buf: []const u8, max_body_size: usize) ParseResult {
         .body = buf[body_start .. body_start + content_length],
         .keep_alive = keep_alive,
         .chunked = chunked,
+        .consumed = body_start + content_length,
     } };
 }
 
@@ -165,7 +169,10 @@ fn hasCrlf(s: []const u8) bool {
 /// 把 `resp` 序列化进 `buf`，返回写出的切片。
 /// - `error.NoSpaceLeft`：响应放不下缓冲区。
 /// - `error.InvalidHeader`：头名或头值含 CR/LF（拒绝注入，不写出任何内容）。
-pub fn serialize(resp: Response, keep_alive: bool, buf: []u8) error{ NoSpaceLeft, InvalidHeader }![]const u8 {
+///
+/// `head_only` 用于 HEAD 请求：`content-length` 仍写真实 body 长度（RFC 9110
+/// §9.3.2 要求 HEAD 的头部与同一 GET 一致），但不写出 body 字节。
+pub fn serialize(resp: Response, keep_alive: bool, head_only: bool, buf: []u8) error{ NoSpaceLeft, InvalidHeader }![]const u8 {
     if (hasCrlf(resp.content_type)) return error.InvalidHeader;
     for (resp.headers) |h| {
         if (hasCrlf(h.name) or hasCrlf(h.value)) return error.InvalidHeader;
@@ -184,13 +191,15 @@ pub fn serialize(resp: Response, keep_alive: bool, buf: []u8) error{ NoSpaceLeft
         const hdr = std.fmt.bufPrint(buf[pos..], "{s}: {s}\r\n", .{ h.name, h.value }) catch return error.NoSpaceLeft;
         pos += hdr.len;
     }
-    // 空行 + body
-    if (pos + 2 + resp.body.len > buf.len) return error.NoSpaceLeft;
+    // 空行 + body（HEAD 只写空行，不写 body 字节）
+    if (pos + 2 + (if (head_only) 0 else resp.body.len) > buf.len) return error.NoSpaceLeft;
     buf[pos] = '\r';
     buf[pos + 1] = '\n';
     pos += 2;
-    @memcpy(buf[pos .. pos + resp.body.len], resp.body);
-    pos += resp.body.len;
+    if (!head_only) {
+        @memcpy(buf[pos .. pos + resp.body.len], resp.body);
+        pos += resp.body.len;
+    }
     return buf[0..pos];
 }
 
@@ -232,7 +241,7 @@ test "malformed request lines are rejected" {
 }
 test "serializes a response with headers and body" {
     var buf: [256]u8 = undefined;
-    const text = try serialize(.{ .body = "hi" }, true, &buf);
+    const text = try serialize(.{ .body = "hi" }, true, false, &buf);
     try std.testing.expect(std.mem.startsWith(u8, text, "HTTP/1.1 200 OK\r\n"));
     try std.testing.expect(std.mem.indexOf(u8, text, "content-length: 2\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "connection: keep-alive\r\n") != null);
@@ -240,7 +249,7 @@ test "serializes a response with headers and body" {
 }
 test "a not-found response says so" {
     var buf: [256]u8 = undefined;
-    const text = try serialize(.{ .status = .not_found, .body = "nope" }, false, &buf);
+    const text = try serialize(.{ .status = .not_found, .body = "nope" }, false, false, &buf);
     try std.testing.expect(std.mem.startsWith(u8, text, "HTTP/1.1 404 Not Found\r\n"));
     try std.testing.expect(std.mem.indexOf(u8, text, "connection: close\r\n") != null);
 }
@@ -265,7 +274,7 @@ test "serialize writes extra response headers" {
         .{ .name = "x-request-id", .value = "abc" },
         .{ .name = "cache-control", .value = "no-cache" },
     };
-    const text = try serialize(.{ .body = "ok", .headers = &hdrs }, false, &buf);
+    const text = try serialize(.{ .body = "ok", .headers = &hdrs }, false, false, &buf);
     try std.testing.expect(std.mem.indexOf(u8, text, "x-request-id: abc\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "cache-control: no-cache\r\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, text, "\r\n\r\nok"));
@@ -286,10 +295,30 @@ test "serialize 拒绝响应头 CRLF 注入（响应拆分防护）" {
         .{ .body = "ok", .content_type = "text/plain\r\nX-Injected: 1" },
     };
     for (cases) |r| {
-        try std.testing.expectError(error.InvalidHeader, serialize(r, false, &buf));
+        try std.testing.expectError(error.InvalidHeader, serialize(r, false, false, &buf));
     }
 
     // 正例：body 里含 CRLF 是合法的（不是头），不能被误判。
-    const ok_text = try serialize(.{ .body = "line1\r\nline2\n" }, false, &buf);
+    const ok_text = try serialize(.{ .body = "line1\r\nline2\n" }, false, false, &buf);
     try std.testing.expect(std.mem.endsWith(u8, ok_text, "\r\n\r\nline1\r\nline2\n"));
+}
+
+
+// HEAD 语义（RFC 9110 §9.3.2）：头部与同一 GET 一致（含真实 content-length），
+// 但不写出 body 字节。若 head_only 被忽略，下面最后一条断言会变红。
+test "serialize head_only 保留 content-length 但不写 body" {
+    var buf: [256]u8 = undefined;
+    const resp = Response{ .body = "hello world" };
+
+    const get_text = try serialize(resp, true, false, &buf);
+    try std.testing.expect(std.mem.endsWith(u8, get_text, "\r\n\r\nhello world"));
+
+    const head_text = try serialize(resp, true, true, &buf);
+    // content-length 必须是真实 body 长度（11），不是 0。
+    try std.testing.expect(std.mem.indexOf(u8, head_text, "content-length: 11\r\n") != null);
+    // 以空行结尾，body 一个字节都不写。
+    try std.testing.expect(std.mem.endsWith(u8, head_text, "\r\n\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, head_text, "hello") == null);
+    // 头部部分与 GET 完全一致（只少了 body）。
+    try std.testing.expect(std.mem.startsWith(u8, get_text, head_text));
 }

@@ -160,6 +160,14 @@ fn entryAt(node: *Node, method: std.http.Method) ?Handler {
     for (node.entries.items) |entry| {
         if (entry.method == method) return entry.handler;
     }
+    // HEAD 语义（RFC 9110 §9.3.2）：服务器收到 HEAD 时应该返回与 GET
+    // 相同的响应头、但不带响应体。这里在路由层回退到 GET handler，
+    // 响应体的抑制由 server 的 respond() 负责，避免每个 handler 都写一遍。
+    if (method == .HEAD) {
+        for (node.entries.items) |entry| {
+            if (entry.method == .GET) return entry.handler;
+        }
+    }
     return null;
 }
 
