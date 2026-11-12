@@ -12,6 +12,82 @@ const root = @import("io.zig");
 
 const is_windows = builtin.os.tag == .windows;
 const is_posix = !is_windows;
+const is_linux = builtin.os.tag == .linux;
+
+/// POSIX 原语：Zig 0.17.1 的 `std.posix` **没有** `isatty` / `pipe2` / `close` /
+/// `TIOCGWINSZ`，`winsize` 也没标 `pub`。所以按后端已有做法直接下探：
+/// Linux 走 `std.os.linux`（不链 libc），其它 POSIX 走 `std.c`。
+const posix = if (is_windows) struct {} else if (is_linux) struct {
+    const lx = std.os.linux;
+
+    const Winsize = extern struct {
+        ws_row: u16,
+        ws_col: u16,
+        ws_xpixel: u16,
+        ws_ypixel: u16,
+    };
+
+    /// `tcgets` 的 ioctl 请求号。`T.IOCGWINSZ` 在 `std.os.linux` 里是
+    /// `IOCGWINSZ`（名字不同，且按架构分组定义），这里直接用字面量最稳：
+    /// TIOCGWINSZ = _IOR('t', 104, struct winsize) = 0x5413（通用）。
+    const TIOCGWINSZ: u32 = 0x5413;
+
+    fn ioctlWinsize(fd: std.posix.fd_t, ws: *Winsize) bool {
+        const rc = lx.ioctl(fd, TIOCGWINSZ, @intFromPtr(ws));
+        // Linux syscall 返回值是 usize，负数（-errno）是错误。
+        const signed: isize = @bitCast(rc);
+        return signed >= 0;
+    }
+
+    /// `isatty` 的可靠替代：对 fd 做 `TCGETS`，成功即终端。
+    /// `std.posix` 没有 isatty，而 `std.c.isatty` 需要链 libc（Linux 上不允许）。
+    fn isatty(fd: std.posix.fd_t) bool {
+        // TCGETS = 0x5401（通用 Linux）
+        const TCGETS: u32 = 0x5401;
+        var termios: std.posix.termios = undefined;
+        const rc = lx.ioctl(fd, TCGETS, @intFromPtr(&termios));
+        const signed: isize = @bitCast(rc);
+        return signed >= 0;
+    }
+
+    fn pipe2(fds: *[2]std.posix.fd_t) bool {
+        const rc = lx.pipe2(fds, .{ .CLOEXEC = true });
+        const signed: isize = @bitCast(rc);
+        return signed >= 0;
+    }
+
+    fn close(fd: std.posix.fd_t) void {
+        _ = lx.close(fd);
+    }
+} else struct {
+    const c = std.c;
+
+    const Winsize = extern struct {
+        ws_row: u16,
+        ws_col: u16,
+        ws_xpixel: u16,
+        ws_ypixel: u16,
+    };
+
+    /// BSD / Darwin 的 TIOCGWINSZ = 0x40087468。
+    const TIOCGWINSZ: c_ulong = 0x40087468;
+
+    fn ioctlWinsize(fd: std.posix.fd_t, ws: *Winsize) bool {
+        return c.ioctl(fd, TIOCGWINSZ, @intFromPtr(ws)) == 0;
+    }
+
+    fn isatty(fd: std.posix.fd_t) bool {
+        return c.isatty(fd) != 0;
+    }
+
+    fn pipe2(fds: *[2]std.posix.fd_t) bool {
+        return c.pipe(fds) == 0;
+    }
+
+    fn close(fd: std.posix.fd_t) void {
+        _ = c.close(fd);
+    }
+};
 
 /// TTY 句柄（stdin/stdout/stderr 的文件描述符 / HANDLE）。
 pub const Handle = if (is_windows) std.os.windows.HANDLE else std.posix.fd_t;
@@ -155,9 +231,8 @@ pub fn getSize(handle: Handle) !Size {
         const cols: u16 = @intCast(info.srWindow.Right - info.srWindow.Left + 1);
         return .{ .rows = rows, .cols = cols };
     } else {
-        var ws: std.posix.system.winsize = undefined;
-        const rc = std.posix.system.ioctl(handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
-        if (rc != 0) return error.IoctlFailed;
+        var ws: posix.Winsize = undefined;
+        if (!posix.ioctlWinsize(handle, &ws)) return error.IoctlFailed;
         return .{ .rows = ws.ws_row, .cols = ws.ws_col };
     }
 }
@@ -292,7 +367,7 @@ pub fn isTty(handle: Handle) bool {
         var mode: std.os.windows.DWORD = 0;
         return wc.GetConsoleMode(handle, &mode).toBool();
     } else {
-        return std.posix.isatty(handle);
+        return posix.isatty(handle);
     }
 }
 
@@ -312,7 +387,7 @@ const PipePair = struct {
             return .{ .a = r, .b = wr };
         } else {
             var fds: [2]std.posix.fd_t = undefined;
-            _ = std.posix.pipe2(&fds, .{ .CLOEXEC = true }) catch return null;
+            if (!posix.pipe2(&fds)) return null;
             return .{ .a = fds[0], .b = fds[1] };
         }
     }
@@ -322,8 +397,8 @@ const PipePair = struct {
             _ = CloseHandle(self.a);
             _ = CloseHandle(self.b);
         } else {
-            std.posix.close(self.a);
-            std.posix.close(self.b);
+            posix.close(self.a);
+            posix.close(self.b);
         }
     }
 };
