@@ -468,6 +468,8 @@ test {
     _ = @import("tests.zig");
     _ = @import("udp.zig");
     _ = @import("dns.zig");
+    // tty.zig 原先漏在这里：它的测试从未被 `zig build test` 跑过。
+    _ = @import("tty.zig");
     if (builtin.os.tag == .windows) {
         _ = @import("backends/windows.zig");
     } else if (builtin.os.tag == .linux) {

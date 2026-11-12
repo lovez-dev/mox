@@ -619,6 +619,37 @@ loop.add(&s.work.c);
 
 两道防线都有变异测试证明有效：撤掉 `MSG_NOSIGNAL` 后进程被信号杀死；只靠
 `SIG_IGN` 时裸 `write` 能拿到 `EPIPE` 并存活。
+
+## TTY / 终端
+
+`src/io/tty.zig`。只暴露同步接口（终端操作微秒级完成，不需要异步化）：
+`isTty` / `getSize` / `save` / `restore` / `setMode`（`cooked` / `raw` / `cbreak`）。
+
+Zig 0.17.1 的 `std.os.windows` 只声明了 `CreateProcessW`，**没有任何 Console API**，
+因此 Windows 侧按 Win32 SDK 签名自行 `extern` 声明
+（`GetConsoleMode` / `SetConsoleMode` / `GetConsoleScreenBufferInfo` /
+`GetStdHandle` / `CreateFileW`）。
+
+| 行为 | POSIX | Windows |
+|---|---|---|
+| `isTty` | `isatty(fd)` | `GetConsoleMode` 成功即控制台（不需要 ConDrv / NtQueryObject） |
+| `getSize` | `ioctl(TIOCGWINSZ)` | `GetConsoleScreenBufferInfo` 的 `srWindow`（**可见窗口**，不是整个屏幕缓冲区 `dwSize`） |
+| `raw` | 关 ICANON/ECHO/ISIG 等 | 关 LINE_INPUT/ECHO/PROCESSED_INPUT，开 `ENABLE_VIRTUAL_TERMINAL_INPUT` |
+| `cbreak` | 关 ICANON，保留 ECHO/ISIG | **退化为 raw**（见下） |
+
+**Windows 的真实平台差异（实测，不是推测）**：关掉 `ENABLE_LINE_INPUT` 后
+`SetConsoleMode` 拒绝保留 `ENABLE_ECHO_INPUT`（`0x5` 失败 / `0x1` 成功）。
+即「无行缓冲 + 有回显」在 Windows 输入句柄上无法表达，所以 `cbreak` 在
+Windows 输入句柄上等同 `raw`，回显需应用自己写回。POSIX 语义不变。
+
+句柄不是控制台（管道、文件重定向）时：`isTty` 返回 `false`，`getSize` /
+`save` / `setMode` 返回 `error.NotATty`（POSIX 侧 `getSize` 是 `error.IoctlFailed`），
+不会 panic 也不会静默成功。
+
+Windows 的 `tty.zig` 测试用 `CONOUT$` / `CONIN$` 打开**真实控制台设备**
+（stdout 被重定向时依然有效），断言 `isTty == true`、`getSize` 行列 > 0、
+`setMode` 后读回的模式位确实变化、`restore` 回到原值。没有控制台的环境
+（纯服务容器）拿不到 `CONOUT$`，此时跳过。
 ## 作为包被依赖
 
 仓库根有 `build.zig.zon`，包名 `mox`，最低 Zig 版本 `0.17.1`。外部项目
