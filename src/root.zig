@@ -53,6 +53,9 @@ pub const setCookieHeader = types.setCookieHeader;
 pub const Metrics = server.Metrics;
 pub const getMetrics = server.getMetrics;
 pub const metricsHandler = server.metricsHandler;
+pub const requestId = middleware.requestId;
+pub const bodyLimit = middleware.bodyLimit;
+pub const cache = middleware.cache;
 
 test {
     @import("std").testing.refAllDecls(@This());

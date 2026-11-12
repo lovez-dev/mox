@@ -299,7 +299,6 @@ pub fn staticDir(comptime dir: []const u8) Handler {
             const path = try std.fmt.allocPrint(ctx.gpa, dir ++ "{s}", .{sub});
             return Response{
                 .file_path = path,
-                .file_path_owned = true,
                 .content_type = mimeFor(sub),
             };
         }
@@ -494,4 +493,157 @@ test "rateLimit 超出限额后返回 429" {
     _ = try app(&ctx); // 第 1 次：ok
     const resp = try app(&ctx); // 第 2 次：超限
     try std.testing.expectEqual(std.http.Status.too_many_requests, resp.status);
+}
+
+
+// ============================================================================
+// Phase 6 中间件
+// ============================================================================
+
+/// 单线程事件循环下，响应头在 `respond()` 里被同步拷进每连接缓冲，
+/// 故中间件复用一块静态暂存区即可，无需热路径堆分配（也无需 server 参与释放）。
+/// 上限 16：上游已有头数达到上限时本中间件不再追加，避免静默截断或堆分配。
+const header_scratch_cap = 16;
+
+/// requestId 中间件：为每条请求生成递增 ID，写入响应头 `X-Request-Id`。
+/// 单线程事件循环保证静态暂存区无竞争；若将来引入多 worker，需改回堆分配并
+/// 在 server 侧增加 `headers_owned` 释放路径。
+pub fn requestId(comptime next: Handler) Handler {
+    return struct {
+        const State = struct {
+            var counter: std.atomic.Value(u64) = .init(0);
+            var id_buf: [32]u8 = undefined;
+            var headers: [header_scratch_cap]Header = undefined;
+        };
+        fn handle(ctx: *Context) anyerror!Response {
+            var resp = try next(ctx);
+            if (resp.headers.len >= State.headers.len) return resp;
+            const id = State.counter.fetchAdd(1, .monotonic);
+            const id_str = std.fmt.bufPrint(&State.id_buf, "{d}", .{id}) catch return resp;
+            @memcpy(State.headers[0..resp.headers.len], resp.headers);
+            State.headers[resp.headers.len] = .{ .name = "x-request-id", .value = id_str };
+            resp.headers = State.headers[0 .. resp.headers.len + 1];
+            return resp;
+        }
+    }.handle;
+}
+
+/// bodyLimit 中间件：当请求体超过 `max_bytes` 时直接以 413 短路，不调用 next。
+/// 补充 Config.max_body_size 的全局限制，可在单条路由粒度覆盖。
+pub fn bodyLimit(comptime max_bytes: usize) Middleware {
+    return struct {
+        fn wrap(comptime next: Handler) Handler {
+            return struct {
+                fn handle(ctx: *Context) anyerror!Response {
+                    if (ctx.body.len > max_bytes) {
+                        return .{
+                            .status = .payload_too_large,
+                            .body = "request body too large\n",
+                        };
+                    }
+                    return next(ctx);
+                }
+            }.handle;
+        }
+    }.wrap;
+}
+
+/// cache 中间件：给成功响应（2xx）加 `Cache-Control: public, max-age=N`。
+/// 非 2xx 响应不加缓存头，以免缓存错误页。
+/// 与 requestId 一样复用静态暂存区（单线程事件循环，零热路径分配）。
+pub fn cache(comptime max_age_seconds: u32) Middleware {
+    const S = struct {
+        const cc_len = std.fmt.count("public, max-age={d}", .{max_age_seconds});
+        const cc_buf: [cc_len]u8 = blk: {
+            var buf: [cc_len]u8 = undefined;
+            _ = std.fmt.bufPrint(&buf, "public, max-age={d}", .{max_age_seconds}) catch unreachable;
+            break :blk buf;
+        };
+        var headers: [header_scratch_cap]Header = undefined;
+    };
+    return struct {
+        fn wrap(comptime next: Handler) Handler {
+            return struct {
+                fn handle(ctx: *Context) anyerror!Response {
+                    var resp = try next(ctx);
+                    const code = @intFromEnum(resp.status);
+                    if (code >= 200 and code < 300 and resp.headers.len < S.headers.len) {
+                        @memcpy(S.headers[0..resp.headers.len], resp.headers);
+                        S.headers[resp.headers.len] = .{
+                            .name = "cache-control",
+                            .value = &S.cc_buf,
+                        };
+                        resp.headers = S.headers[0 .. resp.headers.len + 1];
+                    }
+                    return resp;
+                }
+            }.handle;
+        }
+    }.wrap;
+}
+
+// ---- Phase 6 测试 ----------------------------------------------------------
+
+test "requestId 中间件给响应加 x-request-id 头" {
+    const http = @import("http.zig");
+    const req: http.Request = .{
+        .method = .GET, .target = "/", .path = "/",
+        .version = "HTTP/1.1", .head = "", .body = "", .keep_alive = true,
+    };
+    var params: @import("types.zig").Params = .{};
+    var ctx: Context = .{
+        .gpa = std.testing.allocator,
+        .request = &req,
+        .params = &params,
+    };
+    const h = requestId(ok);
+    const resp = try h(&ctx);
+    var found = false;
+    for (resp.headers) |hdr| {
+        if (std.mem.eql(u8, hdr.name, "x-request-id")) { found = true; break; }
+    }
+    try std.testing.expect(found);
+}
+
+test "bodyLimit 超限返回 413" {
+    const http = @import("http.zig");
+    var big_body: [1025]u8 = undefined;
+    @memset(&big_body, '0');
+    const req: http.Request = .{
+        .method = .POST, .target = "/", .path = "/",
+        .version = "HTTP/1.1", .head = "", .body = &big_body, .keep_alive = true,
+    };
+    var params: @import("types.zig").Params = .{};
+    var ctx: Context = .{
+        .gpa = std.testing.allocator,
+        .request = &req,
+        .params = &params,
+        .body = req.body,
+    };
+    const app = bodyLimit(1024)(ok);
+    const resp = try app(&ctx);
+    try std.testing.expectEqual(std.http.Status.payload_too_large, resp.status);
+}
+
+test "cache 中间件给 2xx 加 Cache-Control" {
+    const http = @import("http.zig");
+    const req: http.Request = .{
+        .method = .GET, .target = "/", .path = "/",
+        .version = "HTTP/1.1", .head = "", .body = "", .keep_alive = true,
+    };
+    var params: @import("types.zig").Params = .{};
+    var ctx: Context = .{
+        .gpa = std.testing.allocator,
+        .request = &req,
+        .params = &params,
+    };
+    const h = cache(3600)(ok);
+    const resp = try h(&ctx);
+    var found = false;
+    for (resp.headers) |hdr| {
+        if (std.mem.eql(u8, hdr.name, "cache-control") and
+            std.mem.indexOf(u8, hdr.value, "max-age=3600") != null)
+        { found = true; break; }
+    }
+    try std.testing.expect(found);
 }

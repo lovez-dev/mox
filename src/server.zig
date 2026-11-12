@@ -357,6 +357,10 @@ const Connection = struct {
     recv_len: usize = 0,
     keep_alive: bool = false,
 
+    /// 每请求 arena：handler 通过 ctx.gpa 分配的内存在此统一回收。
+    /// 惰性创建，keep-alive 下每个请求开始时 reset（retain_capacity 复用大块）。
+    arena: ?std.heap.ArenaAllocator = null,
+
     recv: NetRecv = undefined,
     send: NetSend = undefined,
     close: NetClose = undefined,
@@ -497,7 +501,18 @@ fn onRecv(loop: *Loop, c: *Completion) void {
 }
 
 fn handleRequest(conn: *Connection, req: http.Request) void {
-    // 获取 Server 指针（测试中直连 Connection 时为 null，降级为默认行为）
+    // 每个请求开始：重置上一请求的 arena（保留容量复用），并让 ctx.gpa 指向它。
+    // 修复 problem()/metricsHandler()/setCookieHeader()/示例 allocPrint 等通过
+    // ctx.gpa 分配却从未释放的请求级内存泄漏。
+    if (conn.arena) |*a| {
+        _ = a.reset(.retain_capacity);
+    } else {
+        conn.arena = std.heap.ArenaAllocator.init(conn.alloc);
+    }
+    const req_alloc = conn.arena.?.allocator();
+    // 获取 Server 指针（测试中直连 Connection 时为 null，降级为默认行为）。
+    // req_alloc 覆盖 handler 与 respond()：后者同步把 body/headers 拷进 send_buf，
+    // 因此下次请求 reset arena 时，上一响应的数据已不再被引用。
     const srv = conn.server;
     // 武装请求超时计时器（如果配置了的话）
     if (srv) |s| {
@@ -509,7 +524,7 @@ fn handleRequest(conn: *Connection, req: http.Request) void {
     var params: Params = .{};
     const handler = conn.router.match(req.method, req.path, &params) orelse {
         // 路由未命中：调用可自定义的 not_found handler
-        var ctx: Context = .{ .gpa = conn.alloc, .request = &req, .params = &params, .body = req.body };
+        var ctx: Context = .{ .gpa = req_alloc, .request = &req, .params = &params, .body = req.body };
         const nf_resp = if (srv) |s|
             s.not_found_handler(&ctx) catch Response{ .status = .not_found, .body = "not found\n" }
         else
@@ -519,7 +534,7 @@ fn handleRequest(conn: *Connection, req: http.Request) void {
         return;
     };
 
-    var ctx: Context = .{ .gpa = conn.alloc, .request = &req, .params = &params, .body = req.body };
+    var ctx: Context = .{ .gpa = req_alloc, .request = &req, .params = &params, .body = req.body };
     const response = handler(&ctx) catch |err| {
         // handler 出错：调用可自定义的 error_handler
         disarmRequestTimeout(conn);
@@ -781,19 +796,34 @@ fn sseOnHeadersSent(loop: *Loop, c: *Completion) void {
     if (conn.send_owned) |b| { conn.alloc.free(b); conn.send_owned = null; }
     conn.send_wire = &.{};
     _ = conn.send.getResult() catch { destroyConn(conn); return; };
-    // 调用 SSE handler：持续推送直到 handler 返回 false
+    // 发完头后调用一次 SSE handler（当前实现没有定时/外部 pump 机制，
+    // 见 ssePump 下方说明：返回 true 不会自动再次调用）
     ssePump(conn);
 }
 
-/// 反复调用 sse_handler；每次 handler 返回 true 则继续，返回 false 则关闭。
+/// 调用一次 sse_handler。已知能力缺口：handler 返回 true 且本次未调用
+/// writer.send() 时，没有定时器或外部事件会再次触发 pump，连接会一直挂着。
+/// 真正需要持续推送的场景应在 handler 内连续 send（链式完成回调）或
+/// 等待后续版本提供 tick 钩子。这里如实标注，避免给出虚假的"循环推送"承诺。
 fn ssePump(conn: *Connection) void {
-    if (conn.sse_handler == null or conn.state != .sse) { destroyConn(conn); return; }
+    if (conn.sse_handler == null or conn.state != .sse) {
+        // handler 已清空（延迟关闭信号）或状态异常 → 关连接
+        if (conn.state != .closing) destroyConn(conn);
+        return;
+    }
     const writer = types.SseWriter{ .ptr = conn, .vtable = &sse_vtable };
-    // 调用 handler：若返回 false 则结束
     const keep_going = conn.sse_handler.?(writer);
-    if (!keep_going) destroyConn(conn);
-    // 若 handler 调用了 writer.send()，状态已转为 .sending，pump 被 sseOnEventSent 重启。
-    // 若 handler 没发任何数据（返回 true），这里无法 pump；实际 SSE 通常通过定时器触发。
+    if (!keep_going) {
+        if (conn.state == .sse) {
+            // 没有发送在飞：立即关
+            destroyConn(conn);
+        } else {
+            // send 在飞（handler 已调用 writer.send()）：
+            // 清 sse_handler，sseOnEventSent 看到 null 后关闭。
+            conn.sse_handler = null;
+        }
+    }
+    // keep_going=true 且没有 send：handler 应由外部事件（定时器）触发下一次 pump。
 }
 
 /// SseVtable 实现：推送一个 event。
@@ -828,12 +858,18 @@ fn sseOnEventSent(loop: *Loop, c: *Completion) void {
     conn.send_wire = &.{};
     _ = conn.send.getResult() catch { destroyConn(conn); return; };
     conn.state = .sse;
+    if (conn.sse_handler == null) { destroyConn(conn); return; }
     ssePump(conn);
 }
 
 fn sseClose(ptr: *anyopaque) void {
     const conn: *Connection = @ptrCast(@alignCast(ptr));
-    destroyConn(conn);
+    if (conn.state == .sending) {
+        // 发送在飞，推迟到 sseOnEventSent
+        conn.sse_handler = null;
+    } else {
+        destroyConn(conn);
+    }
 }
 
 const sse_vtable = types.SseVtable{
@@ -842,16 +878,15 @@ const sse_vtable = types.SseVtable{
 };
 
 fn serveFile(conn: *Connection, response: Response, keep_alive: bool) void {
-    const owned = response.file_path_owned;
+    // file_path 若由 handler 用 ctx.gpa 分配，已由每请求 arena 统一回收；
+    // 这里只复制到内联缓冲，不做 free（避免把 arena 内存交还给底层分配器）。
     const src = response.file_path;
     if (src.len == 0 or src.len >= conn.file_path_buf.len) {
-        if (owned) conn.alloc.free(@constCast(src));
         respond(conn, .{ .status = .internal_server_error, .body = "bad file path\n" }, false);
         return;
     }
     @memcpy(conn.file_path_buf[0..src.len], src);
     const path = conn.file_path_buf[0..src.len];
-    if (owned) conn.alloc.free(@constCast(src));
 
     const size = conn.loop.fileSize(path) catch {
         respond(conn, .{ .status = .not_found, .body = "not found\n" }, keep_alive);
@@ -1066,6 +1101,7 @@ fn releaseConn(conn: *Connection) void {
     if (server) |s| unregisterConn(s, conn);
     if (conn.file_buf.len != 0) conn.alloc.free(conn.file_buf);
     if (conn.send_owned) |b| conn.alloc.free(b);
+    if (conn.arena) |*a| a.deinit();
     const alloc = conn.alloc;
     alloc.destroy(conn);
     // 腾出名额：若之前因容量上限停掉了 accept，这里恢复。
@@ -1488,4 +1524,342 @@ test "drainOpen 停机后关闭在飞连接并回收内存" {
 
     H.done.store(true, .release);
     cli.join();
+}
+
+// ============================================================================
+// WebSocket / SSE / metrics 测试
+// ============================================================================
+
+/// 提取握手 Accept 计算，供测试和 wsUpgrade 共用。
+fn wsComputeAccept(key: []const u8, out: *[32]u8) []const u8 {
+    var sha = std.crypto.hash.Sha1.init(.{});
+    sha.update(key);
+    sha.update(WS_MAGIC);
+    var digest: [20]u8 = undefined;
+    sha.final(&digest);
+    return std.base64.standard.Encoder.encode(out, &digest);
+}
+
+test "WS 握手 Accept 值符合 RFC 6455 §1.3 测试向量" {
+    // RFC 6455 §1.3 规定的标准测试向量
+    // key = "dGhlIHNhbXBsZSBub25jZQ==" → accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+    var buf: [32]u8 = undefined;
+    const accept = wsComputeAccept("dGhlIHNhbXBsZSBub25jZQ==", &buf);
+    try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", accept);
+}
+
+test "WS 完整握手：客户端发 Upgrade 请求，服务端回 101 + 正确 Accept" {
+    if (@import("builtin").os.tag == .windows) try mox_io.platform.startup();
+    const alloc = std.heap.page_allocator;
+
+    const S = struct {
+        var got: [1024]u8 = undefined;
+        var got_len: usize = 0;
+        var done: std.atomic.Value(bool) = .init(false);
+
+        fn wsHandler(_: types.WsConn, _: types.WsMessage) void {}
+
+        fn handler(ctx: *Context) !Response {
+            _ = ctx;
+            return Response.upgrade(wsHandler);
+        }
+
+        fn client(addr: std.Io.net.IpAddress) void {
+            const s = mox_io.platform.createTcpSocket(addr) catch return;
+            defer mox_io.platform.closeSocket(s);
+            mox_io.platform.connectSocket(s, addr) catch return;
+            const req =
+                "GET /ws HTTP/1.1\r\n" ++
+                "Host: localhost\r\n" ++
+                "Upgrade: websocket\r\n" ++
+                "Connection: Upgrade\r\n" ++
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+                "Sec-WebSocket-Version: 13\r\n" ++
+                "\r\n";
+            _ = mox_io.platform.sendBlocking(s, req) catch return;
+            var n: usize = 0;
+            while (n < got.len) {
+                const r = mox_io.platform.recvBlocking(s, got[n..]) catch break;
+                if (r == 0) break;
+                n += r;
+                // 收到 "\r\n\r\n" 结尾即可
+                if (std.mem.indexOf(u8, got[0..n], "\r\n\r\n") != null) break;
+            }
+            got_len = n;
+            done.store(true, .release);
+        }
+
+        fn tick(loop: *Loop, c: *Completion) void {
+            const t: *mox_io.Timer = @fieldParentPtr("c", c);
+            if (done.load(.acquire)) { loop.stop(); return; }
+            t.* = mox_io.Timer.init(20);
+            t.c.callback = tick;
+            loop.add(&t.c);
+        }
+    };
+
+    const l = try testListen();
+    const listener = l[0];
+    const bound = l[1];
+    defer mox_io.platform.closeSocket(listener);
+    S.done.store(false, .release);
+    S.got_len = 0;
+
+    const cli = try std.Thread.spawn(.{}, S.client, .{bound});
+    defer cli.join();
+
+    const accepted = try mox_io.platform.acceptSocket(listener);
+    defer mox_io.platform.closeSocket(accepted.socket);
+
+    var loop = try mox_io.open(alloc);
+    defer loop.deinit();
+    try loop.associate(accepted.socket, 1);
+
+    var router = try Router.init(alloc, &.{
+        .{ .method = .GET, .path = "/ws", .handler = S.handler },
+    });
+    defer router.deinit();
+
+    const conn = try alloc.create(Connection);
+    conn.* = .{ .alloc = alloc, .loop = &loop, .router = &router, .socket = accepted.socket };
+    postRecv(conn);
+
+    var hb = mox_io.Timer.init(20);
+    hb.c.callback = S.tick;
+    loop.add(&hb.c);
+    try loop.run();
+
+    const resp = S.got[0..S.got_len];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "101") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Upgrade: websocket") != null);
+}
+
+test "SSE 响应头包含 text/event-stream 且推送首条事件" {
+    if (@import("builtin").os.tag == .windows) try mox_io.platform.startup();
+    const alloc = std.heap.page_allocator;
+
+    const S = struct {
+        var got: [2048]u8 = undefined;
+        var got_len: usize = 0;
+        var done: std.atomic.Value(bool) = .init(false);
+
+        fn sseHandler(w: types.SseWriter) bool {
+            w.send("msg", "hello-sse");
+            w.close();
+            return false;
+        }
+        fn handler(ctx: *Context) !Response {
+            _ = ctx;
+            return Response.sse(sseHandler);
+        }
+        fn client(addr: std.Io.net.IpAddress) void {
+            const s = mox_io.platform.createTcpSocket(addr) catch return;
+            defer mox_io.platform.closeSocket(s);
+            mox_io.platform.connectSocket(s, addr) catch return;
+            const req = "GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            _ = mox_io.platform.sendBlocking(s, req) catch return;
+            var n: usize = 0;
+            while (n < got.len) {
+                const r = mox_io.platform.recvBlocking(s, got[n..]) catch break;
+                if (r == 0) break;
+                n += r;
+                if (std.mem.indexOf(u8, got[0..n], "hello-sse") != null) break;
+            }
+            got_len = n;
+            done.store(true, .release);
+        }
+        fn tick(loop: *Loop, c: *Completion) void {
+            const t: *mox_io.Timer = @fieldParentPtr("c", c);
+            if (done.load(.acquire)) { loop.stop(); return; }
+            t.* = mox_io.Timer.init(20);
+            t.c.callback = tick;
+            loop.add(&t.c);
+        }
+    };
+
+    const l = try testListen();
+    const listener = l[0];
+    const bound = l[1];
+    defer mox_io.platform.closeSocket(listener);
+    S.done.store(false, .release);
+    S.got_len = 0;
+
+    const cli = try std.Thread.spawn(.{}, S.client, .{bound});
+    defer cli.join();
+
+    const accepted = try mox_io.platform.acceptSocket(listener);
+    defer mox_io.platform.closeSocket(accepted.socket);
+
+    var loop = try mox_io.open(alloc);
+    defer loop.deinit();
+    try loop.associate(accepted.socket, 1);
+
+    var router = try Router.init(alloc, &.{
+        .{ .method = .GET, .path = "/events", .handler = S.handler },
+    });
+    defer router.deinit();
+
+    const conn = try alloc.create(Connection);
+    conn.* = .{ .alloc = alloc, .loop = &loop, .router = &router, .socket = accepted.socket };
+    postRecv(conn);
+
+    var hb = mox_io.Timer.init(20);
+    hb.c.callback = S.tick;
+    loop.add(&hb.c);
+    try loop.run();
+
+    const resp = S.got[0..S.got_len];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "text/event-stream") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "data: hello-sse") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "event: msg") != null);
+}
+
+test "metrics 计数器在每次请求后递增" {
+    if (@import("builtin").os.tag == .windows) try mox_io.platform.startup();
+    const alloc = std.heap.page_allocator;
+
+    // 记录基线（可能其他测试已经累积了请求）
+    const before = getMetrics().total_requests;
+
+    const S = struct {
+        var done: std.atomic.Value(bool) = .init(false);
+        fn handler(ctx: *Context) !Response {
+            _ = ctx;
+            return .{ .body = "ok\n" };
+        }
+        fn client(addr: std.Io.net.IpAddress) void {
+            const s = mox_io.platform.createTcpSocket(addr) catch return;
+            defer mox_io.platform.closeSocket(s);
+            mox_io.platform.connectSocket(s, addr) catch return;
+            const req = "GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            _ = mox_io.platform.sendBlocking(s, req) catch return;
+            var tmp: [256]u8 = undefined;
+            _ = mox_io.platform.recvBlocking(s, &tmp) catch {};
+            done.store(true, .release);
+        }
+        fn tick(loop: *Loop, c: *Completion) void {
+            const t: *mox_io.Timer = @fieldParentPtr("c", c);
+            if (done.load(.acquire)) { loop.stop(); return; }
+            t.* = mox_io.Timer.init(20);
+            t.c.callback = tick;
+            loop.add(&t.c);
+        }
+    };
+
+    const l = try testListen();
+    const listener = l[0];
+    const bound = l[1];
+    defer mox_io.platform.closeSocket(listener);
+    S.done.store(false, .release);
+
+    const cli = try std.Thread.spawn(.{}, S.client, .{bound});
+    defer cli.join();
+
+    const accepted = try mox_io.platform.acceptSocket(listener);
+    defer mox_io.platform.closeSocket(accepted.socket);
+
+    var loop = try mox_io.open(alloc);
+    defer loop.deinit();
+    try loop.associate(accepted.socket, 1);
+
+    var router = try Router.init(alloc, &.{
+        .{ .method = .GET, .path = "/ping", .handler = S.handler },
+    });
+    defer router.deinit();
+
+    const conn = try alloc.create(Connection);
+    conn.* = .{ .alloc = alloc, .loop = &loop, .router = &router, .socket = accepted.socket };
+    postRecv(conn);
+
+    var hb = mox_io.Timer.init(20);
+    hb.c.callback = S.tick;
+    loop.add(&hb.c);
+    try loop.run();
+
+    const after = getMetrics().total_requests;
+    try std.testing.expect(after > before);
+}
+
+// 每请求 arena 回归测试：handler 通过 ctx.gpa 分配（problem() 的 JSON body、
+// setCookieHeader 的头值、自定义 allocPrint）。整个连接生命周期用
+// std.testing.allocator 记账，若框架没回收 arena，测试会因泄漏而失败。
+test "每请求 arena 回收 ctx.gpa 分配，无泄漏" {
+    if (@import("builtin").os.tag == .windows) try mox_io.platform.startup();
+    const alloc = std.testing.allocator;
+
+    const S = struct {
+        var done: std.atomic.Value(bool) = .init(false);
+
+        fn handler(ctx: *Context) !Response {
+            // 走 problem()：valueAlloc 用 ctx.gpa 分配 JSON body
+            var resp = try types.problem(ctx.gpa, .bad_request, "bad", "detail");
+            // 再分配一个 Set-Cookie 头 + headers 数组，全部走 ctx.gpa
+            const ck = try types.setCookieHeader(ctx.gpa, "sid", "abc", .{});
+            const hdrs = try ctx.gpa.alloc(types.Header, 1);
+            hdrs[0] = ck;
+            resp.headers = hdrs;
+            return resp;
+        }
+        fn client(addr: std.Io.net.IpAddress) void {
+            const s = mox_io.platform.createTcpSocket(addr) catch return;
+            defer mox_io.platform.closeSocket(s);
+            mox_io.platform.connectSocket(s, addr) catch return;
+            const req = "GET /leak HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            _ = mox_io.platform.sendBlocking(s, req) catch return;
+            var tmp: [512]u8 = undefined;
+            _ = mox_io.platform.recvBlocking(s, &tmp) catch {};
+            done.store(true, .release);
+        }
+        fn tick(loop: *Loop, c: *Completion) void {
+            const t: *mox_io.Timer = @fieldParentPtr("c", c);
+            if (done.load(.acquire)) { loop.stop(); return; }
+            t.* = mox_io.Timer.init(20);
+            t.c.callback = tick;
+            loop.add(&t.c);
+        }
+    };
+
+    const l = try testListen();
+    const listener = l[0];
+    const bound = l[1];
+    defer mox_io.platform.closeSocket(listener);
+    S.done.store(false, .release);
+
+    const cli = try std.Thread.spawn(.{}, S.client, .{bound});
+    defer cli.join();
+
+    const accepted = try mox_io.platform.acceptSocket(listener);
+
+    var loop = try mox_io.open(alloc);
+    defer loop.deinit();
+    try loop.associate(accepted.socket, 1);
+
+    var router = try Router.init(alloc, &.{
+        .{ .method = .GET, .path = "/leak", .handler = S.handler },
+    });
+    defer router.deinit();
+
+    var srv = Server{
+        .alloc = alloc,
+        .loop = &loop,
+        .router = &router,
+        .address = bound,
+        .listener = listener,
+        .idle_timeout_ms = 0,
+        .shutting_down = true, // 不恢复 accept
+    };
+    const conn = try alloc.create(Connection);
+    conn.* = .{ .alloc = alloc, .loop = &loop, .router = &router, .socket = accepted.socket };
+    registerConn(&srv, conn);
+    postRecv(conn);
+
+    var hb = mox_io.Timer.init(20);
+    hb.c.callback = S.tick;
+    loop.add(&hb.c);
+    try loop.run();
+
+    // 驱动收尾完成包，确保连接对象与 arena 都已释放。
+    loop.drainOpen(2000, @ptrCast(&srv), Server.allClosed);
+    try std.testing.expectEqual(@as(usize, 0), srv.active_conns);
 }

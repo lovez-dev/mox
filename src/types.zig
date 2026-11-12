@@ -41,10 +41,9 @@ pub const Response = struct {
     /// 额外响应头（调用方拥有生命周期，仅在响应写出期间有效）。
     headers: []const Header = &.{},
     /// 设置后，文件内容在 `Work` 池线程读取并作为 body 发送，
-    /// 此时忽略 `body`。路径会被复制，故该切片无需活过处理器调用。
+    /// 此时忽略 `body`。路径会被复制到每连接内联缓冲，切片可用 ctx.gpa
+    /// 分配（由每请求 arena 统一回收），无需活过处理器调用。
     file_path: []const u8 = "",
-    /// `file_path` 由处理器堆分配时置位（由 mox 释放）。
-    file_path_owned: bool = false,
     /// WebSocket handler 函数指针（由 server.zig 解释）。
     ws_handler: ?WsHandler = null,
     /// SSE handler 函数指针（由 server.zig 解释）。
@@ -59,9 +58,9 @@ pub const Response = struct {
     }
 
     /// 编译期 URL 重定向（适用于 URL 是常量的场景）。
-    /// 运行时 URL 场景：直接构造
-    ///   `var hdrs = [_]Header{.{ .name = "location", .value = url }};`
-    ///   `return .{ .status = s, .headers = &hdrs };`
+    /// 运行时 URL：Header 值若由 ctx.gpa 分配，可放在 ctx 上或每请求 arena 中；
+    /// 直接返回指向栈局部数组的切片会在 handler 返回后悬垂，不要这样做。
+    /// 可用 `mox.setCookieHeader` 之外的自定义头构造，或提前在 ctx 生命周期内组装。
     pub fn redirect(comptime url: []const u8, status: std.http.Status) Response {
         // 利用匿名 struct 把 headers 数组存入静态区，确保指针生命周期。
         const S = struct {
@@ -76,8 +75,8 @@ pub const Response = struct {
         return .{ .ws_handler = handler };
     }
 
-    /// 触发 SSE 流。handler 返回此值后，mox 发出 SSE 头，
-    /// 然后反复调用 `sse_handler`（每次传入一个 `SseWriter`）直到 handler 返回 false。
+    /// 触发 SSE 流。发出 SSE 头后调用一次 handler（每次 send 的完成回调会再 pump）。
+    /// 已知缺口：只是返回 true 而没有 send 时，无定时/外部事件再次触发，见 README。
     pub fn sse(handler: SseHandler) Response {
         return .{ .sse_handler = handler };
     }
@@ -149,7 +148,9 @@ pub const SseVtable = struct {
     close: *const fn (ptr: *anyopaque) void,
 };
 
-/// SSE handler 签名：服务端推送时反复调用；返回 false 表示流结束。
+/// SSE handler 签名：返回 false 表示流结束。
+/// 当前实现仅保证首次调用；返回 true 须配合本次调用内的 `writer.send()`
+/// 才能触发下一次（见 server.zig 的 ssePump 缺口说明）。
 pub const SseHandler = *const fn (writer: SseWriter) bool;
 
 /// 交给每个处理器与中间件的单次请求状态，仅在调用期间有效。
@@ -178,7 +179,9 @@ pub const Context = struct {
         return null;
     }
 
-    /// 把请求体解析为 JSON 类型 `T`。调用方负责 `parsed.deinit()`。
+    /// 把请求体解析为 JSON 类型 `T`。返回 `std.json.Parsed(T)`；
+    /// 在 mox 服务中其 arena 由每请求的 ctx.gpa 支撑，调用 `.deinit()` 无害，
+    /// 不调用也会在请求结束时由框架统一回收。
     pub fn json(self: *const Context, comptime T: type) !std.json.Parsed(T) {
         return std.json.parseFromSlice(T, self.gpa, self.body, .{});
     }
@@ -193,6 +196,22 @@ pub const Context = struct {
             if (std.mem.eql(u8, k, name)) return part[eq + 1 ..];
         }
         return null;
+
+    }
+
+    /// 读取必填路径参数；不存在则返回 error.MissingParam。
+    pub fn requireParam(self: *const Context, name: []const u8) ![]const u8 {
+        return self.param(name) orelse error.MissingParam;
+    }
+
+    /// 读取必填查询参数；不存在则返回 error.MissingQuery。
+    pub fn requireQuery(self: *const Context, name: []const u8) ![]const u8 {
+        return self.query(name) orelse error.MissingQuery;
+    }
+
+    /// 读取必填请求头；不存在则返回 error.MissingHeader。
+    pub fn requireHeader(self: *const Context, name: []const u8) ![]const u8 {
+        return self.request.header(name) orelse error.MissingHeader;
     }
 };
 
@@ -204,8 +223,8 @@ pub const Handler = *const fn (*Context) anyerror!Response;
 // ============================================================================
 
 /// RFC 9457 结构化错误响应。
-/// `body` 字段由 `ctx.gpa` 分配，调用方负责 `gpa.free(response.body)`。
-/// 推荐搭配 `error_handler` 或 `Context.problem()` 使用。
+/// `body` 由传入的 gpa 分配。在 mox 服务中 `ctx.gpa` 是每请求 arena，
+/// 由框架在下次请求/连接关闭时统一回收，**调用方不要 free**。
 pub fn problem(
     gpa: std.mem.Allocator,
     status: std.http.Status,
@@ -250,11 +269,15 @@ pub const CookieOptions = struct {
     max_age: ?i64 = null,
 };
 
-/// 构建 `set-cookie` 响应头（值由 `gpa` 分配，调用方负责释放）。
+/// 构建 `set-cookie` 响应头。值由 gpa 分配；在 mox 服务中 `ctx.gpa` 是每请求
+/// arena，由框架统一回收，**调用方不要 free**（提前 free 会让响应头悬垂）。
 ///
-///     var sc_hdr = try mox.setCookieHeader(ctx.gpa, "session", token, .{});
-///     defer ctx.gpa.free(sc_hdr.value);
-///     return .{ .headers = &.{sc_hdr} };
+/// 示例（headers 数组必须由 ctx.gpa 分配，不能用栈局部数组——handler
+/// 返回后 respond() 才读它）：
+///     const sc_hdr = try mox.setCookieHeader(ctx.gpa, "session", token, .{});
+///     const hdrs = try ctx.gpa.alloc(mox.Header, 1);
+///     hdrs[0] = sc_hdr;
+///     return .{ .headers = hdrs, .body = "logged in\n" };
 pub fn setCookieHeader(
     gpa: std.mem.Allocator,
     name: []const u8,

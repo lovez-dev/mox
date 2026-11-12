@@ -86,6 +86,180 @@ pub fn main() !void {
 路由是 gin 风格的段前缀树：支持 `:param` 与 `*wildcard`，在编译期展开匹配。
 中间件形状是 `fn (next: Handler) Handler`，由 `mox.compose` 在编译期折叠。
 
+
+## Web 框架 API
+
+### 请求上下文（Context）
+
+```zig
+ctx.param("name")          // 路径参数  ?[]const u8
+ctx.query("page")          // 查询参数  ?[]const u8（零拷贝）
+ctx.body                   // 请求体    []const u8（零拷贝）
+ctx.request.header("x-token") // 请求头
+ctx.json(MyStruct)         // 解析 JSON → std.json.Parsed(T)（框架在请求末统一回收）
+ctx.cookie("session")      // 读 Cookie  ?[]const u8（零拷贝）
+
+// 必填版本（缺失时返回对应 error）
+try ctx.requireParam("id")   // error.MissingParam
+try ctx.requireQuery("q")    // error.MissingQuery
+try ctx.requireHeader("auth")// error.MissingHeader
+```
+
+### 响应
+
+```zig
+// 纯文本
+return .{ .body = "ok\n" };
+
+// 自定义状态码 + 头（编译期常量数组在静态区，安全）
+return .{
+    .status = .created,
+    .headers = &.{ .{ .name = "x-custom", .value = "1" } },
+    .body = "created\n",
+};
+
+// JSON（由上层序列化）
+const out = try std.json.Stringify.valueAlloc(ctx.gpa, value, .{});
+return mox.Response.withJson(out);
+
+// 文件（内存 VFS 或磁盘）
+return .{ .file_path = "/static/index.html", .content_type = "text/html" };
+
+// RFC 9457 Problem Details
+return try mox.problem(ctx.gpa, .bad_request, "Bad input", "field 'email' is invalid");
+
+// WebSocket 升级
+return mox.Response.upgrade(myWsHandler);
+
+// Server-Sent Events
+return mox.Response.sse(mySseHandler);
+
+// Set-Cookie（headers 数组须由 ctx.gpa 分配，栈局部数组在 handler 返回后悬垂）
+const ck = try mox.setCookieHeader(ctx.gpa, "session", tok, .{ .http_only = true });
+const hdrs = try ctx.gpa.alloc(mox.Header, 1);
+hdrs[0] = ck;
+return .{ .headers = hdrs, .body = "logged in\n" };
+```
+
+### 中间件
+
+```zig
+// 内置中间件
+mox.logging               // 请求日志（stderr）
+mox.jsonLog               // JSON Lines 格式日志
+mox.cors(.{               // CORS
+    .allow_origins = &.{"https://example.com"},
+    .allow_credentials = true,
+})
+// 请求超时由 Config.request_timeout_ms 统一配置，无独立 timeout 中间件
+mox.requireHeader("authorization", "Bearer secret")
+mox.rateLimit(.{          // 限流（comptime 静态桶）
+    .window_ms = 60_000,
+    .max_requests = 100,
+})
+mox.staticDir("/public/") // 终结 Handler：须挂在 /static/*path 路由上
+mox.requestId             // 添加 X-Request-Id 响应头
+mox.bodyLimit(1024 * 1024)// 请求体大小限制（1 MB → 413）
+mox.cache(3600)           // Cache-Control: public, max-age=N（2xx 响应）
+
+// compose 多个中间件
+const app = mox.compose(.{
+    mox.requestId,
+    mox.cors(.{}),
+    mox.bodyLimit(1024 * 1024),
+}, myHandler);
+```
+
+### 路由分组与前缀
+
+```zig
+const api = mox.group("/api/v1", &.{
+    .{ .method = .GET,  .path = "/users",     .handler = listUsers },
+    .{ .method = .POST, .path = "/users",     .handler = createUser },
+    .{ .method = .GET,  .path = "/users/:id", .handler = getUser },
+});
+const admin = mox.group("/admin", &.{
+    .{ .method = .GET, .path = "/metrics", .handler = mox.metricsHandler },
+});
+// 合并为一个切片
+const routes = mox.routes(.{ api, admin });
+try mox.serve(.{ .gpa = gpa, .address = addr, .routes = routes });
+```
+
+### WebSocket
+
+```zig
+fn wsHandler(conn: mox.WsConn, msg: mox.WsMessage) void {
+    if (msg.opcode == .text) {
+        conn.sendText(msg.data); // 回显（字段是 data，不是 payload）
+    }
+}
+fn handler(ctx: *mox.Context) !mox.Response {
+    _ = ctx;
+    return mox.Response.upgrade(wsHandler);
+}
+```
+
+### SSE（Server-Sent Events）
+
+```zig
+fn sseHandler(w: mox.SseWriter) bool {
+    w.send("update", "data payload");
+    w.close();      // 结束流
+    return false;   // 当前实现的 pump 无定时/外部触发，返回 true 不会再次调用
+}
+fn handler(ctx: *mox.Context) !mox.Response {
+    _ = ctx;
+    return mox.Response.sse(sseHandler);
+}
+```
+
+**已知能力缺口**：当前 SSE 只会在 HTTP 头发完后调用一次 handler。若 handler
+返回 `true` 且本次没有 `w.send()`，没有定时器或外部事件会再次触发推送，连接会
+一直挂着。需要持续推送的场景，请在一次 handler 调用内连续 `w.send()`（每次
+send 的完成回调会重新 pump），或等后续版本提供 tick 钩子。不要按"自动循环"
+来理解 `true`。
+
+### Multipart
+
+```zig
+fn upload(ctx: *mox.Context) !mox.Response {
+    const ct = ctx.request.header("content-type") orelse "";
+    const boundary = mox.extractBoundary(ct) orelse "";
+    var buf: [mox.multipart.max_parts]mox.Multipart = undefined;
+    const n = try mox.parseMultipart(ctx.body, boundary, &buf);
+    for (buf[0..n]) |part| {
+        std.debug.print("field={s} len={d}\n", .{ part.name, part.data.len });
+    }
+    return .{ .body = "ok\n" };
+}
+```
+
+### 请求指标
+
+```zig
+// 在任意 handler 或定时器中读取快照
+const m = mox.getMetrics();
+// m.total_requests  m.total_errors  m.active_conns
+
+// 直接注册为路由
+.{ .method = .GET, .path = "/metrics", .handler = mox.metricsHandler }
+```
+
+### 服务器配置
+
+```zig
+try mox.serve(.{
+    .gpa           = gpa,
+    .address       = try std.Io.net.IpAddress.parse("0.0.0.0", 8080),
+    .routes        = routes,
+    .max_connections    = 4096,          // 默认 1024
+    .max_body_size      = 4 * 1024 * 1024, // 默认 4 MB
+    .idle_timeout_ms    = 30_000,        // 默认 60s
+    .request_timeout_ms = 10_000,        // 默认 30s
+});
+```
+
 ## I/O 模型
 
 ```

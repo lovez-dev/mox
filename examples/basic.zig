@@ -20,7 +20,7 @@ fn staticFile(ctx: *mox.Context) anyerror!mox.Response {
     const sub = ctx.param("path") orelse
         return .{ .status = .not_found, .body = "not found\n" };
     const path = try std.fmt.allocPrint(ctx.gpa, "public{s}", .{sub});
-    return .{ .file_path = path, .file_path_owned = true, .content_type = ctypeFor(sub) };
+    return .{ .file_path = path, .content_type = ctypeFor(sub) };
 }
 
 fn hello(ctx: *mox.Context) anyerror!mox.Response {
