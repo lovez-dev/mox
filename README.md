@@ -293,7 +293,7 @@ try mox.serve(.{
 | 能力 | 现状 |
 |---|---|
 | 请求体 `Content-Length` | 支持；超出 `max_body_size` 返回 413；重复 `Content-Length` 返回 400 |
-| `Transfer-Encoding: chunked` 请求 | **不支持**，解析器识别后返回 501 |
+| `Transfer-Encoding: chunked` 请求 | **支持**。流式解码，可跨多次 `recv` 累积（请求体不受 8 KB 缓冲区限制）；上限仍受 `max_body_size` 约束，畸形编码返回 400 |
 | HTTP pipelining | **支持**。一次 `recv` 里的多个请求按序处理，响应同序返回；剩余字节在本次响应发完后继续解析 |
 | `HEAD` | **支持**。未注册 HEAD 时自动回退到 GET handler，只发头部、不发 body，`content-length` 仍是真实长度 |
 | `Expect: 100-continue` | 未实现 |

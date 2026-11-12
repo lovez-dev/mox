@@ -5,8 +5,9 @@
 //! 是按 `recv` 分块到达而非字节流。因此 mox 直接
 //! 从接收缓冲里解析请求。
 //!
-//! 当前范围：每次解析一个请求、仅 `Content-Length` 请求体，
-//! 不支持分块传输编码（收到 chunked 请求标记后由上层返回 501）。
+//! 支持 `Content-Length` 与 `Transfer-Encoding: chunked` 两种请求体。
+//! chunked 由 `decodeChunked` 单独解码（因为它是流式的：可能需要多次
+//! `recv` 才能凑够一个请求），解码结果由调用方分配。
 const std = @import("std");
 
 /// 请求头（请求行 + 头部）的上限。客户端若在未结束头部前
@@ -124,6 +125,95 @@ pub fn parseWithLimit(buf: []const u8, max_body_size: usize) ParseResult {
         .chunked = chunked,
         .consumed = body_start + content_length,
     } };
+}
+
+
+/// chunked 请求体解码结果。
+pub const ChunkedResult = union(enum) {
+    /// 字节还不够，需要继续 recv 后重试（不分配任何内存）。
+    incomplete,
+    /// 解码完成。`body` 由调用方传入的 allocator 分配，调用方负责释放；
+    /// `consumed` 是 `input` 里被本次请求占用的字节数（含结尾的 trailer 与空行）。
+    done: struct { body: []u8, consumed: usize },
+    /// 格式错误（块长度不是合法十六进制、缺 CRLF、缺少结尾 0 块等）。
+    malformed,
+    /// 解码后长度超过 `max_body_size`。
+    body_too_large,
+};
+
+/// 解码 `Transfer-Encoding: chunked` 的请求体。
+///
+/// `input` 从**第一个块长度行**开始（即头部 `\r\n\r\n` 之后的位置）。
+/// 这是流式解码：`input` 里可能只有部分块，此时返回 `.incomplete`，
+/// 调用方继续 recv 追加字节后重试。只有凑够完整请求才会分配内存。
+///
+/// 格式（RFC 9112 §7.1）：
+/// ```text
+/// chunk-size [chunk-ext] CRLF
+/// chunk-data CRLF
+/// ...
+/// 0 [chunk-ext] CRLF
+/// trailer-part CRLF        ; 可为空，即紧接一个 CRLF
+/// ```
+/// `chunk-ext` 与 `trailer-part` 会被跳过（不解析、不保留）。
+pub fn decodeChunked(
+    gpa: std.mem.Allocator,
+    input: []const u8,
+    max_body_size: usize,
+) ChunkedResult {
+    // 第一遍：只扫描结构、算总长度，不分配。这样 `.incomplete` 路径零成本，
+    // 也能在分配之前就拒绝超限的请求体。
+    var total: usize = 0;
+    var pos: usize = 0;
+    while (true) {
+        const line_end = std.mem.indexOfPos(u8, input, pos, "\r\n") orelse return .incomplete;
+        const size_line = input[pos..line_end];
+        // 块长度是十六进制；`;` 之后是 chunk-ext，忽略。
+        const size_str = if (std.mem.indexOfScalar(u8, size_line, ';')) |semi|
+            size_line[0..semi]
+        else
+            size_line;
+        const size = std.fmt.parseInt(usize, std.mem.trim(u8, size_str, " \t"), 16) catch
+            return .malformed;
+        pos = line_end + 2;
+
+        if (size == 0) {
+            // 最后一个块：跳过 trailer-part（若干 header 行）直到空行。
+            // 空行可能是紧接的 "\r\n"，也可能在若干 trailer 之后。
+            while (true) {
+                const t_end = std.mem.indexOfPos(u8, input, pos, "\r\n") orelse return .incomplete;
+                if (t_end == pos) { // 空行 → trailer 结束
+                    pos = t_end + 2;
+                    break;
+                }
+                pos = t_end + 2;
+            }
+            // 第二遍：按精确长度分配并拷贝数据。
+            const body = gpa.alloc(u8, total) catch return .body_too_large;
+            errdefer gpa.free(body);
+            var w: usize = 0;
+            var rpos: usize = 0;
+            while (true) {
+                const le = std.mem.indexOfPos(u8, input, rpos, "\r\n").?;
+                const sl = input[rpos..le];
+                const ss = if (std.mem.indexOfScalar(u8, sl, ';')) |semi| sl[0..semi] else sl;
+                const sz = std.fmt.parseInt(usize, std.mem.trim(u8, ss, " \t"), 16) catch unreachable;
+                rpos = le + 2;
+                if (sz == 0) break;
+                @memcpy(body[w .. w + sz], input[rpos .. rpos + sz]);
+                w += sz;
+                rpos += sz + 2; // 跳过块数据后的 CRLF
+            }
+            return .{ .done = .{ .body = body, .consumed = pos } };
+        }
+
+        // 块数据 + 结尾 CRLF 必须完整到达。
+        if (pos + size + 2 > input.len) return .incomplete;
+        if (!std.mem.eql(u8, input[pos + size .. pos + size + 2], "\r\n")) return .malformed;
+        total += size;
+        if (total > max_body_size) return .body_too_large;
+        pos += size + 2;
+    }
 }
 
 /// 供 `http.serialize` 使用的响应描述。
@@ -321,4 +411,89 @@ test "serialize head_only 保留 content-length 但不写 body" {
     try std.testing.expect(std.mem.indexOf(u8, head_text, "hello") == null);
     // 头部部分与 GET 完全一致（只少了 body）。
     try std.testing.expect(std.mem.startsWith(u8, get_text, head_text));
+}
+
+// ---- chunked 解码测试 ------------------------------------------------------
+
+test "decodeChunked 基本解码" {
+    const gpa = std.testing.allocator;
+    // "Wiki" + "pedia" + " in\r\n\r\nchunks."
+    const raw = "4\r\nWiki\r\n5\r\npedia\r\nE\r\n in\r\n\r\nchunks.\r\n0\r\n\r\n";
+    const r = decodeChunked(gpa, raw, 1024 * 1024);
+    try std.testing.expect(r == .done);
+    defer gpa.free(r.done.body);
+    try std.testing.expectEqualStrings("Wikipedia in\r\n\r\nchunks.", r.done.body);
+    try std.testing.expectEqual(raw.len, r.done.consumed);
+}
+
+test "decodeChunked 跳过 chunk-ext 与 trailer" {
+    const gpa = std.testing.allocator;
+    // 块长度带扩展参数，结尾带一个 trailer header
+    const raw = "5;name=value\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n";
+    const r = decodeChunked(gpa, raw, 1024);
+    try std.testing.expect(r == .done);
+    defer gpa.free(r.done.body);
+    try std.testing.expectEqualStrings("hello", r.done.body);
+    try std.testing.expectEqual(raw.len, r.done.consumed);
+}
+
+test "decodeChunked 空 body（只有 0 块）" {
+    const gpa = std.testing.allocator;
+    const raw = "0\r\n\r\n";
+    const r = decodeChunked(gpa, raw, 1024);
+    try std.testing.expect(r == .done);
+    defer gpa.free(r.done.body);
+    try std.testing.expectEqual(@as(usize, 0), r.done.body.len);
+    try std.testing.expectEqual(@as(usize, 5), r.done.consumed);
+}
+
+test "decodeChunked 大小写十六进制" {
+    const gpa = std.testing.allocator;
+    // a = 10 字节，大写 A 也要认
+    const raw = "A\r\n0123456789\r\n0\r\n\r\n";
+    const r = decodeChunked(gpa, raw, 1024);
+    try std.testing.expect(r == .done);
+    defer gpa.free(r.done.body);
+    try std.testing.expectEqualStrings("0123456789", r.done.body);
+}
+
+test "decodeChunked 数据不全返回 incomplete（不分配）" {
+    const gpa = std.testing.allocator;
+    // 块长度行完整但数据没到齐：必须返回 incomplete，且 testing.allocator
+    // 会证明这条路径一次分配都没有。
+    try std.testing.expect(decodeChunked(gpa, "5\r\nhel", 1024) == .incomplete);
+    try std.testing.expect(decodeChunked(gpa, "5\r\nhello", 1024) == .incomplete); // 缺结尾 CRLF
+    try std.testing.expect(decodeChunked(gpa, "5", 1024) == .incomplete); // 连长度行都没完
+    try std.testing.expect(decodeChunked(gpa, "0\r\n", 1024) == .incomplete); // trailer 空行没到
+}
+
+test "decodeChunked 畸形输入返回 malformed" {
+    const gpa = std.testing.allocator;
+    // 非十六进制块长度
+    try std.testing.expect(decodeChunked(gpa, "zz\r\nhello\r\n0\r\n\r\n", 1024) == .malformed);
+    // 块数据后缺 CRLF
+    try std.testing.expect(decodeChunked(gpa, "5\r\nhelloXX0\r\n\r\n", 1024) == .malformed);
+}
+
+test "decodeChunked 超过上限返回 body_too_large" {
+    const gpa = std.testing.allocator;
+    // 两个 10 字节块，上限设 15 → 第二块超限
+    const raw = "A\r\n0123456789\r\nA\r\n0123456789\r\n0\r\n\r\n";
+    try std.testing.expect(decodeChunked(gpa, raw, 15) == .body_too_large);
+    // 上限刚好够
+    const ok = decodeChunked(gpa, raw, 20);
+    try std.testing.expect(ok == .done);
+    defer gpa.free(ok.done.body);
+    try std.testing.expectEqual(@as(usize, 20), ok.done.body.len);
+}
+
+test "decodeChunked 返回的 body 可被 allocator 正常释放" {
+    const gpa = std.testing.allocator;
+    // 回归：第一版按输入长度分配却返回缩短切片，free 时记账不匹配 panic。
+    // 这条测试用 testing.allocator 记账来锁住「返回切片的 len == 分配长度」。
+    const raw = "3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n";
+    const r = decodeChunked(gpa, raw, 1024);
+    try std.testing.expect(r == .done);
+    try std.testing.expectEqualStrings("abcdef", r.done.body);
+    gpa.free(r.done.body); // 长度不匹配会在这里 panic
 }

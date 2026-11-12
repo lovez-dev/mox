@@ -362,6 +362,20 @@ const Connection = struct {
     /// 当前请求在 recv_buf 中占用的字节数（HTTP pipelining 用）。
     /// 响应发完后按它前移剩余字节，继续解析下一个请求。
     consumed: usize = 0,
+    /// chunked 请求体解码结果（由 conn.alloc 分配）。null 表示本次请求
+    /// 不是 chunked，或已释放。响应发完后由 releaseWire 释放。
+    chunked_body: ?[]u8 = null,
+    /// chunked 请求的原始字节累积区（含头部）。因为 chunked body 可以远超
+    /// 8 KB 的 recv_buf，必须跨多次 recv 累积到堆上再解码。
+    /// `chunked_head_len` 是头部（含结尾空行）的长度，body 从这里开始。
+    chunked_accum: std.ArrayList(u8) = .empty,
+    chunked_head_len: usize = 0,
+    /// continueChunked 是否已经把 recv_buf 的增量追加过（避免首轮重复追加）。
+    chunked_appended: bool = false,
+    /// 解析出的 chunked 请求（头部信息），body 稍后由解码结果填充。
+    pending_chunked_req: http.Request = undefined,
+    /// chunked 请求头部块的稳定拷贝（recv_buf 会被后续 recv 覆写）。
+    chunked_head_copy: ?[]u8 = null,
 
     /// 每请求 arena：handler 通过 ctx.gpa 分配的内存在此统一回收。
     /// 惰性创建，keep-alive 下每个请求开始时 reset（retain_capacity 复用大块）。
@@ -414,7 +428,10 @@ const Connection = struct {
 fn postRecv(conn: *Connection) void {
     conn.state = .receiving;
     armIdle(conn);
-    conn.recv = NetRecv.init(conn.socket, conn.recv_buf[conn.recv_len..]);
+    // chunked 累积模式下，recv_buf 只当「新增字节」的暂存区：累积区已存了
+    // 之前收到的全部字节，所以每次都从缓冲区起点写，读到的就是纯增量。
+    const off: usize = if (conn.chunked_head_len > 0) 0 else conn.recv_len;
+    conn.recv = NetRecv.init(conn.socket, conn.recv_buf[off..]);
     conn.recv.c.callback = onRecv;
     conn.loop.add(&conn.recv.c);
 }
@@ -488,7 +505,13 @@ fn onRecv(loop: *Loop, c: *Completion) void {
         destroyConn(conn);
         return;
     }
-    conn.recv_len += n;
+    // chunked 累积模式下 recv_buf 只装本次增量（累积区已存了之前的字节），
+    // 所以是覆盖而不是追加。
+    if (conn.chunked_head_len > 0) {
+        conn.recv_len = n;
+    } else {
+        conn.recv_len += n;
+    }
     tryParseAndHandle(conn);
 }
 
@@ -499,6 +522,12 @@ fn onRecv(loop: *Loop, c: *Completion) void {
 /// 缓冲区里剩下的字节，而不是像以前那样直接 `recv_len = 0` 丢掉。
 fn tryParseAndHandle(conn: *Connection) void {
     const max_body = if (conn.server) |s| s.max_body_size else 4 * 1024 * 1024;
+    // chunked 累积模式：recv_buf 里只有本次新增的 body 字节，头部已在
+    // 累积区里解析过了。直接追加增量并重试解码，不再重新解析头部。
+    if (conn.chunked_head_len > 0) {
+        continueChunked(conn, max_body);
+        return;
+    }
     switch (http.parseWithLimit(conn.recv_buf[0..conn.recv_len], max_body)) {
         .incomplete => {
             if (conn.recv_len == conn.recv_buf.len) {
@@ -511,13 +540,84 @@ fn tryParseAndHandle(conn: *Connection) void {
         .body_too_large => respond(conn, .{ .status = .payload_too_large, .body = "payload too large\n" }, false),
         .request => |req| {
             if (req.chunked) {
-                respond(conn, .{ .status = .not_implemented, .body = "chunked transfer not supported\n" }, false);
+                // chunked 请求体是流式的：`parse` 只确认了头部，body 还没解出来。
+                startChunked(conn, req, max_body);
                 return;
             }
             // 记下本请求占用的字节数；handleRequest 异步完成，剩余字节
             // 要等响应发完才能安全处理（否则会覆写 send_buf）。
             conn.consumed = req.consumed;
             handleRequest(conn, req);
+        },
+    }
+}
+
+
+/// chunked 请求的第一步：把已收到的字节（头部 + 可能的部分 body）搬进
+/// 累积区，然后尝试解码。body 可以远超 8 KB 的 recv_buf，所以必须累积。
+fn startChunked(conn: *Connection, req: http.Request, max_body: usize) void {
+    const body_start = @intFromPtr(req.body.ptr) - @intFromPtr(conn.recv_buf[0..].ptr);
+    conn.chunked_head_len = body_start;
+    conn.chunked_accum.clearRetainingCapacity();
+    conn.chunked_accum.appendSlice(conn.alloc, conn.recv_buf[0..conn.recv_len]) catch {
+        respond(conn, .{ .status = .internal_server_error, .body = "out of memory\n" }, false);
+        return;
+    };
+    // 关键：req 的 path/target 指向 recv_buf，而累积模式下后续 recv 每轮都从
+    // recv_buf 起点覆写。大 body 场景下路径会被后到的字节盖掉，导致路由匹配
+    // 失败（实测：20000 字节请求体时 handler 根本没被调用）。
+    // 把头部拷到一块稳定内存，再按偏移量重建 path/target/head 切片。
+    const head_copy = conn.alloc.dupe(u8, req.head) catch {
+        respond(conn, .{ .status = .internal_server_error, .body = "out of memory\n" }, false);
+        return;
+    };
+    conn.chunked_head_copy = head_copy;
+    const base = @intFromPtr(req.head.ptr);
+    var req2 = req;
+    // target/path 都是 head 内部的切片，按偏移量重建。
+    req2.target = head_copy[@intFromPtr(req.target.ptr) - base ..][0..req.target.len];
+    req2.path = head_copy[@intFromPtr(req.path.ptr) - base ..][0..req.path.len];
+    req2.head = head_copy;
+    conn.pending_chunked_req = req2;
+    continueChunked(conn, max_body);
+}
+
+/// chunked 请求的后续步骤：把 recv_buf 里的增量追加进累积区并重试解码。
+/// 由 `startChunked` 与后续 `onRecv` 调用。
+fn continueChunked(conn: *Connection, max_body: usize) void {
+    // 首次调用时 recv_buf 的内容已由 startChunked 搬过；后续调用才是纯增量。
+    // 用 `chunked_appended` 区分，避免首轮重复追加。
+    if (conn.chunked_appended) {
+        conn.chunked_accum.appendSlice(conn.alloc, conn.recv_buf[0..conn.recv_len]) catch {
+            respond(conn, .{ .status = .internal_server_error, .body = "out of memory\n" }, false);
+            return;
+        };
+    }
+    conn.chunked_appended = true;
+
+    const accum = conn.chunked_accum.items;
+    switch (http.decodeChunked(conn.alloc, accum[conn.chunked_head_len..], max_body)) {
+        .incomplete => {
+            // 累积区远超上限还没凑够完整请求 → 拒绝，避免无限增长。
+            if (accum.len > max_body + conn.chunked_head_len + 1024) {
+                respond(conn, .{ .status = .payload_too_large, .body = "payload too large\n" }, false);
+                return;
+            }
+            // 继续收：新字节写进 recv_buf，下一轮 onRecv 追加进累积区。
+            postRecv(conn);
+        },
+        .malformed => respond(conn, .{ .status = .bad_request, .body = "bad chunked encoding\n" }, false),
+        .body_too_large => respond(conn, .{ .status = .payload_too_large, .body = "payload too large\n" }, false),
+        .done => |d| {
+            conn.chunked_body = d.body;
+            // 请求在累积区里占用的总字节数（用于 pipelining 前移）。
+            conn.consumed = conn.chunked_head_len + d.consumed;
+            // recv_buf 里的字节已全部搬进累积区，没有剩余可前移。
+            conn.recv_len = 0;
+            var full_req = conn.pending_chunked_req;
+            full_req.body = d.body;
+            full_req.consumed = 0;
+            handleRequest(conn, full_req);
         },
     }
 }
@@ -1125,6 +1225,19 @@ fn releaseWire(conn: *Connection) void {
         conn.alloc.free(b);
         conn.send_owned = null;
     }
+    // chunked 解码出的 body 与本次请求同生命周期，响应发完即释放。
+    if (conn.chunked_body) |b| {
+        conn.alloc.free(b);
+        conn.chunked_body = null;
+    }
+    if (conn.chunked_head_copy) |h| {
+        conn.alloc.free(h);
+        conn.chunked_head_copy = null;
+    }
+    // 累积区与累积状态复位（内存保留复用，下次 chunked 请求 clear 即可）。
+    conn.chunked_accum.clearRetainingCapacity();
+    conn.chunked_head_len = 0;
+    conn.chunked_appended = false;
     conn.send_wire = &.{};
     conn.sent_len = 0;
 }
@@ -1206,6 +1319,10 @@ fn releaseConn(conn: *Connection) void {
     if (server) |s| unregisterConn(s, conn);
     if (conn.file_buf.len != 0) conn.alloc.free(conn.file_buf);
     if (conn.send_owned) |b| conn.alloc.free(b);
+    // chunked 累积区是堆上的动态数组，必须显式释放。
+    conn.chunked_accum.deinit(conn.alloc);
+    if (conn.chunked_body) |b| conn.alloc.free(b);
+    if (conn.chunked_head_copy) |h| conn.alloc.free(h);
     if (conn.arena) |*a| a.deinit();
     const alloc = conn.alloc;
     alloc.destroy(conn);
@@ -2523,4 +2640,206 @@ test "HEAD 回退 GET 路由且不发送 body" {
     // 3) body 一个字节都没发。
     try std.testing.expect(std.mem.indexOf(u8, resp, "body-must-not-be-sent") == null);
     try std.testing.expect(std.mem.endsWith(u8, resp, "\r\n\r\n"));
+}
+
+// chunked 请求体端到端：客户端发 Transfer-Encoding: chunked，handler 必须
+// 拿到解码后的 body（不是原始分块编码），且响应正常。
+test "chunked 请求体端到端解码" {
+    if (@import("builtin").os.tag == .windows) try mox_io.platform.startup();
+    const alloc = std.heap.page_allocator;
+
+    const S = struct {
+        var got: [2048]u8 = undefined;
+        var got_len: usize = 0;
+        var body_seen: [64]u8 = undefined;
+        var body_len: usize = 0;
+        var done: std.atomic.Value(bool) = .init(false);
+        var ticks: usize = 0;
+
+        fn echo(ctx: *Context) !Response {
+            // 把收到的 body 抄下来，测试结束后断言
+            const n = @min(ctx.body.len, body_seen.len);
+            @memcpy(body_seen[0..n], ctx.body[0..n]);
+            body_len = n;
+            return .{ .body = "ok" };
+        }
+        fn client(addr: std.Io.net.IpAddress) void {
+            const s = mox_io.platform.createTcpSocket(addr) catch return;
+            defer mox_io.platform.closeSocket(s);
+            mox_io.platform.connectSocket(s, addr) catch return;
+            // "hello world" 拆成 "hello" + " world" 两个块
+            const req = "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" ++
+                "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+            _ = mox_io.platform.sendBlocking(s, req) catch return;
+            var n: usize = 0;
+            while (n < got.len) {
+                const r = mox_io.platform.recvBlocking(s, got[n..]) catch break;
+                if (r == 0) break;
+                n += r;
+            }
+            got_len = n;
+            done.store(true, .release);
+        }
+        fn tick(loop: *Loop, c: *Completion) void {
+            const t: *mox_io.Timer = @fieldParentPtr("c", c);
+            ticks += 1;
+            if (done.load(.acquire) or ticks > 250) {
+                loop.stop();
+                return;
+            }
+            t.* = mox_io.Timer.init(20);
+            t.c.callback = tick;
+            loop.add(&t.c);
+        }
+    };
+
+    const l = try testListen();
+    const listener = l[0];
+    const bound = l[1];
+    defer mox_io.platform.closeSocket(listener);
+    S.done.store(false, .release);
+    S.got_len = 0;
+    S.body_len = 0;
+    S.ticks = 0;
+
+    const cli = try std.Thread.spawn(.{}, S.client, .{bound});
+    defer cli.join();
+
+    const accepted = try mox_io.platform.acceptSocket(listener);
+    defer mox_io.platform.closeSocket(accepted.socket);
+
+    var loop = try mox_io.open(alloc);
+    defer loop.deinit();
+    try loop.associate(accepted.socket, 1);
+
+    var router = try Router.init(alloc, &.{
+        .{ .method = .POST, .path = "/echo", .handler = S.echo },
+    });
+    defer router.deinit();
+
+    const conn = try alloc.create(Connection);
+    conn.* = .{ .alloc = alloc, .loop = &loop, .router = &router, .socket = accepted.socket };
+    postRecv(conn);
+
+    var hb = mox_io.Timer.init(20);
+    hb.c.callback = S.tick;
+    loop.add(&hb.c);
+    try loop.run();
+
+    // handler 必须看到解码后的 "hello world"，而不是 "5\r\nhello\r\n6\r\n world..."
+    try std.testing.expectEqualStrings("hello world", S.body_seen[0..S.body_len]);
+    // 响应正常（不是 501 / 400）
+    const resp = S.got[0..S.got_len];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "200 OK") != null);
+}
+
+// chunked 大 body：远超 8 KB recv_buf 的请求体必须靠跨多次 recv 累积才能解出。
+// 修复前（不累积、只解码单次 recv_buf）这里会 400/413，handler 拿不到 body。
+test "chunked 大请求体跨多次 recv 累积解码" {
+    if (@import("builtin").os.tag == .windows) try mox_io.platform.startup();
+    const alloc = std.testing.allocator; // 顺带验证 chunked 路径无泄漏
+    const total: usize = 20000; // 远大于 8 KB recv_buf
+
+    const S = struct {
+        var got: [512]u8 = undefined;
+        var got_len: usize = 0;
+        var body_len: usize = 0;
+        var body_ok: bool = false;
+        var done: std.atomic.Value(bool) = .init(false);
+        var ticks: usize = 0;
+
+        fn echo(ctx: *Context) !Response {
+            body_len = ctx.body.len;
+            // 校验内容：必须全是 'z'
+            var ok = ctx.body.len == total;
+            for (ctx.body) |c| {
+                if (c != 'z') {
+                    ok = false;
+                    break;
+                }
+            }
+            body_ok = ok;
+            return .{ .body = "ok" };
+        }
+        fn client(addr: std.Io.net.IpAddress) void {
+            const s = mox_io.platform.createTcpSocket(addr) catch return;
+            defer mox_io.platform.closeSocket(s);
+            mox_io.platform.connectSocket(s, addr) catch return;
+            var hdr: [128]u8 = undefined;
+            const h = std.fmt.bufPrint(&hdr, "POST /big HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n", .{}) catch return;
+            _ = mox_io.platform.sendBlocking(s, h) catch return;
+            // 分多个块发：每块 4096 字节
+            var sent: usize = 0;
+            var line: [32]u8 = undefined;
+            while (sent < total) {
+                const n = @min(@as(usize, 4096), total - sent);
+                const sz = std.fmt.bufPrint(&line, "{x}\r\n", .{n}) catch return;
+                _ = mox_io.platform.sendBlocking(s, sz) catch return;
+                var chunk: [4096]u8 = undefined;
+                @memset(chunk[0..n], 'z');
+                _ = mox_io.platform.sendBlocking(s, chunk[0..n]) catch return;
+                _ = mox_io.platform.sendBlocking(s, "\r\n") catch return;
+                sent += n;
+            }
+            _ = mox_io.platform.sendBlocking(s, "0\r\n\r\n") catch return;
+            var k: usize = 0;
+            while (k < got.len) {
+                const r = mox_io.platform.recvBlocking(s, got[k..]) catch break;
+                if (r == 0) break;
+                k += r;
+            }
+            got_len = k;
+            done.store(true, .release);
+        }
+        fn tick(loop: *Loop, c: *Completion) void {
+            const t: *mox_io.Timer = @fieldParentPtr("c", c);
+            ticks += 1;
+            if (done.load(.acquire) or ticks > 500) {
+                loop.stop();
+                return;
+            }
+            t.* = mox_io.Timer.init(20);
+            t.c.callback = tick;
+            loop.add(&t.c);
+        }
+    };
+
+    const l = try testListen();
+    const listener = l[0];
+    const bound = l[1];
+    defer mox_io.platform.closeSocket(listener);
+    S.done.store(false, .release);
+    S.got_len = 0;
+    S.body_len = 0;
+    S.body_ok = false;
+    S.ticks = 0;
+
+    const cli = try std.Thread.spawn(.{}, S.client, .{bound});
+    defer cli.join();
+
+    const accepted = try mox_io.platform.acceptSocket(listener);
+    defer mox_io.platform.closeSocket(accepted.socket);
+
+    var loop = try mox_io.open(alloc);
+    defer loop.deinit();
+    try loop.associate(accepted.socket, 1);
+
+    var router = try Router.init(alloc, &.{
+        .{ .method = .POST, .path = "/big", .handler = S.echo },
+    });
+    defer router.deinit();
+
+    const conn = try alloc.create(Connection);
+    conn.* = .{ .alloc = alloc, .loop = &loop, .router = &router, .socket = accepted.socket };
+    postRecv(conn);
+
+    var hb = mox_io.Timer.init(20);
+    hb.c.callback = S.tick;
+    loop.add(&hb.c);
+    try loop.run();
+
+    // 关键断言：handler 收到完整的 20000 字节，内容正确。
+    try std.testing.expectEqual(total, S.body_len);
+    try std.testing.expect(S.body_ok);
+    try std.testing.expect(std.mem.indexOf(u8, S.got[0..S.got_len], "200 OK") != null);
 }
