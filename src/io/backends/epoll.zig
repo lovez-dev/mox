@@ -243,6 +243,27 @@ fn vtSyncFile(userdata: ?*anyopaque, file: root.Handle) anyerror!void {
     return uring.syncFile(file);
 }
 
+// 阶段 C：与 uring 后端共用同一套实现（同属 Linux）。
+fn vtReadLink(userdata: ?*anyopaque, link_path: []const u8, buf: []u8) anyerror!usize {
+    _ = userdata;
+    return uring.readLink(link_path, buf);
+}
+
+fn vtOpenDir(userdata: ?*anyopaque, path: []const u8) anyerror!root.Handle {
+    _ = userdata;
+    return uring.openDir(path);
+}
+
+fn vtReadDirHandle(userdata: ?*anyopaque, dir: root.Handle, buf: []root.DirEntry) anyerror!usize {
+    _ = userdata;
+    return uring.readDirHandle(dir, buf);
+}
+
+fn vtCloseDir(userdata: ?*anyopaque, dir: root.Handle) void {
+    _ = userdata;
+    uring.closeDir(dir);
+}
+
 fn vtDeleteFile(userdata: ?*anyopaque, path: []const u8) anyerror!void {
     _ = userdata;
     uring.deleteFile(path);
@@ -589,6 +610,10 @@ const vtable_storage: root.VTable = .{
     .removeDir = vtRemoveDir,
     .rename = vtRename,
     .symLink = vtSymLink,
+    .readLink = vtReadLink,
+    .openDir = vtOpenDir,
+    .readDirHandle = vtReadDirHandle,
+    .closeDir = vtCloseDir,
     .statPath = vtStatPath,
     .listDir = vtListDir,
     .associate = vtAssociate,

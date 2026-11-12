@@ -203,6 +203,23 @@ pub const VTable = struct {
     rename: *const fn (userdata: ?*anyopaque, old_path: []const u8, new_path: []const u8) anyerror!void,
     /// 创建符号链接。
     symLink: *const fn (userdata: ?*anyopaque, target: []const u8, link_path: []const u8) anyerror!void,
+
+    // ---- 符号链接读取 + 目录流式句柄（阶段 C）------------------------------
+    // `listDir` 是一次性把整目录塞进调用方缓冲：目录很大时要么截断要么
+    // 调用方给巨大缓冲。这三个原语把目录变成可增量读的流，跟 `FileOpen`
+    // 那套对称。
+
+    /// 读符号链接指向的目标路径。返回目标路径写入 `buf` 的长度。
+    /// 目标比 `buf` 长时报 `error.NameTooLong`（不静默截断——截断后的路径
+    /// 是错的，比报错更危险）。
+    readLink: ?*const fn (userdata: ?*anyopaque, link_path: []const u8, buf: []u8) anyerror!usize = null,
+    /// 打开目录，返回目录句柄（用于 `readDirHandle`）。
+    openDir: ?*const fn (userdata: ?*anyopaque, path: []const u8) anyerror!Handle = null,
+    /// 从目录句柄读下一批条目，返回条目数。返回 0 表示读完。
+    /// 返回数等于 `buf.len` 时**可能**还有剩余，调用方应继续读。
+    readDirHandle: ?*const fn (userdata: ?*anyopaque, dir: Handle, buf: []DirEntry) anyerror!usize = null,
+    /// 关闭目录句柄。幂等。
+    closeDir: ?*const fn (userdata: ?*anyopaque, dir: Handle) void = null,
     /// 取路径元数据（跟随符号链接）。
     statPath: *const fn (userdata: ?*anyopaque, path: []const u8) anyerror!Stat,
     /// 列目录项。`buf` 由调用方提供，返回条目数（超出时截断）。
@@ -354,6 +371,10 @@ pub const CloseFile = @import("file.zig").CloseFile;
 pub const StatFile = @import("file.zig").StatFile;
 pub const SetFileSize = @import("file.zig").SetFileSize;
 pub const SyncFile = @import("file.zig").SyncFile;
+pub const ReadLink = @import("file.zig").ReadLink;
+pub const OpenDir = @import("file.zig").OpenDir;
+pub const ReadDirHandle = @import("file.zig").ReadDirHandle;
+pub const CloseDir = @import("file.zig").CloseDir;
 
 /// 编译期选定的本目标后端。新增后端 = 写一个导出 `create(allocator) !Io`
 /// 的文件，再在这里加一个分支。

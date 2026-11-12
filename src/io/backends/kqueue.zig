@@ -597,6 +597,26 @@ fn vtSyncFile(userdata: ?*anyopaque, file: root.Handle) anyerror!void {
     return syncFile(file);
 }
 
+fn vtReadLink(userdata: ?*anyopaque, link_path: []const u8, buf: []u8) anyerror!usize {
+    _ = userdata;
+    return readLink(link_path, buf);
+}
+
+fn vtOpenDir(userdata: ?*anyopaque, path: []const u8) anyerror!root.Handle {
+    _ = userdata;
+    return openDir(path);
+}
+
+fn vtReadDirHandle(userdata: ?*anyopaque, dir: root.Handle, buf: []root.DirEntry) anyerror!usize {
+    _ = userdata;
+    return readDirHandle(dir, buf);
+}
+
+fn vtCloseDir(userdata: ?*anyopaque, dir: root.Handle) void {
+    _ = userdata;
+    closeDir(dir);
+}
+
 fn vtMakeDir(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
     _ = userdata;
     return makeDir(path, mode);
@@ -660,6 +680,10 @@ const vtable_storage: root.VTable = .{
     .removeDir = vtRemoveDir,
     .rename = vtRename,
     .symLink = vtSymLink,
+    .readLink = vtReadLink,
+    .openDir = vtOpenDir,
+    .readDirHandle = vtReadDirHandle,
+    .closeDir = vtCloseDir,
     .statPath = vtStatPath,
     .listDir = vtListDir,
     .associate = vtAssociate,
@@ -1230,6 +1254,112 @@ pub fn setFileSize(file: root.Handle, size: u64) !void {
 pub fn syncFile(file: root.Handle) !void {
     const fd: c.fd_t = @intCast(file);
     if (c.fsync(fd) != 0) return error.SyncFailed;
+}
+
+// ---- 符号链接读取 + 目录流式句柄（阶段 C）--------------------------------
+
+/// 读符号链接指向的目标。
+pub fn readLink(link_path: []const u8, buf: []u8) !usize {
+    var zbuf: [1024]u8 = undefined;
+    const z = try zpath(link_path, &zbuf);
+    const rc = c.readlink(z.ptr, buf.ptr, buf.len);
+    if (rc < 0) {
+        return switch (std.posix.errno(@as(isize, -1))) {
+            .NOENT => error.FileNotFound,
+            .INVAL => error.NotASymLink,
+            else => error.ReadLinkFailed,
+        };
+    }
+    const n: usize = @intCast(rc);
+    // 与 Linux 侧同样的理由：`readlink` 装满缓冲时静默截断，
+    // n == buf.len 分不清「刚好」和「被切」，宁可报错。
+    if (n >= buf.len) return error.NameTooLong;
+    return n;
+}
+
+/// 打开目录拿 fd。
+pub fn openDir(path: []const u8) !root.Handle {
+    var zbuf: [1024]u8 = undefined;
+    const z = try zpath(path, &zbuf);
+    const fd = c.open(z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, @as(c.mode_t, 0));
+    if (fd < 0) {
+        return switch (std.posix.errno(@as(isize, -1))) {
+            .NOENT => error.FileNotFound,
+            .ACCES => error.AccessDenied,
+            .NOTDIR => error.NotDir,
+            else => error.OpenFailed,
+        };
+    }
+    return @intCast(fd);
+}
+
+/// 从目录句柄读下一批条目。
+///
+///
+/// 与 Linux 侧一样存在「一批被内核整体前移」的问题：`getdirentries` 一次
+/// 填一整块缓冲并把文件偏移推到块尾。缓冲装不下整批时，剩下的条目会丢。
+/// 解法同 Linux：消费完能放下的条目后，把偏移 `lseek` 回最后一个已消费
+/// 条目记录的偏移字段（Darwin 是 `seekoff`，FreeBSD 是 `off`）。
+pub fn readDirHandle(dir: root.Handle, buf: []root.DirEntry) !usize {
+    if (buf.len == 0) return 0;
+    const fd: c.fd_t = @intCast(dir);
+
+    var raw: [4096]u8 = undefined;
+    var base: i64 = 0;
+    const rc = c.getdirentries(fd, &raw, raw.len, &base);
+    if (rc < 0) {
+        return switch (std.posix.errno(@as(isize, -1))) {
+            .BADF => error.InvalidHandle,
+            .NOTDIR => error.NotDir,
+            else => error.ReadDirFailed,
+        };
+    }
+    if (rc == 0) return 0; // 读完
+
+    const got: usize = @intCast(rc);
+    var off: usize = 0;
+    var count: usize = 0;
+    var resume_off: ?i64 = null;
+
+    while (off < got) {
+        const ent: *align(1) const c.dirent = @ptrCast(raw[off..].ptr);
+        const rec_len: usize = ent.reclen;
+        if (rec_len == 0 or off + rec_len > got) break;
+        // Darwin 的名字是定长数组按 NUL 截断；FreeBSD 是 [255:0]。
+        const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.name)), 0);
+
+        const is_dot = std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..");
+        if (!is_dot) {
+            if (count >= buf.len) break; // 缓冲满：回退到当前条目重读
+            if (name.len <= buf[count].name.len) {
+                @memcpy(buf[count].name[0..name.len], name);
+                buf[count].len = name.len;
+                buf[count].is_dir = ent.type == c.DT.DIR;
+                count += 1;
+            }
+            resume_off = direntOffset(ent);
+        }
+        off += rec_len;
+    }
+
+    if (off < got) {
+        if (resume_off) |r| _ = c.lseek(fd, @intCast(r), c.SEEK.SET);
+    }
+    return count;
+}
+
+/// 取目录条目的「下一条偏移」。Darwin 用 `seekoff`，FreeBSD 用 `off`。
+/// 两者语义相同（该条目之后的位置），字段名不同。
+fn direntOffset(ent: *align(1) const c.dirent) i64 {
+    if (@hasField(c.dirent, "seekoff")) return @intCast(ent.seekoff);
+    if (@hasField(c.dirent, "off")) return @intCast(ent.off);
+    return 0;
+}
+
+/// 关闭目录句柄。幂等。
+pub fn closeDir(dir: root.Handle) void {
+    const fd: c.fd_t = @intCast(dir);
+    if (fd >= 0) _ = c.close(fd);
 }
 
 test "kqueue backend type-checks end to end" {

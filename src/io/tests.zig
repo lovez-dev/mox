@@ -17,6 +17,11 @@ const CloseFile = root.CloseFile;
 const StatFile = root.StatFile;
 const SetFileSize = root.SetFileSize;
 const SyncFile = root.SyncFile;
+// 符号链接读取 + 目录流式句柄（阶段 C）
+const ReadLink = root.ReadLink;
+const OpenDir = root.OpenDir;
+const ReadDirHandle = root.ReadDirHandle;
+const CloseDir = root.CloseDir;
 
 // Options：运行时配置必须真的传到后端，不能只是把参数接住扔掉。
 test "openWith 的 queue_size 非法值报错，合法值生效" {
@@ -2310,7 +2315,8 @@ test "文件句柄：open → 写入 → 随机读 → close 全链路" {
     try std.testing.expectEqualStrings("0123XY6789", try read_back.getResult());
 
     // 6. 关闭
-    CloseFile.init(l.io, h).close();
+    var cf_x = CloseFile.init(l.io, h);
+    cf_x.close();
 
     // 注意：**不**在这里断言「关闭后再读会报某个具体错误」。
     // 关闭后的句柄值是未定义行为——Windows 返回 SeekFailed、Linux 返回
@@ -2345,7 +2351,8 @@ test "文件句柄：读超出文件尾短读不报错" {
     l.add(&open_node.work.c);
     try l.run();
     const h = try open_node.getResult();
-    defer CloseFile.init(l.io, h).close();
+    var cf_close = CloseFile.init(l.io, h);
+    defer cf_close.close();
 
     // 从 0 读 100 字节，只应拿到 3 字节（EOF 短读，不是错误）
     var big: [100]u8 = undefined;
@@ -2424,7 +2431,8 @@ test "文件句柄：write_only 打开会清空既有内容" {
     l.add(&w.work.c);
     try l.run();
     try std.testing.expectEqual(@as(usize, 3), try w.getResult());
-    CloseFile.init(l.io, h).close();
+    var cf_x = CloseFile.init(l.io, h);
+    cf_x.close();
 
     // 文件应只剩 "new"（TRUNC 生效）
     var buf: [64]u8 = undefined;
@@ -2432,7 +2440,7 @@ test "文件句柄：write_only 打开会清空既有内容" {
     try std.testing.expectEqualStrings("new", buf[0..n]);
 }
 
-test "文件句柄：CloseFile 重复关闭不 panic（幂等）" {
+test "文件句柄：CloseFile 同一实例重复关闭不 panic" {
     // 回调一触发就停机：本层全部走 Work 池，单步驱动。
     const stopCb = struct {
         fn cb(loop: *Loop, c: *Completion) void {
@@ -2458,9 +2466,12 @@ test "文件句柄：CloseFile 重复关闭不 panic（幂等）" {
     try l.run();
     const h = try open_node.getResult();
 
-    CloseFile.init(l.io, h).close();
-    CloseFile.init(l.io, h).close(); // 第二次不能崩
-    CloseFile.init(l.io, h).close(); // 第三次也不能
+    // 同一个实例重复 close：必须安全（第二次起直接返回）。
+    // 拿裸句柄值再 init 新实例去关是未定义行为，所以只测同一实例。
+    var cf = CloseFile.init(l.io, h);
+    cf.close();
+    cf.close(); // 第二次不能崩
+    cf.close(); // 第三次也不能
 }
 
 // ---- 句柄级元数据与同步（阶段 B）------------------------------------------
@@ -2492,7 +2503,8 @@ test "句柄元数据：statFile 报告真实大小，且随写入增长" {
     l.add(&open_node.work.c);
     try l.run();
     const h = try open_node.getResult();
-    defer CloseFile.init(l.io, h).close();
+    var cf_close = CloseFile.init(l.io, h);
+    defer cf_close.close();
 
     // 空文件：大小 0，类型是普通文件
     var st1 = StatFile.init(l.io, h);
@@ -2545,7 +2557,8 @@ test "句柄元数据：setFileSize 截断后大小与内容都变" {
     l.add(&open_node.work.c);
     try l.run();
     const h = try open_node.getResult();
-    defer CloseFile.init(l.io, h).close();
+    var cf_close = CloseFile.init(l.io, h);
+    defer cf_close.close();
 
     // 截到 4 字节
     var trunc = SetFileSize.init(l.io, h, 4);
@@ -2607,7 +2620,8 @@ test "句柄元数据：syncFile 在有效句柄上成功" {
     l.add(&open_node.work.c);
     try l.run();
     const h = try open_node.getResult();
-    defer CloseFile.init(l.io, h).close();
+    var cf_close = CloseFile.init(l.io, h);
+    defer cf_close.close();
 
     var w = WriteFileHandle.init(l.io, h, 0, "durable");
     w.work.c.callback = stopCb;
@@ -2623,4 +2637,247 @@ test "句柄元数据：syncFile 在有效句柄上成功" {
     l.add(&sync.work.c);
     try l.run();
     try sync.getResult();
+}
+
+// ---- 符号链接读取 + 目录流式句柄（阶段 C）--------------------------------
+// 核心正确性问题：`getdents64`/`getdirentries` 一次返回一整批条目，
+// 内核的 fd 偏移直接前移到批次末尾。如果调用方缓冲装不下整批，
+// 剩下的条目就**丢了**。下面第 2 条测试专门打这个。
+
+test "目录流：openDir → 分多次读完 → closeDir，条目不丢不重" {
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "dstream");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    // 建 5 个文件。用固定名字，便于断言集合完全相等。
+    const names = [_][]const u8{ "a.txt", "b.txt", "c.txt", "d.txt", "e.txt" };
+    var fbufs: [5][600]u8 = undefined;
+    var fpaths: [5][]const u8 = undefined;
+    for (names, 0..) |n, i| {
+        fpaths[i] = try std.fmt.bufPrint(&fbufs[i], "{s}/{s}", .{ dir, n });
+        try l.writeFileAll(fpaths[i], "x");
+    }
+    defer for (fpaths) |p| l.deleteFile(p);
+
+    var open_node = OpenDir.init(l.io, dir);
+    open_node.work.c.callback = stopCb;
+    l.add(&open_node.work.c);
+    try l.run();
+    const dh = try open_node.getResult();
+    var cd_x = CloseDir.init(l.io, dh);
+    defer cd_x.close();
+
+    // **关键**：每次只给 2 个槽位，而目录里有 5 个条目。
+    // 如果实现没处理「批次装不下」的情况，第一次 getdents64 拿到的
+    // 整批条目里只有 2 个被消费，剩下 3 个随 fd 偏移前移而丢失，
+    // 总收集数会是 2 而不是 5。
+    var seen: [5]bool = .{ false, false, false, false, false };
+    var total: usize = 0;
+    var rounds: usize = 0;
+    while (rounds < 20) : (rounds += 1) {
+        var batch: [2]root.DirEntry = undefined;
+        var rd = ReadDirHandle.init(l.io, dh, &batch);
+        rd.work.c.callback = stopCb;
+        l.add(&rd.work.c);
+        try l.run();
+        const entries = try rd.getResult();
+        if (entries.len == 0) break; // 读完
+        for (entries) |e| {
+            total += 1;
+            for (names, 0..) |n, i| {
+                if (std.mem.eql(u8, e.slice(), n)) seen[i] = true;
+            }
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 5), total);
+    for (seen, 0..) |s, i| {
+        if (!s) {
+            std.debug.print("缺失条目: {s}\n", .{names[i]});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "目录流：一次给足缓冲能读完，is_dir 标志正确" {
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "dflags");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var fbuf: [600]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&fbuf, "{s}/file.txt", .{dir});
+    try l.writeFileAll(fpath, "x");
+    defer l.deleteFile(fpath);
+
+    var sbuf: [600]u8 = undefined;
+    const subdir = try std.fmt.bufPrint(&sbuf, "{s}/subdir", .{dir});
+    try l.makeDir(subdir, 0o755);
+    defer l.removeDir(subdir) catch {};
+
+    var open_node = OpenDir.init(l.io, dir);
+    open_node.work.c.callback = stopCb;
+    l.add(&open_node.work.c);
+    try l.run();
+    const dh = try open_node.getResult();
+    var cd_x = CloseDir.init(l.io, dh);
+    defer cd_x.close();
+
+    var batch: [16]root.DirEntry = undefined;
+    var rd = ReadDirHandle.init(l.io, dh, &batch);
+    rd.work.c.callback = stopCb;
+    l.add(&rd.work.c);
+    try l.run();
+    const entries = try rd.getResult();
+
+    // 恰好 2 个条目（file.txt + subdir），且 is_dir 要分清
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.slice(), "file.txt")) {
+            try std.testing.expect(!e.is_dir);
+        } else if (std.mem.eql(u8, e.slice(), "subdir")) {
+            try std.testing.expect(e.is_dir);
+        } else {
+            std.debug.print("意外条目: {s}\n", .{e.slice()});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "目录流：openDir 不存在的目录返回 FileNotFound" {
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "dnodir");
+    // 不创建，直接开
+
+    var open_node = OpenDir.init(l.io, dir);
+    open_node.work.c.callback = stopCb;
+    l.add(&open_node.work.c);
+    try l.run();
+    try std.testing.expectError(error.FileNotFound, open_node.getResult());
+}
+
+test "readLink 读回符号链接目标" {
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "rlink");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var tbuf: [600]u8 = undefined;
+    const target = try std.fmt.bufPrint(&tbuf, "{s}/real.txt", .{dir});
+    try l.writeFileAll(target, "hi");
+    defer l.deleteFile(target);
+
+    var lbuf: [600]u8 = undefined;
+    const link = try std.fmt.bufPrint(&lbuf, "{s}/link.txt", .{dir});
+    l.symLink(target, link) catch |e| switch (e) {
+        // 非管理员权限下 Windows 无法建符号链接；跳过而不是假装通过。
+        error.AccessDenied, error.PrivilegeNotHeld => return error.SkipZigTest,
+        else => return e,
+    };
+    defer l.deleteFile(link);
+
+    var rbuf: [1024]u8 = undefined;
+    var rl = ReadLink.init(l.io, link, &rbuf);
+    rl.work.c.callback = stopCb;
+    l.add(&rl.work.c);
+    try l.run();
+    const got = try rl.getResult();
+    // 目标可能被平台规范化（Windows 会补绝对路径/前缀），只断言尾部一致。
+    try std.testing.expect(std.mem.endsWith(u8, got, "real.txt"));
+}
+
+test "readLink 对普通文件返回 NotASymLink" {
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "rlnot");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var fbuf: [600]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&fbuf, "{s}/plain.txt", .{dir});
+    try l.writeFileAll(fpath, "x");
+    defer l.deleteFile(fpath);
+
+    var rbuf: [1024]u8 = undefined;
+    var rl = ReadLink.init(l.io, fpath, &rbuf);
+    rl.work.c.callback = stopCb;
+    l.add(&rl.work.c);
+    try l.run();
+    // 普通文件不是符号链接：必须报错，不能返回空串假装成功。
+    try std.testing.expectError(error.NotASymLink, rl.getResult());
+}
+
+test "CloseDir 同一实例重复关闭不 panic" {
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "didem");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var open_node = OpenDir.init(l.io, dir);
+    open_node.work.c.callback = stopCb;
+    l.add(&open_node.work.c);
+    try l.run();
+    const dh = try open_node.getResult();
+
+    // 同一个实例重复 close：必须安全（第二次起直接返回）。
+    // 注意：拿裸句柄值再 init 一个新 CloseDir 去关**不**安全——
+    // 那是未定义行为，所以这里刻意只测同一实例。
+    var cd = CloseDir.init(l.io, dh);
+    cd.close();
+    cd.close();
+    cd.close();
 }

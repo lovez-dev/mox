@@ -16,6 +16,7 @@ const Work = root.Work;
 const Handle = root.Handle;
 const INVALID_HANDLE = root.INVALID_HANDLE;
 const Stat = root.Stat;
+const DirEntry = root.DirEntry;
 
 /// 进程内内存文件表。条目由调用方在启动时 `mount`，生命周期必须长于
 /// 任何 `ReadFile`；通常挂在 `Loop` 上，随循环一起销毁。
@@ -371,13 +372,23 @@ pub const WriteFileHandle = struct {
 pub const CloseFile = struct {
     io: Io,
     file: Handle,
+    /// 是否已经关闭过。裸 fd/HANDLE 无法自证是否已关闭，所以由节点记住。
+    closed: bool = false,
 
     pub fn init(io: Io, file: Handle) CloseFile {
         return .{ .io = io, .file = file };
     }
 
-    /// 立即关闭。幂等：重复关闭或无效句柄不报错。
-    pub fn close(self: *const CloseFile) void {
+    /// 立即关闭。
+    ///
+    /// **不是**幂等的，但重复调用同一个 `CloseFile` 实例是安全的：
+    /// 第二次起直接返回，不会重复 `close`。这是本层能提供的唯一保证——
+    /// 拿同一个**裸句柄值**再 `init` 一个新 `CloseFile` 去关，仍然会重复
+    /// `close`（POSIX 与 Win32 上都是未定义行为，可能误关被系统复用的
+    /// 别人的 fd/句柄）。句柄的所有权只能由调用方自己维护。
+    pub fn close(self: *CloseFile) void {
+        if (self.closed) return;
+        self.closed = true;
         if (self.io.vtable.closeFile) |vt| vt(self.io.userdata, self.file);
     }
 };
@@ -469,6 +480,126 @@ pub const SyncFile = struct {
 
     pub fn getResult(self: *const SyncFile) !void {
         if (self.err) |e| return e;
+    }
+};
+
+// ---- 符号链接读取 + 目录流式节点（阶段 C）--------------------------------
+// `listDir` 一次性把整个目录塞进调用方缓冲，目录大时要么截断要么给巨大缓冲。
+// 这三个节点把目录变成可增量读的流，与 `OpenFile`/`ReadFileHandle` 那套对称。
+
+/// 读符号链接指向的目标路径。
+pub const ReadLink = struct {
+    work: Work,
+    io: Io,
+    link_path: []const u8,
+    buf: []u8,
+    len: usize = 0,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, link_path: []const u8, buf: []u8) ReadLink {
+        return .{ .work = Work.init(run), .io = io, .link_path = link_path, .buf = buf };
+    }
+
+    fn run(w: *Work) void {
+        const self: *ReadLink = @fieldParentPtr("work", w);
+        const vt = self.io.vtable.readLink orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        self.len = vt(self.io.userdata, self.link_path, self.buf) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    /// 成功返回目标路径 `buf[0..len]`。
+    pub fn getResult(self: *const ReadLink) ![]const u8 {
+        if (self.err) |e| return e;
+        return self.buf[0..self.len];
+    }
+};
+
+/// 打开目录，拿目录句柄。
+pub const OpenDir = struct {
+    work: Work,
+    io: Io,
+    path: []const u8,
+    dir: Handle = INVALID_HANDLE,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, path: []const u8) OpenDir {
+        return .{ .work = Work.init(run), .io = io, .path = path };
+    }
+
+    fn run(w: *Work) void {
+        const self: *OpenDir = @fieldParentPtr("work", w);
+        const vt = self.io.vtable.openDir orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        self.dir = vt(self.io.userdata, self.path) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    /// 成功后返回目录句柄。**调用方负责 `CloseDir`**。
+    pub fn getResult(self: *const OpenDir) !Handle {
+        if (self.err) |e| return e;
+        return self.dir;
+    }
+};
+
+/// 从目录句柄读下一批条目。
+pub const ReadDirHandle = struct {
+    work: Work,
+    io: Io,
+    dir: Handle,
+    buf: []DirEntry,
+    count: usize = 0,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, dir: Handle, buf: []DirEntry) ReadDirHandle {
+        return .{ .work = Work.init(run), .io = io, .dir = dir, .buf = buf };
+    }
+
+    fn run(w: *Work) void {
+        const self: *ReadDirHandle = @fieldParentPtr("work", w);
+        const vt = self.io.vtable.readDirHandle orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        self.count = vt(self.io.userdata, self.dir, self.buf) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    /// 返回本次读到的条目 `buf[0..count]`。空切片表示读完。
+    pub fn getResult(self: *const ReadDirHandle) ![]const DirEntry {
+        if (self.err) |e| return e;
+        return self.buf[0..self.count];
+    }
+};
+
+/// 关闭目录句柄。**同步**，理由同 `CloseFile`：关闭不阻塞，
+/// 进池只会制造「以为关了其实还在排队」的悬垂窗口。
+pub const CloseDir = struct {
+    io: Io,
+    dir: Handle,
+    /// 是否已经关闭过。理由同 `CloseFile`：裸句柄无法自证状态。
+    closed: bool = false,
+
+    pub fn init(io: Io, dir: Handle) CloseDir {
+        return .{ .io = io, .dir = dir };
+    }
+
+    /// 立即关闭。重复调用同一个实例安全（第二次起直接返回）；
+    /// 但拿同一个裸句柄值重新 `init` 去关仍是未定义行为，见 `CloseFile.close`。
+    pub fn close(self: *CloseDir) void {
+        if (self.closed) return;
+        self.closed = true;
+        if (self.io.vtable.closeDir) |vt| vt(self.io.userdata, self.dir);
     }
 };
 

@@ -856,6 +856,26 @@ fn vtSyncFile(userdata: ?*anyopaque, file: root.Handle) anyerror!void {
     return syncFile(file);
 }
 
+fn vtReadLink(userdata: ?*anyopaque, link_path: []const u8, buf: []u8) anyerror!usize {
+    _ = userdata;
+    return readLink(link_path, buf);
+}
+
+fn vtOpenDir(userdata: ?*anyopaque, path: []const u8) anyerror!root.Handle {
+    _ = userdata;
+    return openDir(path);
+}
+
+fn vtReadDirHandle(userdata: ?*anyopaque, dir: root.Handle, buf: []root.DirEntry) anyerror!usize {
+    _ = userdata;
+    return readDirHandle(dir, buf);
+}
+
+fn vtCloseDir(userdata: ?*anyopaque, dir: root.Handle) void {
+    _ = userdata;
+    closeDir(dir);
+}
+
 fn vtMakeDir(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
     _ = userdata;
     return makeDir(path, mode);
@@ -919,6 +939,10 @@ const vtable_storage: root.VTable = .{
     .removeDir = vtRemoveDir,
     .rename = vtRename,
     .symLink = vtSymLink,
+    .readLink = vtReadLink,
+    .openDir = vtOpenDir,
+    .readDirHandle = vtReadDirHandle,
+    .closeDir = vtCloseDir,
     .statPath = vtStatPath,
     .listDir = vtListDir,
     .associate = vtAssociate,
@@ -1493,6 +1517,119 @@ pub fn setFileSize(file: root.Handle, size: u64) !void {
 pub fn syncFile(file: root.Handle) !void {
     const fd: linux.fd_t = @intCast(file);
     _ = try cvt(linux.fdatasync(fd));
+}
+
+// ---- 符号链接读取 + 目录流式句柄（阶段 C）--------------------------------
+
+/// 读符号链接指向的目标。目标比 `buf` 长时报 `NameTooLong`，不静默截断。
+pub fn readLink(link_path: []const u8, buf: []u8) !usize {
+    var pz: [1024]u8 = undefined;
+    const p = try pathZ(link_path, &pz);
+    const rc = linux.readlink(p, buf.ptr, buf.len);
+    const rc_s = signed(rc);
+    if (rc_s < 0) {
+        return switch (-rc_s) {
+            @as(isize, @backingInt(linux.E.NOENT)) => error.FileNotFound,
+            @as(isize, @backingInt(linux.E.INVAL)) => error.NotASymLink,
+            else => error.ReadLinkFailed,
+        };
+    }
+    const n: usize = @intCast(rc_s);
+    // `readlink` 在缓冲正好装满时会截断且不报错（POSIX 行为），
+    // 所以 n == buf.len 无法区分「刚好装满」与「被截断」。
+    // 宁可报错也不返回一个可能被切掉的路径。
+    if (n >= buf.len) return error.NameTooLong;
+    return n;
+}
+
+/// 打开目录拿 fd。之后用 `readDirHandle` 增量读。
+pub fn openDir(path: []const u8) !root.Handle {
+    // `openat` 的 DIRECTORY 标志保证拿到的确实是目录（不是文件/链接）。
+    const fd = std.posix.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0) catch |e| {
+        return switch (e) {
+            error.FileNotFound => error.FileNotFound,
+            error.AccessDenied => error.AccessDenied,
+            error.NotDir => error.NotDir,
+            else => error.OpenFailed,
+        };
+    };
+    return @intCast(fd);
+}
+
+/// 从目录句柄读下一批条目。
+///
+/// **关键正确性问题**：`getdents64` 一次返回一整批条目，内核的 fd 偏移
+/// 直接前移到批次末尾。如果调用方缓冲装不下整批，剩下的条目就丢了
+/// （下一次 `getdents64` 从批次末尾继续）。
+///
+/// 解法：消费完能放下的条目后，把 fd 偏移 `lseek` 回**最后一个已消费条目**
+/// 记录的 `d_off`，下次从这里继续。`d_off` 是内核给的「下一个条目」偏移，
+/// 所以回退到它正是「已消费条目的下一条」。
+pub fn readDirHandle(dir: root.Handle, buf: []root.DirEntry) !usize {
+    if (buf.len == 0) return 0;
+    const fd: linux.fd_t = @intCast(dir);
+
+    var raw: [4096]u8 = undefined;
+    const rc = linux.getdents64(fd, &raw, raw.len);
+    const rc_s = signed(rc);
+    if (rc_s < 0) {
+        return switch (-rc_s) {
+            @as(isize, @backingInt(linux.E.BADF)) => error.InvalidHandle,
+            @as(isize, @backingInt(linux.E.NOTDIR)) => error.NotDir,
+            else => error.ReadDirFailed,
+        };
+    }
+    if (rc_s == 0) return 0; // 读完
+
+    const got: usize = @intCast(rc_s);
+    var off: usize = 0;
+    var count: usize = 0;
+    // 已消费条目的下一个偏移；用于缓冲满时回退。
+    var resume_off: ?u64 = null;
+
+    while (off < got) {
+        const ent: *align(1) const linux.dirent64 = @ptrCast(raw[off..].ptr);
+        const rec_len: usize = ent.reclen;
+        if (rec_len == 0 or off + rec_len > got) break;
+        const name_ptr = raw[off + @offsetOf(linux.dirent64, "name") .. off + rec_len];
+        const name = std.mem.sliceTo(name_ptr, 0);
+
+        const is_dot = std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..");
+        if (!is_dot) {
+            if (count >= buf.len) {
+                // 缓冲满了：回退到这个条目的偏移，下次从这里重读。
+                // `d_off` 是「下一条目」的偏移，但我们要重读**当前**这条，
+                // 所以回退到当前条目自己的偏移（off 之前那条的 d_off 已记录）。
+                break;
+            }
+            if (name.len <= buf[count].name.len) {
+                @memcpy(buf[count].name[0..name.len], name);
+                buf[count].len = name.len;
+                buf[count].is_dir = ent.type == linux.DT.DIR;
+                count += 1;
+                resume_off = ent.off;
+            } else {
+                // 名字超长被跳过，但仍算已消费，偏移要跟上。
+                resume_off = ent.off;
+            }
+        }
+        off += rec_len;
+    }
+
+    // 如果没消费完整批（还有剩余），把 fd 偏移拉回到「已消费的最后一
+    // 条之后」。`d_off` 正是内核给的该语义。
+    if (off < got) {
+        if (resume_off) |r| {
+            _ = linux.lseek(fd, @intCast(r), linux.SEEK.SET);
+        }
+    }
+    return count;
+}
+
+/// 关闭目录句柄。幂等。
+pub fn closeDir(dir: root.Handle) void {
+    const fd: linux.fd_t = @intCast(dir);
+    if (fd >= 0) _ = linux.close(fd);
 }
 
 // ---- 测试（在 Linux 运行；已在 WSL 验证） ----------------------------------

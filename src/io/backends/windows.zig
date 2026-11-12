@@ -1023,6 +1023,24 @@ fn vtSyncFile(userdata: ?*anyopaque, file: root.Handle) anyerror!void {
     return syncFile(file);
 }
 
+fn vtReadLink(userdata: ?*anyopaque, link_path: []const u8, buf: []u8) anyerror!usize {
+    _ = userdata;
+    return readLink(link_path, buf);
+}
+
+// 目录流需要分配器（`WinDirStream` 是堆对象），从后端状态里取。
+fn vtOpenDir(userdata: ?*anyopaque, path: []const u8) anyerror!root.Handle {
+    return openDir(stateOf(userdata).alloc, path);
+}
+
+fn vtReadDirHandle(userdata: ?*anyopaque, dir: root.Handle, buf: []root.DirEntry) anyerror!usize {
+    return readDirHandle(stateOf(userdata).alloc, dir, buf);
+}
+
+fn vtCloseDir(userdata: ?*anyopaque, dir: root.Handle) void {
+    closeDir(stateOf(userdata).alloc, dir);
+}
+
 fn vtMakeDir(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
     _ = userdata;
     return makeDir(path, mode);
@@ -1086,6 +1104,10 @@ const vtable_storage: root.VTable = .{
     .removeDir = vtRemoveDir,
     .rename = vtRename,
     .symLink = vtSymLink,
+    .readLink = vtReadLink,
+    .openDir = vtOpenDir,
+    .readDirHandle = vtReadDirHandle,
+    .closeDir = vtCloseDir,
     .statPath = vtStatPath,
     .listDir = vtListDir,
     .associate = vtAssociate,
@@ -1175,6 +1197,16 @@ const fl32 = struct {
     extern "kernel32" fn GetFileTime(h: HANDLE, creation: ?*windows.FILETIME, access: ?*windows.FILETIME, write: ?*windows.FILETIME) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn GetFileInformationByHandle(h: HANDLE, info: *BY_HANDLE_FILE_INFORMATION) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn FlushFileBuffers(h: HANDLE) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn DeviceIoControl(
+        h: HANDLE,
+        code: u32,
+        in_buf: ?*const anyopaque,
+        in_size: u32,
+        out_buf: ?*anyopaque,
+        out_size: u32,
+        returned: *u32,
+        overlapped: ?*anyopaque,
+    ) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn FindFirstFileW(name: [*]const u16, data: *WIN32_FIND_DATAW) callconv(.winapi) HANDLE;
     extern "kernel32" fn FindNextFileW(h: HANDLE, data: *WIN32_FIND_DATAW) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn FindClose(h: HANDLE) callconv(.winapi) windows.BOOL;
@@ -1211,6 +1243,13 @@ const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_PATH_NOT_FOUND: u32 = 3;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_HANDLE: u32 = 6;
+
+// 重解析点（符号链接 / junction）相关常量，见 `winnt.h` / `winioctl.h`。
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+const FSCTL_GET_REPARSE_POINT: u32 = 0x000900A8;
+const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA0000003;
+const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000000C;
 
 fn invalidHandle() HANDLE {
     return @ptrFromInt(std.math.maxInt(usize));
@@ -1579,4 +1618,152 @@ pub fn syncFile(file: root.Handle) anyerror!void {
     const h: HANDLE = @ptrFromInt(file);
     if (h == invalidHandle()) return error.InvalidHandle;
     if (!fl32.FlushFileBuffers(h).toBool()) return error.SyncFailed;
+}
+
+// ---- 符号链接读取 + 目录流式句柄（阶段 C）--------------------------------
+
+/// 读符号链接指向的目标。
+pub fn readLink(link_path: []const u8, buf: []u8) anyerror!usize {
+    var wbuf: [1024]u16 = undefined;
+    const w = try widePath(link_path, &wbuf);
+    // 打开重解析点本身（FILE_FLAG_OPEN_REPARSE_POINT 才能拿到链接本身
+    // 而不是它指向的目标）。BACKUP_SEMANTICS 是打开目录所必需的。
+    const h = fl32.CreateFileW(
+        w.ptr,
+        0, // 只查属性，不需要读写权限
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        null,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        null,
+    );
+    if (h == invalidHandle()) {
+        return switch (fl32.GetLastError()) {
+            ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND => error.FileNotFound,
+            else => error.ReadLinkFailed,
+        };
+    }
+    defer _ = c.CloseHandle(h);
+
+    // 用 FSCTL_GET_REPARSE_POINT 拿重解析数据。
+    var rdb: [16 * 1024]u8 align(8) = undefined;
+    var returned: u32 = 0;
+    if (!fl32.DeviceIoControl(h, FSCTL_GET_REPARSE_POINT, null, 0, &rdb, rdb.len, &returned, null).toBool()) {
+        return error.NotASymLink; // 不是重解析点
+    }
+    return parseReparsePoint(&rdb, returned, buf);
+}
+
+/// 从 `REPARSE_DATA_BUFFER` 里取出符号链接目标并转成 UTF-8。
+/// 结构见 `ntifs.h`；只处理 `IO_REPARSE_TAG_SYMLINK` 与
+/// `IO_REPARSE_TAG_MOUNT_POINT`（junction）两种。
+fn parseReparsePoint(raw: []const u8, returned: u32, buf: []u8) anyerror!usize {
+    if (returned < 8) return error.ReadLinkFailed;
+    const tag = std.mem.readInt(u32, raw[0..4], .little);
+    const data_len = std.mem.readInt(u16, raw[4..6], .little);
+    if (returned < 8 + @as(u32, data_len)) return error.ReadLinkFailed;
+
+    if (tag == IO_REPARSE_TAG_MOUNT_POINT) {
+        // junction：8 字节头之后是 4 个偏移/长度字段（SubstName 与
+        // PrintName 各一对），路径在偏移 16 处开始。
+        if (data_len < 16) return error.ReadLinkFailed;
+        const sub_off = std.mem.readInt(u16, raw[8..10], .little);
+        const sub_len = std.mem.readInt(u16, raw[10..12], .little);
+        const base: usize = 8;
+        if (base + sub_off + sub_len > 8 + @as(usize, data_len)) return error.ReadLinkFailed;
+        return u16PathToUtf8(raw[base + sub_off .. base + sub_off + sub_len], buf);
+    }
+    if (tag == IO_REPARSE_TAG_SYMLINK) {
+        // symlink：8 字节头 + 4 偏移 + 4 长度 + 4 标志 + 路径，路径从偏移 20 开始。
+        if (data_len < 12) return error.ReadLinkFailed;
+        const sub_off = std.mem.readInt(u16, raw[8..10], .little);
+        const sub_len = std.mem.readInt(u16, raw[10..12], .little);
+        const base: usize = 20;
+        if (base + sub_off + sub_len > 8 + @as(usize, data_len)) return error.ReadLinkFailed;
+        return u16PathToUtf8(raw[base + sub_off .. base + sub_off + sub_len], buf);
+    }
+    return error.NotASymLink;
+}
+
+/// 把 UTF-16LE 字节序列转成 UTF-8 写进 `buf`。
+fn u16PathToUtf8(u16_bytes: []const u8, buf: []u8) anyerror!usize {
+    const n_u16 = u16_bytes.len / 2;
+    if (n_u16 == 0) return 0;
+    const src: [*]const u16 = @ptrCast(@alignCast(u16_bytes.ptr));
+    const written = std.unicode.utf16LeToUtf8(buf, src[0..n_u16]) catch return error.NameTooLong;
+    if (written >= buf.len) return error.NameTooLong;
+    return written;
+}
+
+/// Windows 的目录流状态。`FindFirstFileW` 给的是一个有状态枚举器，
+/// 一次只交一条，所以这里只要记住「已从 FindNext 拿到但还没交给调用方」
+/// 的那一条即可——不存在 Linux/BSD 那种整批前移丢条目的问题。
+const WinDirStream = struct {
+    handle: HANDLE,
+    /// 待交付的条目。`valid == false` 表示没有预取。
+    pending: WIN32_FIND_DATAW = undefined,
+    valid: bool = false,
+};
+
+/// 打开目录。返回的是自建的流对象指针（不是 Win32 HANDLE），
+/// 由 `closeDir` 释放。
+pub fn openDir(st_alloc: std.mem.Allocator, path: []const u8) anyerror!root.Handle {
+    var joined_buf: [1100]u8 = undefined;
+    if (path.len + 3 > joined_buf.len) return error.NameTooLong;
+    @memcpy(joined_buf[0..path.len], path);
+    @memcpy(joined_buf[path.len..][0..2], "\\*");
+
+    var wbuf: [1100]u16 = undefined;
+    const w = try widePath(joined_buf[0 .. path.len + 2], &wbuf);
+
+    var data: WIN32_FIND_DATAW = undefined;
+    const h = fl32.FindFirstFileW(w.ptr, &data);
+    if (h == invalidHandle()) {
+        return switch (fl32.GetLastError()) {
+            ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND => error.FileNotFound,
+            else => error.OpenFailed,
+        };
+    }
+
+    const stream = st_alloc.create(WinDirStream) catch {
+        _ = fl32.FindClose(h);
+        return error.OutOfMemory;
+    };
+    stream.* = .{ .handle = h, .pending = data, .valid = true };
+    return @intFromPtr(stream);
+}
+
+/// 从目录流读下一批条目。
+pub fn readDirHandle(st_alloc: std.mem.Allocator, dir: root.Handle, buf: []root.DirEntry) anyerror!usize {
+    _ = st_alloc;
+    if (buf.len == 0) return 0;
+    const stream: *WinDirStream = @ptrFromInt(dir);
+
+    var count: usize = 0;
+    while (count < buf.len) {
+        var data: WIN32_FIND_DATAW = undefined;
+        if (stream.valid) {
+            data = stream.pending;
+            stream.valid = false;
+        } else {
+            if (!fl32.FindNextFileW(stream.handle, &data).toBool()) break; // 读完
+        }
+        const name_u16 = std.mem.sliceTo(&data.cFileName, 0);
+        if (std.mem.eql(u16, name_u16, &.{'.'}) or std.mem.eql(u16, name_u16, &.{ '.', '.' })) continue;
+        var utf8: [256]u8 = undefined;
+        const n = std.unicode.utf16LeToUtf8(&utf8, name_u16) catch continue;
+        if (n == 0 or n > buf[count].name.len) continue;
+        @memcpy(buf[count].name[0..n], utf8[0..n]);
+        buf[count].len = n;
+        buf[count].is_dir = data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        count += 1;
+    }
+    return count;
+}
+
+/// 关闭目录流。幂等。
+pub fn closeDir(st_alloc: std.mem.Allocator, dir: root.Handle) void {
+    const stream: *WinDirStream = @ptrFromInt(dir);
+    _ = fl32.FindClose(stream.handle);
+    st_alloc.destroy(stream);
 }

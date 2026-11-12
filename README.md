@@ -849,8 +849,9 @@ const bytes = try rd.getResult();      // 文件尾短读不报错
 var wr = mox_io.WriteFileHandle.init(io, h, 0, "header");
 loop.add(&wr.work.c);
 
-// 关闭（同步、幂等：重复关闭不报错）
-mox_io.CloseFile.init(io, h).close();
+// 关闭（同步；同一个实例重复调用安全）
+var cf = mox_io.CloseFile.init(io, h);
+cf.close();
 ```
 
 `OpenFile` 的 `FileMode`：`read_only`（必须已存在）、`write_only`（截断并创建）、
@@ -858,6 +859,12 @@ mox_io.CloseFile.init(io, h).close();
 
 **为什么 `CloseFile` 是同步的**：关闭本身不阻塞，没必要进池线程；更重要的是
 避免「调用方以为已经关了、其实还在队列里排队」的悬垂窗口。
+
+**关闭的幂等性边界（重要）**：重复调用**同一个** `CloseFile` 实例是安全的
+（第二次起直接返回）。但拿同一个**裸句柄值**再 `init` 一个新实例去关，
+仍然是未定义行为——POSIX 的 `close()` 与 Win32 的 `CloseHandle()` 都如此，
+第二次可能误关被系统复用的别人的 fd/句柄。句柄所有权只能由调用方自己维护，
+框架无法替你判断一个 `usize` 是否还有效。
 
 **生命周期契约**：`OpenFile` 成功后句柄归调用方，节点不会替你关（否则你拿到
 的是已失效句柄）。`path` / `bytes` / `buf` 都由调用方持有，必须活到回调触发为止。
@@ -896,6 +903,58 @@ Windows 用 `GetFileInformationByHandle`。
 
 `syncFile` 的测试**只能证明调用链通、错误没被吞掉**，不能证明数据真的落盘——
 那要断电才验证得了。别把它当持久化保证的证明。
+
+## 目录流与符号链接
+
+`listDir(path)` 一次性把整个目录塞进调用方缓冲：目录大时要么截断、要么给一个
+巨大缓冲。目录流把目录变成可增量读的句柄，和文件句柄那套对称：
+
+```zig
+var od = mox_io.OpenDir.init(io, "/var/log");
+loop.add(&od.work.c);
+const dh = try od.getResult();       // 目录句柄归调用方
+
+var cd = mox_io.CloseDir.init(io, dh);
+defer cd.close();
+
+// 每次读一小批，读到空切片为止
+while (true) {
+    var batch: [32]mox_io.DirEntry = undefined;
+    var rd = mox_io.ReadDirHandle.init(io, dh, &batch);
+    loop.add(&rd.work.c);
+    const entries = try rd.getResult();
+    if (entries.len == 0) break;
+    for (entries) |e| {
+        // e.slice(), e.is_dir
+    }
+}
+```
+
+**这里有个非平凡的正确性问题**：Linux 的 `getdents64` 与 BSD 的 `getdirentries`
+一次返回**一整批**条目，内核的文件偏移直接前移到批次末尾。如果调用方缓冲装不下
+整批，剩下的条目就丢了——下一次读从批次末尾继续，中间那段永远读不到。
+
+mox 的解法：消费完能放下的条目后，把偏移 `lseek` 回**最后一个已消费条目**记录
+的偏移字段（Linux 是 `d_off`，Darwin 是 `seekoff`，FreeBSD 是 `off`），下次从
+那里继续。测试里专门有一条用「2 个槽位读 5 个条目」来打这个。
+
+Windows 不存在这个问题：`FindFirstFileW`/`FindNextFileW` 是逐条推进的枚举器，
+只需记住「已取到但还没交付」的那一条。
+
+符号链接读取：
+
+```zig
+var rbuf: [1024]u8 = undefined;
+var rl = mox_io.ReadLink.init(io, "/etc/localtime", &rbuf);
+loop.add(&rl.work.c);
+const target = try rl.getResult();
+```
+
+目标比缓冲长时报 `error.NameTooLong` 而不是静默截断——被切掉的路径是**错的**，
+比报错更危险。对普通文件调用报 `error.NotASymLink`。
+
+Windows 侧读链接走 `FSCTL_GET_REPARSE_POINT`，同时支持
+`IO_REPARSE_TAG_SYMLINK`（符号链接）与 `IO_REPARSE_TAG_MOUNT_POINT`（junction）。
 
 ## 内存文件（VFS）
 
