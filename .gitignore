@@ -20,3 +20,4 @@ Thumbs.db
 .mox_*
 .zonprobe/
 .benchtmp/
+zig-cache-mox-onedir/
