@@ -329,10 +329,24 @@ pub const VTable = struct {
     /// 就绪位经 `Ref.bytes` 回传（`Ready.bits()`），由 `Loop` 统一翻译进
     /// `WatchFd.ready` —— 后端不必知道节点布局，三个后端形状一致。
     ///
-    /// 整槽为 `?` 是为了 Windows 能置 `null`：IOCP 是完成模型，没有「等就绪」
-    /// 这回事，硬实现要另起 `WSAPoll` 线程，等于塞第二条事件循环。为 `null`
-    /// 时调用方拿到 `error.Unsupported`。
+    /// 整槽为 `?` 是为了 Windows 能置 `null`。理由**不是**「IOCP 做不到就绪
+    /// 通知」——实测它做得到（零字节重叠读在数据到达时才完成）。真实原因是
+    /// **句柄类型**：`WatchFd` 的目标场景是管道、串口、`stdin`，而匿名管道和
+    /// 控制台句柄挂不进 IOCP（`ERROR_INVALID_PARAMETER`），只有 socket 和
+    /// 命名管道可以。所以 `WatchFd` 在 Windows 上如实返回 `Unsupported`，
+    /// 而 socket 就绪等待走下面单独的 `netPoll`。
     watchFd: ?*const fn (userdata: ?*anyopaque, fd: Handle, want: Ready, scratch: *Scratch) anyerror!?void = null,
+
+    /// 等 socket 可读/可写（`NetPoll`）。就绪位经 `Ref.bytes` 回传。
+    ///
+    /// 与 `watchFd` 分开是因为两个平台的最优实现不同：
+    /// - Linux/BSD：与 `watchFd` 完全一样，直接复用。
+    /// - Windows：`watchFd` 对管道/控制台无解，但 **socket 有解**——投一个
+    ///   零字节 `WSARecv`（等可读）或 `WSASend`（等可写），它在真正就绪时
+    ///   才完成。这走的是既有的 IOCP 完成包通道，不新增线程。
+    ///
+    /// 为 `null` 时调用方拿到 `error.Unsupported`。
+    netPoll: ?*const fn (userdata: ?*anyopaque, socket: Handle, want: Ready, scratch: *Scratch) anyerror!?void = null,
 
     // ---- Unix domain socket（可选：Windows 上整组为 `null`） -------------
     //

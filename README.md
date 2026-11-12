@@ -579,9 +579,11 @@ loop.add(&w.c);
 - **就绪位经 `Ref.bytes` 回传**，由 `Loop` 统一翻译进 `WatchFd.ready`。这样
   三个后端不必知道节点布局，形状完全一致。
 - **kqueue 一次只盯一个方向**：可读可写要挂两个 `WatchFd` 节点。
-- **Windows 返回 `error.Unsupported`**：IOCP 是完成模型，没有「等就绪」这
-  回事。硬实现要另起 `WSAPoll` 线程桥接，那等于在 IOCP 里塞第二条事件循环，
-  比 `select` 更糟。这是刻意的能力缺口，不是遗漏。
+- **Windows 返回 `error.Unsupported`**：理由**不是**「IOCP 没有等就绪这回事」
+  ——那是错的，零字节重叠读就是干净的就绪通知（见「分散聚合 I/O 与全方向
+  关闭」一节的实测表格）。真实原因是**句柄类型**：`WatchFd` 面向管道、串口、
+  `stdin`，而匿名管道和控制台句柄挂不进 IOCP（`ERROR_INVALID_PARAMETER`）。
+  socket 就绪等待由 `NetPoll` 承担，Windows 上有实现。
 
 ## 信号
 
@@ -1081,8 +1083,33 @@ socket 能收了」而不是「等这个 fd 的 read 位」。
 
 **一次性通知**：回调触发后若要继续等，必须重新 `init` + `add`。
 
-**Windows 上返回 `Unsupported`**：IOCP 的通知模型与「等 fd 就绪」不同构
-（它是完成式，不是就绪式），这是刻意的能力缺口，不是漏实现。
+**Windows 上可用**（v0.12.1 起）。实现方式是投一个零字节的 `WSARecv`
+（等可读）或 `WSASend`（等可写）：缓冲区长度为 0 时内核不搬数据，但仍然在
+**真的能读/能写**时才投递完成包——这就是就绪通知。走既有 IOCP 通道，不新增
+线程，也不需要 `WSAPoll`。
+
+> 这条是实测出来的，不是推测。我最初在文档里写「IOCP 是完成式不是就绪式，
+> 做不到就绪通知」——**那句话是错的**，探针推翻了自己。
+
+### `WatchFd` 在 Windows 上仍然不支持，但理由不同
+
+`WatchFd` 和 `NetPoll` 是**两个独立节点**，因为两个平台的最优实现不同。
+`WatchFd` 在 Windows 上返回 `Unsupported`，真实限制是**句柄类型**：
+
+| 句柄 | 能挂 IOCP | 零字节重叠读当通知 |
+|---|---|---|
+| TCP socket | 能 | 有效（已实测） |
+| 命名管道（`FILE_FLAG_OVERLAPPED`） | 能 | 有效（已实测） |
+| 匿名管道 | 不能（`ERROR_INVALID_PARAMETER`） | — |
+| 控制台 `CONIN$` | 不能（`ERROR_INVALID_PARAMETER`） | — |
+
+`WatchFd` 的文档场景正是「管道、串口、`stdin` 这类 mox 不认识语义的 fd」，
+而这几类在 Windows 上恰恰挂不进 IOCP。socket 是能挂的那一类，所以 `NetPoll`
+单独有实现。
+
+顺带说明为什么不用 `WSAPoll`：它需要一条**阻塞在 `WSAPoll` 上的线程**，再
+把结果投回循环——那等于塞第二条事件循环，与「单线程事件循环 + 完成包」的
+架构冲突。零字节重叠 I/O 没有这个问题。
 
 ## 内存文件（VFS）
 

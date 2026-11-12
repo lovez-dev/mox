@@ -318,6 +318,20 @@ pub const Loop = struct {
                 self.pushReadySync(c);
             },
 
+            .net_poll => {
+                const p: *root.NetPoll = @fieldParentPtr("c", c);
+                const vt = self.io.vtable.netPoll orelse {
+                    c.err = error.Unsupported;
+                    self.pushReadySync(c);
+                    return;
+                };
+                const r = vt(self.io.userdata, p.socket, p.want, &c.ov) catch |e| {
+                    c.err = e;
+                    self.pushReadySync(c);
+                    return;
+                };
+                if (r) |_| self.pushReadySync(c);
+            },
             .net_sendmsg => {
                 const t: *root.NetSendMsg = @fieldParentPtr("c", c);
                 const vt = self.io.vtable.sendMsg orelse {
@@ -487,6 +501,17 @@ pub const Loop = struct {
         if (c.op == .watch_fd and c.err == null) {
             const w: *root.WatchFd = @fieldParentPtr("c", c);
             w.ready = root.Ready.fromBits(@truncate(ref.bytes));
+        }
+        if (c.op == .net_poll and c.err == null) {
+            const p: *root.NetPoll = @fieldParentPtr("c", c);
+            var got = root.Ready.fromBits(@truncate(ref.bytes));
+            // Windows 的零字节重叠读完成时 `bytes` 是 0（没搬数据），
+            // 不带就绪位。但「完成」本身就说明等到的方向就绪了，
+            // 所以把 `want` 并进去。Linux/BSD 的 `bytes` 已带真实位，
+            // 并集不会丢 `hangup`/`failed`。
+            got.read = got.read or p.want.read;
+            got.write = got.write or p.want.write;
+            p.readiness = got;
         }
         if (c.op == .net_sendmsg and c.err == null) {
             const m: *root.NetSendMsg = @fieldParentPtr("c", c);

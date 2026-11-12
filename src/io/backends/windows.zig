@@ -1012,6 +1012,54 @@ fn vtRecvMsg(
     }
 }
 
+/// 等 socket 可读/可写。
+///
+/// **实现原理**：投一个零字节的 `WSARecv`（等可读）或 `WSASend`（等可写）。
+/// 缓冲区长度为 0 时这两个调用不搬数据，但内核仍然在「真的能读/能写」时
+/// 才投递完成包——正好就是「就绪通知」。走的是既有 IOCP 通道，不新增线程，
+/// 也不需要 `WSAPoll`。
+///
+/// 这是实测结论，不是推测：探针验证过零字节 `WSARecv` 在数据到达前不完成、
+/// 到达后完成（`bytes=0`）；零字节 `WSASend` 在可写时立即完成。
+///
+/// **与 `watchFd` 的关系**：`watchFd` 在 Windows 上仍然是 `null`。它的目标
+/// 场景是管道、串口、`stdin`，而匿名管道和控制台句柄挂不进 IOCP
+/// （`ERROR_INVALID_PARAMETER`）。socket 是能挂的那一类，所以单独有这条路径。
+fn vtNetPoll(
+    userdata: ?*anyopaque,
+    socket: root.Handle,
+    want: root.Ready,
+    scratch: *root.Scratch,
+) anyerror!?void {
+    _ = userdata;
+    if (!want.read and !want.write) return error.NothingToWatch;
+
+    // OVERLAPPED 与零长缓冲都必须活到完成包被收割。`scratch` 正是为此存在。
+    const ov: *OVERLAPPED = @ptrCast(@alignCast(&scratch.bytes));
+    ov.* = std.mem.zeroes(OVERLAPPED);
+
+    // 零长缓冲：指向 scratch 自己的尾部（有效地址 + 长度 0）。
+    const zero_buf: [*]u8 = @ptrCast(&scratch.bytes);
+    var wsabuf = [1]WSABUF{.{ .len = 0, .buf = zero_buf }};
+    const s: SOCKET = @intCast(socket);
+
+    // 可读优先：同时要两个方向时先等可读（与 kqueue 的取舍一致，
+    // 调用方要两个方向应当用两个 NetPoll 节点）。
+    var flags: u32 = 0;
+    const rc = if (want.read)
+        c.WSARecv(s, &wsabuf, 1, null, &flags, ov, null)
+    else
+        c.WSASend(s, &wsabuf, 1, null, 0, ov, null);
+
+    if (rc != 0) {
+        const e = lastError();
+        // WSA_IO_PENDING 是正常路径：完成包稍后投递到 IOCP。
+        if (e != WSA_IO_PENDING) return error.PollFailed;
+    }
+    // 同步完成（rc == 0）时 IOCP 仍会投递完成包，`return null` 表示
+    // 「等待完成包」，与其它异步原语一致。
+    return null;
+}
 fn vtBind(userdata: ?*anyopaque, socket: root.Handle, address: net.IpAddress) anyerror!void {
     _ = userdata;
     try bindSocket(@intCast(socket), address);
@@ -1153,6 +1201,7 @@ const vtable_storage: root.VTable = .{
     .shutdown = vtShutdown,
     .sendMsg = vtSendMsg,
     .recvMsg = vtRecvMsg,
+    .netPoll = vtNetPoll,
     .bind = vtBind,
     .listen = vtListen,
     .fileSize = vtFileSize,

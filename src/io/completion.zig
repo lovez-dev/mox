@@ -35,6 +35,8 @@ pub const Op = enum {
     net_recvmsg,
     /// 全方向关闭（`shutdown`）。
     net_shutdown,
+    /// 等 socket 可读/可写（`NetPoll`）。
+    net_poll,
 };
 
 /// 所有操作的基类。具体完成体把它作为第一个字段 `c` 内嵌，
@@ -129,39 +131,46 @@ pub const WatchFd = struct {
     }
 };
 
-/// 等 socket 变成可读或可写。
+/// 等 socket 变成可读或可写。zio 里对应 `NetPoll`。
 ///
-/// 这是 `WatchFd` 的语义化封装——底层完全一样（都是「等 fd 的某个方向就绪」），
-/// 区别只在可读性：调用方想说的是「等这个 socket 能收了」，而不是「等这个
-/// fd 的 read 位」。zio 里对应 `NetPoll`。
+/// 与 `WatchFd` 的区别是**独立节点**而不是包装：Windows 上两者走完全不同的
+/// 实现（`WatchFd` 对管道/控制台无解，socket 却有零字节重叠 I/O 的解法），
+/// 包装会让那个差异无处安放。Linux/BSD 上后端把两者都映射到同一套就绪
+/// 机制，调用方看不出区别。
 ///
 /// 注意：**一次性**通知。回调触发后若要继续等，必须重新 `init` + `add`。
 pub const NetPoll = struct {
-    inner: WatchFd,
+    c: Completion = .{ .op = .net_poll },
+    socket: Handle,
+    /// 想等哪个方向。
+    want: Ready,
+    /// 回填：实际就绪的方向。回调里读。
+    readiness: Ready = .{},
 
     pub const Event = enum { recv, send };
 
     pub fn init(socket: Handle, event: Event) NetPoll {
         return .{
-            .inner = WatchFd.init(socket, switch (event) {
+            .socket = socket,
+            .want = switch (event) {
                 .recv => .{ .read = true },
                 .send => .{ .write = true },
-            }),
+            },
         };
     }
 
     /// 拿到可提交的完成体。
     pub fn completion(self: *NetPoll) *Completion {
-        return &self.inner.c;
+        return &self.c;
     }
 
     /// 回调里读：是否真的就绪了。
     pub fn ready(self: *const NetPoll) Ready {
-        return self.inner.ready;
+        return self.readiness;
     }
 
     pub fn getResult(self: *const NetPoll) !void {
-        if (self.inner.c.err) |e| return e;
+        if (self.c.err) |e| return e;
     }
 };
 

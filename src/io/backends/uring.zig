@@ -1045,6 +1045,8 @@ const vtable_storage: root.VTable = .{
     .updateConnect = vtUpdateConnect,
     .cancel = vtCancel,
     .watchFd = vtWatchFd,
+    // socket 就绪等待与任意 fd 走同一套机制，直接复用。
+    .netPoll = vtWatchFd,
     .readFileAsync = vtReadFileAsync,
     .writeFileAsync = vtWriteFileAsync,
     .sendFileTo = vtSendFileTo,

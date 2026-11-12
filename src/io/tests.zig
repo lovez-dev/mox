@@ -3342,9 +3342,6 @@ test "NetRecvMsg：一个数据包摊到两个缓冲，顺序与长度正确" {
 }
 
 test "NetPoll：socket 可读时立即完成" {
-    // Windows 后端没有 watchFd（IOCP 的通知模型与「等 fd 就绪」不同构），
-    // 所以 NetPoll 在那里如实返回 Unsupported。
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const stopCb = struct {
         fn cb(loop: *Loop, c: *Completion) void {
             _ = c;
@@ -3366,5 +3363,50 @@ test "NetPoll：socket 可读时立即完成" {
     l.add(poll.completion());
     try l.run();
     try poll.getResult();
+    try std.testing.expect(poll.ready().read);
+}
+
+test "NetPoll 真的会等：无数据时不完成，来了数据才完成" {
+    var l = try testLoop();
+    defer l.deinit();
+
+    const pair = try makeTcpPair();
+    defer pair.close();
+    try l.associate(pair.server, 1);
+
+    // **关键**：此刻 socket 上没有任何数据。NetPoll 必须「挂着」而不是
+    // 立即完成——否则它就是个永远返回就绪的假实现。用 300ms 定时器证明
+    // 这段时间内它没完成。
+    const Ctx = struct {
+        var poll_done: bool = false;
+        fn onPoll(loop: *Loop, c: *Completion) void {
+            _ = c;
+            poll_done = true;
+            loop.stop();
+        }
+        fn onDeadline(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    };
+    Ctx.poll_done = false;
+
+    var poll = root.NetPoll.init(pair.server, .recv);
+    poll.completion().callback = &Ctx.onPoll;
+    l.add(poll.completion());
+
+    var deadline = root.Timer.init(300);
+    deadline.c.callback = &Ctx.onDeadline;
+    l.add(&deadline.c);
+    try l.run();
+
+    // 定时器先到：poll 还没完成，正是我们要的。
+    try std.testing.expect(!Ctx.poll_done);
+
+    // 现在发数据，再跑一次——这次必须完成。
+    _ = try platform.sendBlocking(pair.client, "go");
+    l.add(poll.completion());
+    try l.run();
+    try std.testing.expect(Ctx.poll_done);
     try std.testing.expect(poll.ready().read);
 }
