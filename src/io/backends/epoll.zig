@@ -22,7 +22,7 @@ const INVALID_HANDLE = root.INVALID_HANDLE;
 /// 未取完的留在 `state.events` 里，下一次 `waitBatch` 优先消费。
 const MAX_EVENTS = 64;
 
-const Kind = enum { recv, send, accept, connect, udp_recv, udp_send, watch };
+const Kind = enum { recv, send, accept, connect, udp_recv, udp_send, watch, recvmsg, sendmsg };
 
 const Pending = struct {
     fd: i32,
@@ -36,6 +36,8 @@ const Pending = struct {
     /// `udp_send` 的 sockaddr 存储：编在调用方节点的 `hdr` 里。
     hdr: []usize = &.{},
     hdr_len: linux.socklen_t = 0,
+    /// `recvmsg`/`sendmsg` 的 iovec 来源：指向调用方节点的 bufs 切片。
+    msg_bufs: ?[]const []const u8 = null,
 };
 
 const State = struct {
@@ -145,12 +147,20 @@ fn vtSendMsg(
     hdr: []usize,
     scratch: *root.Scratch,
 ) anyerror!void {
-    _ = userdata;
     _ = hdr;
-    _ = scratch;
-    // epoll 后端没有原生 sendmsg 的异步形式（它只能等可写再同步 send），
-    // 这里直接同步发完。语义正确，只是不占异步槽位。
-    return uring.sendMsgBlocking(socket, bufs);
+    // **不能同步 sendmsg**：socket 写不进去时会把整个循环线程卡住。
+    // 正确做法与 `vtSend` 一致：等 EPOLLOUT，就绪后在 reap 里做那一次
+    // 系统调用。
+    const state = stateOf(userdata);
+    const fd = fdOf(socket);
+    try state.pending.append(state.alloc, .{
+        .fd = fd,
+        .events = linux.EPOLL.OUT,
+        .kind = .sendmsg,
+        .scratch = scratch,
+        .msg_bufs = bufs,
+    });
+    try arm(state, fd, linux.EPOLL.OUT);
 }
 
 fn vtRecvMsg(
@@ -160,10 +170,18 @@ fn vtRecvMsg(
     hdr: []usize,
     scratch: *root.Scratch,
 ) anyerror!void {
-    _ = userdata;
     _ = hdr;
-    _ = scratch;
-    return uring.recvMsgBlocking(socket, bufs);
+    // 理由同 `vtSendMsg`：绝不能同步 recvmsg。
+    const state = stateOf(userdata);
+    const fd = fdOf(socket);
+    try state.pending.append(state.alloc, .{
+        .fd = fd,
+        .events = linux.EPOLL.IN,
+        .kind = .recvmsg,
+        .scratch = scratch,
+        .msg_bufs = @ptrCast(bufs),
+    });
+    try arm(state, fd, linux.EPOLL.IN);
 }
 
 fn vtBind(userdata: ?*anyopaque, socket: Handle, address: net.IpAddress) anyerror!void {
@@ -576,6 +594,37 @@ fn finishOne(state: *State, p: Pending, ev_events: u32) root.Ref {
                 @ptrCast(@alignCast(p.from.ptr)),
                 &len,
             ));
+        },
+        .sendmsg => {
+            // 可写了：这时 sendmsg 不会阻塞。
+            const bufs = p.msg_bufs orelse &.{};
+            var iov: [uring.IOV_MAX]std.posix.iovec_const = undefined;
+            for (bufs, 0..) |b, i| iov[i] = .{ .base = b.ptr, .len = b.len };
+            var msg: linux.msghdr_const = .{
+                .name = null,
+                .namelen = 0,
+                .iov = &iov,
+                .iovlen = @intCast(bufs.len),
+                .control = null,
+                .controllen = 0,
+                .flags = 0,
+            };
+            res = @intCast(linux.sendmsg(p.fd, &msg, linux.MSG.NOSIGNAL));
+        },
+        .recvmsg => {
+            const bufs = p.msg_bufs orelse &.{};
+            var iov: [uring.IOV_MAX]std.posix.iovec = undefined;
+            for (bufs, 0..) |b, i| iov[i] = .{ .base = @constCast(b.ptr), .len = b.len };
+            var msg: linux.msghdr = .{
+                .name = null,
+                .namelen = 0,
+                .iov = &iov,
+                .iovlen = @intCast(bufs.len),
+                .control = null,
+                .controllen = 0,
+                .flags = 0,
+            };
+            res = @intCast(linux.recvmsg(p.fd, &msg, 0));
         },
         .watch => {
             // 不代收数据，只把内核给的方向位翻成 `Ready` 回填给调用方。

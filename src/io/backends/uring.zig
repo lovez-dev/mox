@@ -408,7 +408,7 @@ fn vtUdpSend(
 ///
 /// iovec 数组长度取 32：够 HTTP/2 帧头 + 若干段载荷，且与
 /// `MSG_HDR_WORDS` 的预算对得上（见下方 comptime 断言）。
-const IOV_MAX = 32;
+pub const IOV_MAX = 32;
 
 const SendMsgHdr = extern struct {
     msg: linux.msghdr_const,

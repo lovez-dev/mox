@@ -20,7 +20,7 @@ const net = std.Io.net;
 const Handle = root.Handle;
 const INVALID_HANDLE = root.INVALID_HANDLE;
 
-const Kind = enum { recv, send, accept, connect, udp_recv, udp_send, watch };
+const Kind = enum { recv, send, accept, connect, udp_recv, udp_send, watch, recvmsg, sendmsg };
 
 /// `EVFILT_USER` 唤醒源的 ident。固定值即可，只要不与真实 fd 冲突；
 /// 真实 fd 从 3 起，用 1 是安全的。
@@ -37,6 +37,9 @@ const Pending = struct {
     /// `udp_send` 的 sockaddr 存储：编在调用方节点的 `hdr` 里，这里只留指针和长度。
     hdr: []usize = &.{},
     hdr_len: c.socklen_t = 0,
+    /// `recvmsg`/`sendmsg` 的 iovec 来源：指向调用方节点的 bufs 切片。
+    /// 只用 `?[]const []const u8` 一种形态，recvmsg 时由后端 `@constCast`。
+    msg_bufs: ?[]const []const u8 = null,
 };
 
 const State = struct {
@@ -335,6 +338,38 @@ fn finishOne(state: *State, p: Pending, ev_flags: u16) root.Ref {
             _ = c.getsockopt(fdOf(p.ident), c.SOL.SOCKET, c.SO.ERROR, &err, &len);
             res = if (err == 0) 0 else -err;
         },
+        .sendmsg => {
+            // 可写了：这时 sendmsg 不会阻塞（内核至少能收一部分）。
+            // 返回字节数交给 Loop 回填 NetSendMsg.sent。
+            const bufs = p.msg_bufs orelse &.{};
+            var iov: [IOV_MAX]std.posix.iovec_const = undefined;
+            for (bufs, 0..) |b, i| iov[i] = .{ .base = b.ptr, .len = b.len };
+            var msg: c.msghdr_const = .{
+                .name = null,
+                .namelen = 0,
+                .iov = @ptrCast(&iov),
+                .iovlen = @intCast(bufs.len),
+                .control = null,
+                .controllen = 0,
+                .flags = 0,
+            };
+            res = c.sendmsg(fdOf(p.ident), &msg, 0);
+        },
+        .recvmsg => {
+            const bufs = p.msg_bufs orelse &.{};
+            var iov: [IOV_MAX]std.posix.iovec = undefined;
+            for (bufs, 0..) |b, i| iov[i] = .{ .base = @constCast(b.ptr), .len = b.len };
+            var msg: c.msghdr = .{
+                .name = null,
+                .namelen = 0,
+                .iov = @ptrCast(&iov),
+                .iovlen = @intCast(bufs.len),
+                .control = null,
+                .controllen = 0,
+                .flags = 0,
+            };
+            res = c.recvmsg(fdOf(p.ident), &msg, 0);
+        },
         .watch => {
             // 不代收数据，只回填方向。`EVFILT.READ` 就绪 = 可读，
             // `EV_EOF` 表示对端关闭（此时读会拿到 0 字节）。
@@ -537,11 +572,20 @@ fn vtSendMsg(
     hdr: []usize,
     scratch: *root.Scratch,
 ) anyerror!void {
-    _ = userdata;
     _ = hdr;
-    _ = scratch;
-    // kqueue 没有原生 sendmsg 的异步形式，同步发完即可。
-    try sendMsgBlocking(socket, bufs);
+    // **不能同步 sendmsg**：socket 可能暂时写不进去，同步调用会把整个
+    // 循环线程卡住（macOS CI 实测 NetRecvMsg 挂死就是这么来的）。
+    // 正确做法与 `vtSend` 一致：注册 EVFILT.WRITE，就绪后在 reap 里
+    // 同步执行那一次系统调用。
+    const state = stateOf(userdata);
+    try state.pending.append(state.alloc, .{
+        .ident = socket,
+        .filter = c.EVFILT.WRITE,
+        .kind = .sendmsg,
+        .scratch = scratch,
+        .msg_bufs = bufs,
+    });
+    try evAdd(state, socket, c.EVFILT.WRITE, c.EV.ONESHOT);
 }
 
 fn vtRecvMsg(
@@ -551,10 +595,17 @@ fn vtRecvMsg(
     hdr: []usize,
     scratch: *root.Scratch,
 ) anyerror!void {
-    _ = userdata;
     _ = hdr;
-    _ = scratch;
-    try recvMsgBlocking(socket, bufs);
+    // 理由同 `vtSendMsg`：绝不能同步 recvmsg。
+    const state = stateOf(userdata);
+    try state.pending.append(state.alloc, .{
+        .ident = socket,
+        .filter = c.EVFILT.READ,
+        .kind = .recvmsg,
+        .scratch = scratch,
+        .msg_bufs = @ptrCast(bufs),
+    });
+    try evAdd(state, socket, c.EVFILT.READ, c.EV.ONESHOT);
 }
 
 fn vtBind(userdata: ?*anyopaque, socket: root.Handle, address: net.IpAddress) anyerror!void {
@@ -882,7 +933,7 @@ pub fn shutdownSend(h: Handle) !void {
 }
 
 /// iovec 上限，与 `MSG_HDR_WORDS` 的预算对应。
-const IOV_MAX = 32;
+pub const IOV_MAX = 32;
 
 /// 阻塞版分散聚合发送。
 pub fn sendMsgBlocking(h: Handle, bufs: []const []const u8) !void {
