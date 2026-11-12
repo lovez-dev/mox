@@ -182,9 +182,107 @@ pub const Context = struct {
     pub fn json(self: *const Context, comptime T: type) !std.json.Parsed(T) {
         return std.json.parseFromSlice(T, self.gpa, self.body, .{});
     }
+
+    /// 解析 Cookie 请求头，返回指定名称的 cookie 值（指向原始头字符串，不分配）。
+    pub fn cookie(self: *const Context, name: []const u8) ?[]const u8 {
+        const hdr = self.request.header("cookie") orelse return null;
+        var parts = std.mem.splitSequence(u8, hdr, "; ");
+        while (parts.next()) |part| {
+            const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
+            const k = std.mem.trim(u8, part[0..eq], " ");
+            if (std.mem.eql(u8, k, name)) return part[eq + 1 ..];
+        }
+        return null;
+    }
 };
 
 pub const Handler = *const fn (*Context) anyerror!Response;
+
+
+// ============================================================================
+// Problem Details（RFC 9457）
+// ============================================================================
+
+/// RFC 9457 结构化错误响应。
+/// `body` 字段由 `ctx.gpa` 分配，调用方负责 `gpa.free(response.body)`。
+/// 推荐搭配 `error_handler` 或 `Context.problem()` 使用。
+pub fn problem(
+    gpa: std.mem.Allocator,
+    status: std.http.Status,
+    title: []const u8,
+    detail: []const u8,
+) !Response {
+    // 用带引号字段名的匿名 struct 保证 JSON key 合法（"type" 是 Zig 关键字）。
+    const pd = struct {
+        @"type": []const u8,
+        status: u16,
+        title: []const u8,
+        detail: []const u8,
+    }{
+        .@"type" = "about:blank",
+        .status = @backingInt(status),
+        .title = title,
+        .detail = detail,
+    };
+    const body = try std.json.Stringify.valueAlloc(gpa, pd, .{});
+    return .{
+        .status = status,
+        .body = body,
+        .content_type = "application/problem+json; charset=utf-8",
+    };
+}
+
+// ============================================================================
+// Cookie 支持
+// ============================================================================
+
+/// Set-Cookie 头构建选项。
+pub const CookieOptions = struct {
+    /// Cookie 路径，默认 "/"。
+    path: []const u8 = "/",
+    /// 是否加 Secure 标志（HTTPS 专用）。
+    secure: bool = false,
+    /// 是否加 HttpOnly 标志（阻止 JS 访问）。
+    http_only: bool = true,
+    /// SameSite 策略：Strict / Lax / None，空字符串则不加。
+    same_site: []const u8 = "Lax",
+    /// Cookie 有效时长（秒）；null = 会话 cookie。
+    max_age: ?i64 = null,
+};
+
+/// 构建 `set-cookie` 响应头（值由 `gpa` 分配，调用方负责释放）。
+///
+///     var sc_hdr = try mox.setCookieHeader(ctx.gpa, "session", token, .{});
+///     defer ctx.gpa.free(sc_hdr.value);
+///     return .{ .headers = &.{sc_hdr} };
+pub fn setCookieHeader(
+    gpa: std.mem.Allocator,
+    name: []const u8,
+    value: []const u8,
+    opts: CookieOptions,
+) !Header {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    try buf.appendSlice(gpa, name);
+    try buf.append(gpa, '=');
+    try buf.appendSlice(gpa, value);
+    if (opts.path.len > 0) {
+        try buf.appendSlice(gpa, "; Path=");
+        try buf.appendSlice(gpa, opts.path);
+    }
+    if (opts.secure) try buf.appendSlice(gpa, "; Secure");
+    if (opts.http_only) try buf.appendSlice(gpa, "; HttpOnly");
+    if (opts.same_site.len > 0) {
+        try buf.appendSlice(gpa, "; SameSite=");
+        try buf.appendSlice(gpa, opts.same_site);
+    }
+    if (opts.max_age) |age| {
+        const age_str = try std.fmt.allocPrint(gpa, "; Max-Age={d}", .{age});
+        defer gpa.free(age_str);
+        try buf.appendSlice(gpa, age_str);
+    }
+    return .{ .name = "set-cookie", .value = try buf.toOwnedSlice(gpa) };
+}
 
 pub const Route = struct {
     method: std.http.Method,

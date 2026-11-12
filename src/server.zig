@@ -174,6 +174,43 @@ const Server = struct {
     }
 };
 
+// ============================================================================
+// 全局请求指标（原子计数器，单节点内存统计）
+// ============================================================================
+/// 总请求数（所有连接累计）
+var metrics_total_requests = std.atomic.Value(u64).init(0);
+/// 总错误数（handler 返回错误 + not_found 兜底算作 4xx，不计入）
+var metrics_total_errors = std.atomic.Value(u64).init(0);
+/// 当前活跃连接数（register/unregister 同步）
+var metrics_active_conns = std.atomic.Value(u64).init(0);
+
+/// 读取当前指标快照（非事务性，各字段独立 load）。
+pub const Metrics = struct {
+    total_requests: u64,
+    total_errors: u64,
+    active_conns: u64,
+};
+pub fn getMetrics() Metrics {
+    return .{
+        .total_requests = metrics_total_requests.load(.monotonic),
+        .total_errors = metrics_total_errors.load(.monotonic),
+        .active_conns = metrics_active_conns.load(.monotonic),
+    };
+}
+
+/// 可直接注册为路由 handler 的指标端点。
+/// 返回 JSON：{"total_requests":N,"total_errors":N,"active_conns":N}
+pub fn metricsHandler(ctx: *types.Context) anyerror!types.Response {
+    const m = getMetrics();
+    const body = try std.fmt.allocPrint(
+        ctx.gpa,
+        "{{\"total_requests\":{d},\"total_errors\":{d},\"active_conns\":{d}}}",
+        .{ m.total_requests, m.total_errors, m.active_conns },
+    );
+    return .{ .body = body, .content_type = "application/json" };
+}
+
+
 fn registerConn(server: *Server, conn: *Connection) void {
     conn.server = server;
     conn.prev = null;
@@ -181,6 +218,7 @@ fn registerConn(server: *Server, conn: *Connection) void {
     if (server.conns) |head| head.prev = conn;
     server.conns = conn;
     server.active_conns += 1;
+    _ = metrics_active_conns.fetchAdd(1, .monotonic);
 }
 
 fn unregisterConn(server: *Server, conn: *Connection) void {
@@ -189,6 +227,7 @@ fn unregisterConn(server: *Server, conn: *Connection) void {
     conn.prev = null;
     conn.next = null;
     if (server.active_conns > 0) server.active_conns -= 1;
+    _ = metrics_active_conns.fetchSub(1, .monotonic);
 }
 
 /// 投递一次 accept。三条前置条件任一不满足就**不**投：
@@ -465,6 +504,8 @@ fn handleRequest(conn: *Connection, req: http.Request) void {
         if (s.request_timeout_ms > 0) armRequestTimeout(conn, s.request_timeout_ms);
     }
 
+    // 全局请求计数
+    _ = metrics_total_requests.fetchAdd(1, .monotonic);
     var params: Params = .{};
     const handler = conn.router.match(req.method, req.path, &params) orelse {
         // 路由未命中：调用可自定义的 not_found handler
@@ -482,6 +523,7 @@ fn handleRequest(conn: *Connection, req: http.Request) void {
     const response = handler(&ctx) catch |err| {
         // handler 出错：调用可自定义的 error_handler
         disarmRequestTimeout(conn);
+        _ = metrics_total_errors.fetchAdd(1, .monotonic);
         const err_resp = if (srv) |s|
             s.error_handler(&ctx, err)
         else

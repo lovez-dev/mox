@@ -47,6 +47,12 @@ pub const WsOpcode = types.WsOpcode;
 pub const WsHandler = types.WsHandler;
 pub const SseWriter = types.SseWriter;
 pub const SseHandler = types.SseHandler;
+pub const problem = types.problem;
+pub const CookieOptions = types.CookieOptions;
+pub const setCookieHeader = types.setCookieHeader;
+pub const Metrics = server.Metrics;
+pub const getMetrics = server.getMetrics;
+pub const metricsHandler = server.metricsHandler;
 
 test {
     @import("std").testing.refAllDecls(@This());
