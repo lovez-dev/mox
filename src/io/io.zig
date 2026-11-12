@@ -179,6 +179,17 @@ pub const VTable = struct {
     writeFileHandle: ?*const fn (userdata: ?*anyopaque, file: Handle, offset: u64, bytes: []const u8) anyerror!usize = null,
     /// 关闭句柄。句柄无效或重复关闭不报错（幂等）。
     closeFile: ?*const fn (userdata: ?*anyopaque, file: Handle) void = null,
+
+    // ---- 句柄级元数据与同步（阶段 B）--------------------------------------
+    // 路径式 `statPath`/`truncateFile` 要先解析路径再 open，句柄在手时
+    // 再走一遍路径既浪费又可能竞态（路径被换掉）。这三个原语直接吃句柄。
+
+    /// 取句柄对应的元数据（类型/大小/mtime）。不需要重新解析路径。
+    statFile: ?*const fn (userdata: ?*anyopaque, file: Handle) anyerror!Stat = null,
+    /// 把句柄对应文件截断到 `size` 字节。句柄必须可写。
+    setFileSize: ?*const fn (userdata: ?*anyopaque, file: Handle, size: u64) anyerror!void = null,
+    /// 把缓冲内容刷到磁盘（`fsync` / `FlushFileBuffers`）。
+    syncFile: ?*const fn (userdata: ?*anyopaque, file: Handle) anyerror!void = null,
     /// 把文件阻塞截断到 `size` 字节（`Work` 池线程）。
     truncateFile: *const fn (userdata: ?*anyopaque, path: []const u8, size: u64) anyerror!void,
     /// 删除文件（`Work` 池线程）。平台层实现返回 `void`，**所有**失败
@@ -340,6 +351,9 @@ pub const OpenFile = @import("file.zig").OpenFile;
 pub const ReadFileHandle = @import("file.zig").ReadFileHandle;
 pub const WriteFileHandle = @import("file.zig").WriteFileHandle;
 pub const CloseFile = @import("file.zig").CloseFile;
+pub const StatFile = @import("file.zig").StatFile;
+pub const SetFileSize = @import("file.zig").SetFileSize;
+pub const SyncFile = @import("file.zig").SyncFile;
 
 /// 编译期选定的本目标后端。新增后端 = 写一个导出 `create(allocator) !Io`
 /// 的文件，再在这里加一个分支。

@@ -13,6 +13,10 @@ const OpenFile = root.OpenFile;
 const ReadFileHandle = root.ReadFileHandle;
 const WriteFileHandle = root.WriteFileHandle;
 const CloseFile = root.CloseFile;
+// 句柄级元数据与同步（阶段 B）
+const StatFile = root.StatFile;
+const SetFileSize = root.SetFileSize;
+const SyncFile = root.SyncFile;
 
 // Options：运行时配置必须真的传到后端，不能只是把参数接住扔掉。
 test "openWith 的 queue_size 非法值报错，合法值生效" {
@@ -2457,4 +2461,166 @@ test "文件句柄：CloseFile 重复关闭不 panic（幂等）" {
     CloseFile.init(l.io, h).close();
     CloseFile.init(l.io, h).close(); // 第二次不能崩
     CloseFile.init(l.io, h).close(); // 第三次也不能
+}
+
+// ---- 句柄级元数据与同步（阶段 B）------------------------------------------
+// 这三条打的是「路径式 API 做不到」的部分：statFile 直接吃句柄，
+// 不存在「open 之后路径被换掉」的竞态；setFileSize / syncFile 同理。
+
+test "句柄元数据：statFile 报告真实大小，且随写入增长" {
+    // 回调一触发就停机：本层全部走 Work 池，单步驱动。
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "sfst");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var fbuf: [600]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&fbuf, "{s}/s.txt", .{dir});
+    defer l.deleteFile(fpath);
+
+    var open_node = OpenFile.init(l.io, fpath, .read_write);
+    open_node.work.c.callback = stopCb;
+    l.add(&open_node.work.c);
+    try l.run();
+    const h = try open_node.getResult();
+    defer CloseFile.init(l.io, h).close();
+
+    // 空文件：大小 0，类型是普通文件
+    var st1 = StatFile.init(l.io, h);
+    st1.work.c.callback = stopCb;
+    l.add(&st1.work.c);
+    try l.run();
+    const s1 = try st1.getResult();
+    try std.testing.expectEqual(@as(u64, 0), s1.size);
+    try std.testing.expectEqual(root.FileKind.file, s1.kind);
+
+    // 写 7 字节后再 stat：大小必须跟着变。
+    // 这条是关键——如果 statFile 误用了路径式 stat 或缓存了旧值，
+    // 这里会读到 0。
+    var w = WriteFileHandle.init(l.io, h, 0, "1234567");
+    w.work.c.callback = stopCb;
+    l.add(&w.work.c);
+    try l.run();
+    try std.testing.expectEqual(@as(usize, 7), try w.getResult());
+
+    var st2 = StatFile.init(l.io, h);
+    st2.work.c.callback = stopCb;
+    l.add(&st2.work.c);
+    try l.run();
+    try std.testing.expectEqual(@as(u64, 7), (try st2.getResult()).size);
+}
+
+test "句柄元数据：setFileSize 截断后大小与内容都变" {
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "sfss");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var fbuf: [600]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&fbuf, "{s}/z.txt", .{dir});
+    defer l.deleteFile(fpath);
+
+    try l.writeFileAll(fpath, "0123456789"); // 10 字节
+
+    var open_node = OpenFile.init(l.io, fpath, .read_write);
+    open_node.work.c.callback = stopCb;
+    l.add(&open_node.work.c);
+    try l.run();
+    const h = try open_node.getResult();
+    defer CloseFile.init(l.io, h).close();
+
+    // 截到 4 字节
+    var trunc = SetFileSize.init(l.io, h, 4);
+    trunc.work.c.callback = stopCb;
+    l.add(&trunc.work.c);
+    try l.run();
+    try trunc.getResult();
+
+    // 读回只剩前 4 字节（不只看 size，还要看内容真的被切了）
+    var buf: [32]u8 = undefined;
+    var rd = ReadFileHandle.init(l.io, h, 0, &buf);
+    rd.work.c.callback = stopCb;
+    l.add(&rd.work.c);
+    try l.run();
+    try std.testing.expectEqualStrings("0123", try rd.getResult());
+
+    // statFile 也报告 4
+    var st = StatFile.init(l.io, h);
+    st.work.c.callback = stopCb;
+    l.add(&st.work.c);
+    try l.run();
+    try std.testing.expectEqual(@as(u64, 4), (try st.getResult()).size);
+
+    // 反向：扩展到 8 字节，多出来的部分是零（稀疏扩展的常见语义）
+    var grow = SetFileSize.init(l.io, h, 8);
+    grow.work.c.callback = stopCb;
+    l.add(&grow.work.c);
+    try l.run();
+    try grow.getResult();
+
+    var st2 = StatFile.init(l.io, h);
+    st2.work.c.callback = stopCb;
+    l.add(&st2.work.c);
+    try l.run();
+    try std.testing.expectEqual(@as(u64, 8), (try st2.getResult()).size);
+}
+
+test "句柄元数据：syncFile 在有效句柄上成功" {
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "sfsy");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var fbuf: [600]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&fbuf, "{s}/y.txt", .{dir});
+    defer l.deleteFile(fpath);
+
+    var open_node = OpenFile.init(l.io, fpath, .read_write);
+    open_node.work.c.callback = stopCb;
+    l.add(&open_node.work.c);
+    try l.run();
+    const h = try open_node.getResult();
+    defer CloseFile.init(l.io, h).close();
+
+    var w = WriteFileHandle.init(l.io, h, 0, "durable");
+    w.work.c.callback = stopCb;
+    l.add(&w.work.c);
+    try l.run();
+    try std.testing.expectEqual(@as(usize, 7), try w.getResult());
+
+    // 刷盘必须成功。注意：这条**不**能证明数据真的落盘了——
+    // 断电才验证得了，测试里没有那个能力。它只证明调用链通、
+    // 且没有把错误吞掉。
+    var sync = SyncFile.init(l.io, h);
+    sync.work.c.callback = stopCb;
+    l.add(&sync.work.c);
+    try l.run();
+    try sync.getResult();
 }

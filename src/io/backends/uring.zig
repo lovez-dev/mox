@@ -840,6 +840,22 @@ fn vtCloseFile(userdata: ?*anyopaque, file: root.Handle) void {
     closeFile(file);
 }
 
+fn vtStatFile(userdata: ?*anyopaque, file: root.Handle) anyerror!root.Stat {
+    _ = userdata;
+    const st = try statFile(file);
+    return .{ .kind = @fromBackingInt(@intCast(@backingInt(st.kind))), .size = st.size, .mtime_ms = st.mtime_ms };
+}
+
+fn vtSetFileSize(userdata: ?*anyopaque, file: root.Handle, size: u64) anyerror!void {
+    _ = userdata;
+    return setFileSize(file, size);
+}
+
+fn vtSyncFile(userdata: ?*anyopaque, file: root.Handle) anyerror!void {
+    _ = userdata;
+    return syncFile(file);
+}
+
 fn vtMakeDir(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
     _ = userdata;
     return makeDir(path, mode);
@@ -895,6 +911,9 @@ const vtable_storage: root.VTable = .{
     .readFileHandle = vtReadFileHandle,
     .writeFileHandle = vtWriteFileHandle,
     .closeFile = vtCloseFile,
+    .statFile = vtStatFile,
+    .setFileSize = vtSetFileSize,
+    .syncFile = vtSyncFile,
     .deleteFile = vtDeleteFile,
     .makeDir = vtMakeDir,
     .removeDir = vtRemoveDir,
@@ -1279,6 +1298,12 @@ pub fn stat(path: []const u8) !Stat {
         if (rc_s == -@as(isize, @backingInt(linux.E.NOENT))) return error.FileNotFound;
         return error.StatFailed;
     }
+    return statFromStatx(&stx);
+}
+
+/// 把 `statx` 的回填结果转成跨平台 `Stat`。
+/// 路径版与句柄版共用，避免两处各写一份类型/mtime 翻译。
+fn statFromStatx(stx: *const linux.Statx) Stat {
     const kind: FileKind = switch (stx.mode & linux.S.IFMT) {
         linux.S.IFREG => .file,
         linux.S.IFDIR => .directory,
@@ -1436,6 +1461,38 @@ pub fn writeFileHandle(file: root.Handle, offset: u64, bytes: []const u8) !usize
 pub fn closeFile(file: root.Handle) void {
     const fd: linux.fd_t = @intCast(file);
     if (fd >= 0) _ = linux.close(fd);
+}
+
+// ---- 句柄级元数据与同步（阶段 B）------------------------------------------
+
+/// 取句柄元数据。用 `statx` 的 `AT_EMPTY_PATH` 形式：
+/// 路径传空串、`dirfd` 就是句柄本身，避免重新解析路径（也就没有
+/// 「open 之后路径被换掉」的竞态）。
+pub fn statFile(file: root.Handle) !Stat {
+    const fd: linux.fd_t = @intCast(file);
+    var stx: linux.Statx = std.mem.zeroes(linux.Statx);
+    const mask = linux.STATX{ .TYPE = true, .MODE = true, .SIZE = true, .MTIME = true };
+    // 空路径指针 + AT_EMPTY_PATH：直接对 dirfd 本身取元数据。
+    const empty: [*:0]const u8 = "";
+    const rc_s = signed(linux.statx(fd, empty, linux.AT.EMPTY_PATH, mask, &stx));
+    if (rc_s < 0) {
+        if (rc_s == -@as(isize, @backingInt(linux.E.BADF))) return error.InvalidHandle;
+        return error.StatFailed;
+    }
+    return statFromStatx(&stx);
+}
+
+/// 把句柄对应文件截断到 `size` 字节。
+pub fn setFileSize(file: root.Handle, size: u64) !void {
+    const fd: linux.fd_t = @intCast(file);
+    _ = try cvt(linux.ftruncate(fd, @intCast(size)));
+}
+
+/// 把缓冲内容刷到磁盘。`fdatasync` 只保证数据（不保证元数据如 mtime），
+/// 对「写完就想持久」的场景足够，且比 `fsync` 便宜。
+pub fn syncFile(file: root.Handle) !void {
+    const fd: linux.fd_t = @intCast(file);
+    _ = try cvt(linux.fdatasync(fd));
 }
 
 // ---- 测试（在 Linux 运行；已在 WSL 验证） ----------------------------------

@@ -226,6 +226,23 @@ fn vtCloseFile(userdata: ?*anyopaque, file: root.Handle) void {
     uring.closeFile(file);
 }
 
+// 句柄级元数据与同步：与 uring 后端共用同一套 syscall 实现。
+fn vtStatFile(userdata: ?*anyopaque, file: root.Handle) anyerror!root.Stat {
+    _ = userdata;
+    const st = try uring.statFile(file);
+    return .{ .kind = @fromBackingInt(@intCast(@backingInt(st.kind))), .size = st.size, .mtime_ms = st.mtime_ms };
+}
+
+fn vtSetFileSize(userdata: ?*anyopaque, file: root.Handle, size: u64) anyerror!void {
+    _ = userdata;
+    return uring.setFileSize(file, size);
+}
+
+fn vtSyncFile(userdata: ?*anyopaque, file: root.Handle) anyerror!void {
+    _ = userdata;
+    return uring.syncFile(file);
+}
+
 fn vtDeleteFile(userdata: ?*anyopaque, path: []const u8) anyerror!void {
     _ = userdata;
     uring.deleteFile(path);
@@ -564,6 +581,9 @@ const vtable_storage: root.VTable = .{
     .readFileHandle = vtReadFileHandle,
     .writeFileHandle = vtWriteFileHandle,
     .closeFile = vtCloseFile,
+    .statFile = vtStatFile,
+    .setFileSize = vtSetFileSize,
+    .syncFile = vtSyncFile,
     .deleteFile = vtDeleteFile,
     .makeDir = vtMakeDir,
     .removeDir = vtRemoveDir,

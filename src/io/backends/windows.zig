@@ -1007,6 +1007,22 @@ fn vtCloseFile(userdata: ?*anyopaque, file: root.Handle) void {
     closeFile(file);
 }
 
+fn vtStatFile(userdata: ?*anyopaque, file: root.Handle) anyerror!root.Stat {
+    _ = userdata;
+    const st = try statFile(file);
+    return .{ .kind = @fromBackingInt(@intCast(@backingInt(st.kind))), .size = st.size, .mtime_ms = st.mtime_ms };
+}
+
+fn vtSetFileSize(userdata: ?*anyopaque, file: root.Handle, size: u64) anyerror!void {
+    _ = userdata;
+    return setFileSize(file, size);
+}
+
+fn vtSyncFile(userdata: ?*anyopaque, file: root.Handle) anyerror!void {
+    _ = userdata;
+    return syncFile(file);
+}
+
 fn vtMakeDir(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
     _ = userdata;
     return makeDir(path, mode);
@@ -1062,6 +1078,9 @@ const vtable_storage: root.VTable = .{
     .readFileHandle = vtReadFileHandle,
     .writeFileHandle = vtWriteFileHandle,
     .closeFile = vtCloseFile,
+    .statFile = vtStatFile,
+    .setFileSize = vtSetFileSize,
+    .syncFile = vtSyncFile,
     .deleteFile = vtDeleteFile,
     .makeDir = vtMakeDir,
     .removeDir = vtRemoveDir,
@@ -1125,6 +1144,20 @@ const WIN32_FIND_DATAW = extern struct {
     cAlternateFileName: [14]u16,
 };
 
+/// `fileapi.h: BY_HANDLE_FILE_INFORMATION`
+/// 字段顺序与 Win32 一致；`nFileSizeHigh`/`Low` 拼成 64 位大小。
+const BY_HANDLE_FILE_INFORMATION = extern struct {
+    dwFileAttributes: u32,
+    ftCreationTime: std.os.windows.FILETIME,
+    ftLastAccessTime: std.os.windows.FILETIME,
+    ftLastWriteTime: std.os.windows.FILETIME,
+    dwVolumeSerialNumber: u32,
+    nFileSizeHigh: u32,
+    nFileSizeLow: u32,
+    nNumberOfLinks: u32,
+    nFileIndexHigh: u32,
+    nFileIndexLow: u32,
+};
 const fl32 = struct {
     extern "kernel32" fn CreateFileW(
         name: [*]const u16,
@@ -1140,6 +1173,8 @@ const fl32 = struct {
     extern "kernel32" fn GetFileSizeEx(h: HANDLE, size: *i64) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn CreateSymbolicLinkW(link: [*]const u16, target: [*]const u16, flags: u32) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn GetFileTime(h: HANDLE, creation: ?*windows.FILETIME, access: ?*windows.FILETIME, write: ?*windows.FILETIME) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn GetFileInformationByHandle(h: HANDLE, info: *BY_HANDLE_FILE_INFORMATION) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn FlushFileBuffers(h: HANDLE) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn FindFirstFileW(name: [*]const u16, data: *WIN32_FIND_DATAW) callconv(.winapi) HANDLE;
     extern "kernel32" fn FindNextFileW(h: HANDLE, data: *WIN32_FIND_DATAW) callconv(.winapi) windows.BOOL;
     extern "kernel32" fn FindClose(h: HANDLE) callconv(.winapi) windows.BOOL;
@@ -1175,6 +1210,7 @@ const ERROR_ALREADY_EXISTS: u32 = 183;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_PATH_NOT_FOUND: u32 = 3;
 const ERROR_ACCESS_DENIED: u32 = 5;
+const ERROR_INVALID_HANDLE: u32 = 6;
 
 fn invalidHandle() HANDLE {
     return @ptrFromInt(std.math.maxInt(usize));
@@ -1496,4 +1532,51 @@ pub fn writeFileHandle(file: root.Handle, offset: u64, bytes: []const u8) anyerr
 pub fn closeFile(file: root.Handle) void {
     const h: HANDLE = @ptrFromInt(file);
     if (h != invalidHandle()) _ = c.CloseHandle(h);
+}
+
+// ---- 句柄级元数据与同步（阶段 B）------------------------------------------
+
+/// 把 FILETIME 转成 Unix 毫秒。1601→1970 的偏移是固定常数。
+fn fileTimeToUnixMs(ft: std.os.windows.FILETIME) i64 {
+    const ticks: u64 = (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    const epoch_diff: u64 = 116_444_736_000_000_000;
+    if (ticks <= epoch_diff) return 0;
+    return @intCast((ticks - epoch_diff) / 10_000);
+}
+
+/// 取句柄元数据。`GetFileInformationByHandle` 直接作用于句柄，
+/// 不需要重新解析路径（也就没有「open 后路径被换掉」的竞态）。
+pub fn statFile(file: root.Handle) anyerror!Stat {
+    const h: HANDLE = @ptrFromInt(file);
+    if (h == invalidHandle()) return error.InvalidHandle;
+    var info: BY_HANDLE_FILE_INFORMATION = undefined;
+    if (!fl32.GetFileInformationByHandle(h, &info).toBool()) {
+        return switch (fl32.GetLastError()) {
+            ERROR_INVALID_HANDLE => error.InvalidHandle,
+            else => error.StatFailed,
+        };
+    }
+    const is_dir = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    const size: u64 = (@as(u64, info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    return .{
+        .kind = if (is_dir) .directory else .file,
+        .size = if (is_dir) 0 else size,
+        .mtime_ms = fileTimeToUnixMs(info.ftLastWriteTime),
+    };
+}
+
+/// 把句柄对应文件截断到 `size` 字节。
+/// 先定位到目标长度再 `SetEndOfFile`（Win32 没有 `ftruncate` 那种一步到位）。
+pub fn setFileSize(file: root.Handle, size: u64) anyerror!void {
+    const h: HANDLE = @ptrFromInt(file);
+    if (h == invalidHandle()) return error.InvalidHandle;
+    try seekTo(h, size);
+    if (!fl32.SetEndOfFile(h).toBool()) return error.TruncateFailed;
+}
+
+/// 把缓冲内容刷到磁盘。`FlushFileBuffers` 是 Win32 的 `fsync` 等价物。
+pub fn syncFile(file: root.Handle) anyerror!void {
+    const h: HANDLE = @ptrFromInt(file);
+    if (h == invalidHandle()) return error.InvalidHandle;
+    if (!fl32.FlushFileBuffers(h).toBool()) return error.SyncFailed;
 }

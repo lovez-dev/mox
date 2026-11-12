@@ -15,6 +15,7 @@ const Io = root.Io;
 const Work = root.Work;
 const Handle = root.Handle;
 const INVALID_HANDLE = root.INVALID_HANDLE;
+const Stat = root.Stat;
 
 /// 进程内内存文件表。条目由调用方在启动时 `mount`，生命周期必须长于
 /// 任何 `ReadFile`；通常挂在 `Loop` 上，随循环一起销毁。
@@ -380,6 +381,97 @@ pub const CloseFile = struct {
         if (self.io.vtable.closeFile) |vt| vt(self.io.userdata, self.file);
     }
 };
+
+// ---- 句柄级元数据与同步节点（阶段 B）--------------------------------------
+// 三个都走 `Work` 池，与读写节点对称。
+
+/// 取句柄元数据（类型/大小/mtime）。
+pub const StatFile = struct {
+    work: Work,
+    io: Io,
+    file: Handle,
+    stat: Stat = .{ .kind = .other, .size = 0, .mtime_ms = 0 },
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, file: Handle) StatFile {
+        return .{ .work = Work.init(run), .io = io, .file = file };
+    }
+
+    fn run(w: *Work) void {
+        const self: *StatFile = @fieldParentPtr("work", w);
+        const vt = self.io.vtable.statFile orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        self.stat = vt(self.io.userdata, self.file) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    pub fn getResult(self: *const StatFile) !Stat {
+        if (self.err) |e| return e;
+        return self.stat;
+    }
+};
+
+/// 把句柄对应文件截断到指定长度。
+pub const SetFileSize = struct {
+    work: Work,
+    io: Io,
+    file: Handle,
+    size: u64,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, file: Handle, size: u64) SetFileSize {
+        return .{ .work = Work.init(run), .io = io, .file = file, .size = size };
+    }
+
+    fn run(w: *Work) void {
+        const self: *SetFileSize = @fieldParentPtr("work", w);
+        const vt = self.io.vtable.setFileSize orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        vt(self.io.userdata, self.file, self.size) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    pub fn getResult(self: *const SetFileSize) !void {
+        if (self.err) |e| return e;
+    }
+};
+
+/// 把缓冲内容刷到磁盘（`fsync` / `FlushFileBuffers`）。
+pub const SyncFile = struct {
+    work: Work,
+    io: Io,
+    file: Handle,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, file: Handle) SyncFile {
+        return .{ .work = Work.init(run), .io = io, .file = file };
+    }
+
+    fn run(w: *Work) void {
+        const self: *SyncFile = @fieldParentPtr("work", w);
+        const vt = self.io.vtable.syncFile orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        vt(self.io.userdata, self.file) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    pub fn getResult(self: *const SyncFile) !void {
+        if (self.err) |e| return e;
+    }
+};
+
 test "MemoryFs 查找与覆盖" {
     var fs = MemoryFs.init(std.testing.allocator);
     defer fs.deinit();

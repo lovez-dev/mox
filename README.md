@@ -872,6 +872,31 @@ Windows 用 `SetFilePointerEx` + `ReadFile`/`WriteFile`。Windows 刻意**不用
 `OVERLAPPED`——那会把文件 I/O 接到 IOCP 上变成异步语义，与另外两个后端的
 同步 `Work` 池语义不一致。
 
+句柄在手时还能做元数据与同步，不用再走一遍路径（也就没有「open 之后路径
+被换掉」的竞态）：
+
+```zig
+// 取元数据：类型 / 大小 / mtime
+var st = mox_io.StatFile.init(io, h);
+loop.add(&st.work.c);
+const s = try st.getResult();          // s.size, s.kind, s.mtime_ms
+
+// 截断到指定长度
+var trunc = mox_io.SetFileSize.init(io, h, 4096);
+loop.add(&trunc.work.c);
+
+// 刷到磁盘（fsync / FlushFileBuffers）
+var sync = mox_io.SyncFile.init(io, h);
+loop.add(&sync.work.c);
+```
+
+`statFile` 各平台都是**直接作用于句柄**：Linux 用 `statx` 的 `AT_EMPTY_PATH`
+形式（路径传空串、`dirfd` 就是句柄本身），BSD/Darwin 用 `fstat`，
+Windows 用 `GetFileInformationByHandle`。
+
+`syncFile` 的测试**只能证明调用链通、错误没被吞掉**，不能证明数据真的落盘——
+那要断电才验证得了。别把它当持久化保证的证明。
+
 ## 内存文件（VFS）
 
 `Loop.memory_fs` 可以挂载编译期资源或测试替身，静态文件路由会优先命中它，

@@ -581,6 +581,22 @@ fn vtCloseFile(userdata: ?*anyopaque, file: root.Handle) void {
     closeFile(file);
 }
 
+fn vtStatFile(userdata: ?*anyopaque, file: root.Handle) anyerror!root.Stat {
+    _ = userdata;
+    const st = try statFile(file);
+    return .{ .kind = @fromBackingInt(@intCast(@backingInt(st.kind))), .size = st.size, .mtime_ms = st.mtime_ms };
+}
+
+fn vtSetFileSize(userdata: ?*anyopaque, file: root.Handle, size: u64) anyerror!void {
+    _ = userdata;
+    return setFileSize(file, size);
+}
+
+fn vtSyncFile(userdata: ?*anyopaque, file: root.Handle) anyerror!void {
+    _ = userdata;
+    return syncFile(file);
+}
+
 fn vtMakeDir(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
     _ = userdata;
     return makeDir(path, mode);
@@ -636,6 +652,9 @@ const vtable_storage: root.VTable = .{
     .readFileHandle = vtReadFileHandle,
     .writeFileHandle = vtWriteFileHandle,
     .closeFile = vtCloseFile,
+    .statFile = vtStatFile,
+    .setFileSize = vtSetFileSize,
+    .syncFile = vtSyncFile,
     .deleteFile = vtDeleteFile,
     .makeDir = vtMakeDir,
     .removeDir = vtRemoveDir,
@@ -1169,6 +1188,48 @@ pub fn writeFileHandle(file: root.Handle, offset: u64, bytes: []const u8) !usize
 pub fn closeFile(file: root.Handle) void {
     const fd: c.fd_t = @intCast(file);
     if (fd >= 0) _ = c.close(fd);
+}
+
+// ---- 句柄级元数据与同步（阶段 B）------------------------------------------
+
+/// 取句柄元数据。`fstat` 直接作用于 fd，不重新解析路径。
+pub fn statFile(file: root.Handle) !Stat {
+    const fd: c.fd_t = @intCast(file);
+    var st: c.Stat = undefined;
+    if (c.fstat(fd, &st) != 0) {
+        return switch (std.posix.errno(@as(isize, -1))) {
+            .BADF => error.InvalidHandle,
+            else => error.StatFailed,
+        };
+    }
+    const kind: FileKind = switch (st.mode & c.S.IFMT) {
+        c.S.IFREG => .file,
+        c.S.IFDIR => .directory,
+        c.S.IFLNK => .sym_link,
+        else => .other,
+    };
+    return .{
+        .kind = kind,
+        .size = @intCast(st.size),
+        // 用 `mtime()` 而不是直接读字段：Darwin 是 `mtimespec`、FreeBSD 是
+        // `mtim`，但两者都提供同名访问器，比按平台分叉稳。
+        .mtime_ms = blk: {
+            const mt = st.mtime();
+            break :blk @as(i64, @intCast(mt.sec)) * 1000 + @divTrunc(@as(i64, @intCast(mt.nsec)), 1_000_000);
+        },
+    };
+}
+
+/// 把句柄对应文件截断到 `size` 字节。
+pub fn setFileSize(file: root.Handle, size: u64) !void {
+    const fd: c.fd_t = @intCast(file);
+    if (c.ftruncate(fd, @intCast(size)) < 0) return error.TruncateFailed;
+}
+
+/// 把缓冲内容刷到磁盘。`fsync` 在 BSD/Darwin 上同时保证数据与元数据。
+pub fn syncFile(file: root.Handle) !void {
+    const fd: c.fd_t = @intCast(file);
+    if (c.fsync(fd) != 0) return error.SyncFailed;
 }
 
 test "kqueue backend type-checks end to end" {
