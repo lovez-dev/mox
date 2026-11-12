@@ -1739,14 +1739,30 @@ pub fn setFileTimestamps(file: root.Handle, atime_ns: i64, mtime_ns: i64) !void 
 pub fn setPermissions(path: []const u8, mode: u32) !void {
     var zbuf: [1024]u8 = undefined;
     const p = try pathZ(path, &zbuf);
-    _ = try cvt(linux.fchmodat(linux.AT.FDCWD, p, mode));
+    const rc = linux.fchmodat(linux.AT.FDCWD, p, mode);
+    const rc_s = signed(rc);
+    if (rc_s < 0) {
+        return switch (-rc_s) {
+            @as(isize, @backingInt(linux.E.NOENT)) => error.FileNotFound,
+            @as(isize, @backingInt(linux.E.ACCES)) => error.AccessDenied,
+            else => error.SetPermissionsFailed,
+        };
+    }
 }
 
 /// 按路径改属主（`fchownat`）。
 pub fn setOwner(path: []const u8, uid: u32, gid: u32) !void {
     var zbuf: [1024]u8 = undefined;
     const p = try pathZ(path, &zbuf);
-    _ = try cvt(linux.fchownat(linux.AT.FDCWD, p, uid, gid, 0));
+    const rc = linux.fchownat(linux.AT.FDCWD, p, uid, gid, 0);
+    const rc_s = signed(rc);
+    if (rc_s < 0) {
+        return switch (-rc_s) {
+            @as(isize, @backingInt(linux.E.NOENT)) => error.FileNotFound,
+            @as(isize, @backingInt(linux.E.ACCES)) => error.AccessDenied,
+            else => error.SetOwnerFailed,
+        };
+    }
 }
 
 /// 按路径改时间戳（`utimensat`）。
@@ -1757,14 +1773,31 @@ pub fn setTimestamps(path: []const u8, atime_ns: i64, mtime_ns: i64) !void {
         .{ .sec = @divFloor(atime_ns, 1_000_000_000), .nsec = @mod(atime_ns, 1_000_000_000) },
         .{ .sec = @divFloor(mtime_ns, 1_000_000_000), .nsec = @mod(mtime_ns, 1_000_000_000) },
     };
-    _ = try cvt(linux.utimensat(linux.AT.FDCWD, p, &times, 0));
+    const rc = linux.utimensat(linux.AT.FDCWD, p, &times, 0);
+    const rc_s = signed(rc);
+    if (rc_s < 0) {
+        return switch (-rc_s) {
+            @as(isize, @backingInt(linux.E.NOENT)) => error.FileNotFound,
+            @as(isize, @backingInt(linux.E.ACCES)) => error.AccessDenied,
+            else => error.SetTimestampsFailed,
+        };
+    }
 }
 
 /// 检查路径可达性（`access`）。`mode`: 0=存在、4=可读、2=可写、1=可执行。
 pub fn access(path: []const u8, mode: u32) !void {
     var zbuf: [1024]u8 = undefined;
     const p = try pathZ(path, &zbuf);
-    _ = try cvt(linux.access(p, mode));
+    const rc = linux.access(p, mode);
+    const rc_s = signed(rc);
+    if (rc_s < 0) {
+        return switch (-rc_s) {
+            @as(isize, @backingInt(linux.E.NOENT)) => error.FileNotFound,
+            @as(isize, @backingInt(linux.E.ACCES)) => error.AccessDenied,
+            @as(isize, @backingInt(linux.E.PERM)) => error.AccessDenied,
+            else => error.AccessFailed,
+        };
+    }
 }
 
 /// 解析符号链接拿绝对路径（`realpath`）。
@@ -1797,7 +1830,16 @@ pub fn hardLink(old_path: []const u8, new_path: []const u8) !void {
     var nbuf: [1024]u8 = undefined;
     const o = try pathZ(old_path, &obuf);
     const n = try pathZ(new_path, &nbuf);
-    _ = try cvt(linux.linkat(linux.AT.FDCWD, o, linux.AT.FDCWD, n, 0));
+    const rc = linux.linkat(linux.AT.FDCWD, o, linux.AT.FDCWD, n, 0);
+    const rc_s = signed(rc);
+    if (rc_s < 0) {
+        return switch (-rc_s) {
+            @as(isize, @backingInt(linux.E.NOENT)) => error.FileNotFound,
+            @as(isize, @backingInt(linux.E.EXIST)) => error.FileAlreadyExists,
+            @as(isize, @backingInt(linux.E.PERM)) => error.AccessDenied,
+            else => error.HardLinkFailed,
+        };
+    }
 }
 
 // ---- 符号链接读取 + 目录流式句柄（阶段 C）--------------------------------
