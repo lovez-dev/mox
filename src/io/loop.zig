@@ -303,6 +303,67 @@ pub const Loop = struct {
                 self.pushReadySync(c);
             },
 
+            .net_shutdown => {
+                const t: *root.NetShutdown = @fieldParentPtr("c", c);
+                // `shutdown` 是同步的（只改连接状态，不排队数据），
+                // 与 `.net_close` 同构：调完直接进就绪队列。
+                const vt = self.io.vtable.shutdown orelse {
+                    c.err = error.Unsupported;
+                    self.pushReadySync(c);
+                    return;
+                };
+                vt(self.io.userdata, t.socket, t.how) catch |e| {
+                    c.err = e;
+                };
+                self.pushReadySync(c);
+            },
+
+            .net_sendmsg => {
+                const t: *root.NetSendMsg = @fieldParentPtr("c", c);
+                const vt = self.io.vtable.sendMsg orelse {
+                    // 后端没有原生 sendmsg：回落成依次 send。语义等价，
+                    // 只是失去「一次系统调用」的原子性（多路复用时可能
+                    // 被其他写入插入，破坏帧边界）。
+                    var total: usize = 0;
+                    for (t.bufs) |b| {
+                        const r = self.io.vtable.send(self.io.userdata, t.socket, b, &c.ov) catch |e| {
+                            c.err = e;
+                            self.pushReadySync(c);
+                            return;
+                        };
+                        if (r) |n| {
+                            total += n;
+                            // 短写：剩下的部分这里不再续发。调用方应检查
+                            // 返回值是否等于总长度。
+                            if (n < b.len) break;
+                        }
+                    }
+                    t.sent = total;
+                    c.bytes = total;
+                    self.pushReadySync(c);
+                    return;
+                };
+                vt(self.io.userdata, t.socket, t.bufs, &t.hdr, &c.ov) catch |e| {
+                    c.err = e;
+                    self.pushReadySync(c);
+                    return;
+                };
+            },
+
+            .net_recvmsg => {
+                const t: *root.NetRecvMsg = @fieldParentPtr("c", c);
+                const vt = self.io.vtable.recvMsg orelse {
+                    c.err = error.Unsupported;
+                    self.pushReadySync(c);
+                    return;
+                };
+                vt(self.io.userdata, t.socket, t.bufs, &t.hdr, &c.ov) catch |e| {
+                    c.err = e;
+                    self.pushReadySync(c);
+                    return;
+                };
+            },
+
             .file_read => {
                 const f: *root.ReadFileAsync = @fieldParentPtr("c", c);
                 const vf = self.io.vtable.readFileAsync orelse {
@@ -426,6 +487,14 @@ pub const Loop = struct {
         if (c.op == .watch_fd and c.err == null) {
             const w: *root.WatchFd = @fieldParentPtr("c", c);
             w.ready = root.Ready.fromBits(@truncate(ref.bytes));
+        }
+        if (c.op == .net_sendmsg and c.err == null) {
+            const m: *root.NetSendMsg = @fieldParentPtr("c", c);
+            m.sent = ref.bytes;
+        }
+        if (c.op == .net_recvmsg and c.err == null) {
+            const m: *root.NetRecvMsg = @fieldParentPtr("c", c);
+            m.received = ref.bytes;
         }
         if (c.op == .net_connect and c.err == null) {
             const a: *NetConnect = @fieldParentPtr("c", c);

@@ -37,6 +37,16 @@ pub const SockOpt = enum {
     send_buf,
 };
 
+/// `shutdown` 的方向。与 POSIX `SHUT_*` 一一对应。
+pub const ShutdownHow = enum {
+    /// 关读方向：本端不再 `recv`，对端发来的数据被内核丢弃。
+    read,
+    /// 关写方向：本端不再 `send`，内核发完已排队的再发 FIN。
+    write,
+    /// 双向都关。
+    both,
+};
+
 /// 由 `Completion` 持有、按 8 字节对齐的不透明内核暂存区。尺寸取各后端单操作
 /// 所需最大值（Windows 的 `OVERLAPPED` + `WSABUF` 约 48 字节；io_uring 只存
 /// 一个 `user_data` 字）。由后端重新解释，接口层绝不碰它。
@@ -278,6 +288,37 @@ pub const VTable = struct {
     /// 这是优雅收尾的常规做法，与 `close` 直接终止语义不同。
     shutdownSend: ?*const fn (userdata: ?*anyopaque, socket: Handle) anyerror!void = null,
 
+    /// 全方向关闭：`how` 指定读、写还是双向。`shutdownSend` 只能关写方向，
+    /// 想同时拒绝后续读取（例如协议错误后强制断开）就需要这个。
+    ///
+    /// 与 `close` 的区别：`shutdown` 只改连接状态，不释放句柄，套接字仍可
+    /// 用于后续的 `recv` 探测（读到 0 字节 = 对端已关）或最终 `close`。
+    shutdown: ?*const fn (userdata: ?*anyopaque, socket: Handle, how: ShutdownHow) anyerror!void = null,
+
+    /// 分散聚合发送：一次系统调用把多个缓冲发出去（`sendmsg` 的 iovec）。
+    /// 用于 HTTP/2 分帧、WebSocket 拼头+载荷，避免多次 `send` 的边界问题。
+    ///
+    /// `hdr` 是节点自带的后端私有存储（至少 32 个 usize）——io_uring 与
+    /// IOCP 都要在其中放 `msghdr`/`WSABUF` 数组，它们必须活到完成包被收割。
+    /// 不提供（`null`）时节点层回落成「依次 `send`」。
+    sendMsg: ?*const fn (
+        userdata: ?*anyopaque,
+        socket: Handle,
+        bufs: []const []const u8,
+        hdr: []usize,
+        scratch: *Scratch,
+    ) anyerror!void = null,
+
+    /// 分散聚合接收：一次系统调用把数据摊到多个缓冲（`recvmsg` 的 iovec）。
+    /// 相比先 `recv` 到一个大缓冲再手动切分，省掉一次内存拷贝。
+    recvMsg: ?*const fn (
+        userdata: ?*anyopaque,
+        socket: Handle,
+        bufs: []const []u8,
+        hdr: []usize,
+        scratch: *Scratch,
+    ) anyerror!void = null,
+
     /// 取消一个已提交、尚未完成的操作。后端必须保证最终仍会投递一个完成包
     /// （可以是 aborted / ECANCELED），使 `Loop` 能安全回收该节点；
     /// 循环收到后会因 `cancelled` 标志直接丢弃，不回调。
@@ -360,6 +401,12 @@ pub const NetConnect = completion_mod.NetConnect;
 pub const Work = completion_mod.Work;
 pub const Async = completion_mod.Async;
 pub const Group = completion_mod.Group;
+pub const NetSendMsg = completion_mod.NetSendMsg;
+pub const NetRecvMsg = completion_mod.NetRecvMsg;
+pub const NetShutdown = completion_mod.NetShutdown;
+pub const NetPoll = completion_mod.NetPoll;
+/// 分散聚合 I/O 的后端私有暂存区容量（以 `usize` 计）。
+pub const MSG_HDR_WORDS = completion_mod.MSG_HDR_WORDS;
 pub const Loop = loop_mod.Loop;
 
 pub const ReadFile = @import("file.zig").ReadFile;

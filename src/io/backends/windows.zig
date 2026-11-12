@@ -946,6 +946,72 @@ fn vtShutdownSend(userdata: ?*anyopaque, socket: root.Handle) anyerror!void {
     try shutdownSend(@intCast(socket));
 }
 
+fn vtShutdown(userdata: ?*anyopaque, socket: root.Handle, how: root.ShutdownHow) anyerror!void {
+    _ = userdata;
+    const flag: c_int = switch (how) {
+        .read => SD_RECEIVE,
+        .write => SD_SEND,
+        .both => SD_BOTH,
+    };
+    if (c.shutdown(@intCast(socket), flag) != ERROR_SUCCESS) return error.ShutdownFailed;
+}
+
+/// iovec 上限，与 `MSG_HDR_WORDS` 的预算对应（32 个 WSABUF = 256 字节）。
+const IOV_MAX = 32;
+
+fn vtSendMsg(
+    userdata: ?*anyopaque,
+    socket: root.Handle,
+    bufs: []const []const u8,
+    hdr: []usize,
+    scratch: *root.Scratch,
+) anyerror!void {
+    _ = userdata;
+    _ = hdr;
+    if (bufs.len == 0) return error.NoBuffers;
+    if (bufs.len > IOV_MAX) return error.TooManyBuffers;
+
+    var wsabufs: [IOV_MAX]WSABUF = undefined;
+    for (bufs, 0..) |b, i| wsabufs[i] = .{ .len = @intCast(b.len), .buf = @constCast(b.ptr) };
+
+    // OVERLAPPED 必须活到完成包被收割：`scratch` 正是为此存在。
+    const ov: *OVERLAPPED = @ptrCast(@alignCast(&scratch.bytes));
+    ov.* = std.mem.zeroes(OVERLAPPED);
+    const s: SOCKET = @intCast(socket);
+    var sent: u32 = 0;
+    if (c.WSASend(s, &wsabufs, @intCast(bufs.len), &sent, 0, ov, null) != 0) {
+        const e = lastError();
+        // WSA_IO_PENDING 是正常路径：完成包稍后投递到 IOCP。
+        if (e != WSA_IO_PENDING) return error.SendFailed;
+    }
+}
+
+fn vtRecvMsg(
+    userdata: ?*anyopaque,
+    socket: root.Handle,
+    bufs: []const []u8,
+    hdr: []usize,
+    scratch: *root.Scratch,
+) anyerror!void {
+    _ = userdata;
+    _ = hdr;
+    if (bufs.len == 0) return error.NoBuffers;
+    if (bufs.len > IOV_MAX) return error.TooManyBuffers;
+
+    var wsabufs: [IOV_MAX]WSABUF = undefined;
+    for (bufs, 0..) |b, i| wsabufs[i] = .{ .len = @intCast(b.len), .buf = b.ptr };
+
+    const ov: *OVERLAPPED = @ptrCast(@alignCast(&scratch.bytes));
+    ov.* = std.mem.zeroes(OVERLAPPED);
+    const s: SOCKET = @intCast(socket);
+    var received: u32 = 0;
+    var flags: u32 = 0;
+    if (c.WSARecv(s, &wsabufs, @intCast(bufs.len), &received, &flags, ov, null) != 0) {
+        const e = lastError();
+        if (e != WSA_IO_PENDING) return error.RecvFailed;
+    }
+}
+
 fn vtBind(userdata: ?*anyopaque, socket: root.Handle, address: net.IpAddress) anyerror!void {
     _ = userdata;
     try bindSocket(@intCast(socket), address);
@@ -1084,6 +1150,9 @@ const vtable_storage: root.VTable = .{
     .setReuseAddress = vtSetReuseAddress,
     .setSockOpt = vtSetSockOpt,
     .shutdownSend = vtShutdownSend,
+    .shutdown = vtShutdown,
+    .sendMsg = vtSendMsg,
+    .recvMsg = vtRecvMsg,
     .bind = vtBind,
     .listen = vtListen,
     .fileSize = vtFileSize,

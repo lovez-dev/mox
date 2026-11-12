@@ -29,6 +29,12 @@ pub const Op = enum {
     work,
     /// 跨线程投递：别的线程把回调塞进循环，循环线程上执行。
     async,
+    /// 分散聚合发送（`sendmsg`）。
+    net_sendmsg,
+    /// 分散聚合接收（`recvmsg`）。
+    net_recvmsg,
+    /// 全方向关闭（`shutdown`）。
+    net_shutdown,
 };
 
 /// 所有操作的基类。具体完成体把它作为第一个字段 `c` 内嵌，
@@ -120,6 +126,42 @@ pub const WatchFd = struct {
 
     pub fn init(fd: Handle, want: Ready) WatchFd {
         return .{ .fd = fd, .want = want };
+    }
+};
+
+/// 等 socket 变成可读或可写。
+///
+/// 这是 `WatchFd` 的语义化封装——底层完全一样（都是「等 fd 的某个方向就绪」），
+/// 区别只在可读性：调用方想说的是「等这个 socket 能收了」，而不是「等这个
+/// fd 的 read 位」。zio 里对应 `NetPoll`。
+///
+/// 注意：**一次性**通知。回调触发后若要继续等，必须重新 `init` + `add`。
+pub const NetPoll = struct {
+    inner: WatchFd,
+
+    pub const Event = enum { recv, send };
+
+    pub fn init(socket: Handle, event: Event) NetPoll {
+        return .{
+            .inner = WatchFd.init(socket, switch (event) {
+                .recv => .{ .read = true },
+                .send => .{ .write = true },
+            }),
+        };
+    }
+
+    /// 拿到可提交的完成体。
+    pub fn completion(self: *NetPoll) *Completion {
+        return &self.inner.c;
+    }
+
+    /// 回调里读：是否真的就绪了。
+    pub fn ready(self: *const NetPoll) Ready {
+        return self.inner.ready;
+    }
+
+    pub fn getResult(self: *const NetPoll) !void {
+        if (self.inner.c.err) |e| return e;
     }
 };
 
@@ -343,5 +385,86 @@ pub const Group = struct {
     /// 是否全部完成。
     pub fn done(self: *const Group) bool {
         return self.pending == 0;
+    }
+};
+
+// ---- 分散聚合 I/O 与全方向关闭（阶段 E）----------------------------------
+
+/// 后端私有暂存区大小（以 `usize` 计）。
+///
+/// 原生 `sendmsg`/`recvmsg` 要把 `msghdr` + `iovec` 数组放在**活到完成包
+/// 被收割**的地方，不能是栈上临时变量。96 个字 = 768 字节：
+/// `linux.msghdr_const` 56B + 32 个 `iovec_const`（16B each）512B = 568B，
+/// 留有余量。**这个数字是被 comptime 断言逼出来的**——第一版写 64 个字
+/// （512B）在 Linux 上直接编译失败，断言替我们算对了账。
+pub const MSG_HDR_WORDS = 96;
+
+/// 分散聚合发送：一次系统调用把多个缓冲发出去。
+///
+/// 用途：HTTP/2 帧头 + 载荷、WebSocket 帧头 + 载荷这类「必须连续但分属不同
+/// 缓冲」的场景。分两次 `send` 也能work，但会有两个问题：两次系统调用之间
+/// 可能被其他写入插入（多路复用时破坏帧边界），以及多一次内核态切换。
+///
+/// 后端不支持原生 `sendMsg` 时，节点层回落成「依次 `send`」——语义等价，
+/// 只是没有原子性。
+pub const NetSendMsg = struct {
+    c: Completion = .{ .op = .net_sendmsg },
+    socket: Handle = INVALID_HANDLE,
+    /// 待发送的缓冲。**必须活到回调触发**。
+    bufs: []const []const u8 = &.{},
+    /// 后端私有暂存区（`msghdr` + `iovec`）。同样必须活到回调触发。
+    hdr: [MSG_HDR_WORDS]usize = std.mem.zeroes([MSG_HDR_WORDS]usize),
+    /// 回填：实际发出的总字节数。
+    sent: usize = 0,
+
+    pub fn init(socket: Handle, bufs: []const []const u8) NetSendMsg {
+        return .{ .socket = socket, .bufs = bufs };
+    }
+
+    pub fn getResult(self: *const NetSendMsg) !usize {
+        if (self.c.err) |e| return e;
+        return self.sent;
+    }
+};
+
+/// 分散聚合接收：一次系统调用把数据摊到多个缓冲。
+///
+/// 相比「先 `recv` 到一个大缓冲再手动切分」，省掉一次内存拷贝。典型场景是
+/// 协议头与载荷分处两个缓冲、或想把固定长度的帧头单独解析。
+pub const NetRecvMsg = struct {
+    c: Completion = .{ .op = .net_recvmsg },
+    socket: Handle = INVALID_HANDLE,
+    /// 接收缓冲。**必须活到回调触发**。
+    bufs: []const []u8 = &.{},
+    /// 后端私有暂存区。
+    hdr: [MSG_HDR_WORDS]usize = std.mem.zeroes([MSG_HDR_WORDS]usize),
+    /// 回填：实际收到的总字节数。
+    received: usize = 0,
+
+    pub fn init(socket: Handle, bufs: []const []u8) NetRecvMsg {
+        return .{ .socket = socket, .bufs = bufs };
+    }
+
+    pub fn getResult(self: *const NetRecvMsg) !usize {
+        if (self.c.err) |e| return e;
+        return self.received;
+    }
+};
+
+/// 全方向关闭。
+///
+/// 与 `NetClose` 的区别：`shutdown` 只改连接状态、不释放句柄，之后仍可以
+/// `recv` 探测对端是否已关（读到 0 字节），也可以正常 `close`。
+pub const NetShutdown = struct {
+    c: Completion = .{ .op = .net_shutdown },
+    socket: Handle = INVALID_HANDLE,
+    how: root.ShutdownHow,
+
+    pub fn init(socket: Handle, how: root.ShutdownHow) NetShutdown {
+        return .{ .socket = socket, .how = how };
+    }
+
+    pub fn getResult(self: *const NetShutdown) !void {
+        if (self.c.err) |e| return e;
     }
 };

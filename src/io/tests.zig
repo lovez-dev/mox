@@ -3151,3 +3151,220 @@ test "Async：循环已阻塞在 waitBatch 时，notify 立刻唤醒（不等 20
     // 有 notify 时应该在个位数毫秒内被叫醒。
     try std.testing.expect(elapsed < 60);
 }
+
+// ---- 分散聚合 I/O 与全方向关闭（阶段 E）----------------------------------
+
+/// 建一对已连接的 TCP socket（本机回环）。返回 {client, server}。
+/// 测试收尾要 `loop.close` 两个。
+fn tcpPair(loop: *Loop) !struct { a: root.Handle, b: root.Handle } {
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1:0", 0);
+    const listen = try loop.createSocket(addr);
+    try loop.setReuseAddress(listen, true);
+    try loop.bind(listen, addr);
+    try loop.listen(listen, 8);
+
+    // 拿实际端口
+    const bound = loop.io.vtable.statSocketAddr(loop.io.userdata, listen) catch
+        try std.Io.net.IpAddress.parse("127.0.0.1:0", 0);
+    _ = bound;
+
+    const client = try loop.createSocket(addr);
+    return .{ .a = client, .b = listen };
+}
+
+/// 建一对已连接的 TCP socket（本机回环）。
+///
+/// 走 `platform.*` 同步原语而不是 `Loop.*`：这里要的是「先有一条活着的连接」
+/// 这个**前置条件**，用异步 accept/connect 建连接会把被测对象和搭建步骤
+/// 混在一起，测试失败时分不清是谁的问题。
+const TcpPair = struct {
+    listener: root.Handle,
+    client: root.Handle,
+    server: root.Handle,
+
+    fn close(self: TcpPair) void {
+        platform.closeSocket(self.client);
+        platform.closeSocket(self.server);
+        platform.closeSocket(self.listener);
+    }
+};
+
+fn makeTcpPair() !TcpPair {
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    const listener = try platform.createTcpSocket(bind_addr);
+    errdefer platform.closeSocket(listener);
+    try platform.setReuseAddress(listener, true);
+    try platform.bindSocket(listener, bind_addr);
+    const bound = try platform.localAddress(listener);
+    try platform.listenSocket(listener, 16);
+
+    const Sender = struct {
+        fn run(addr: net.IpAddress, out: *root.Handle) void {
+            const c = platform.createTcpSocket(addr) catch return;
+            platform.connectSocket(c, addr) catch return;
+            out.* = c;
+        }
+    };
+    var client: root.Handle = root.INVALID_HANDLE;
+    const t = try std.Thread.spawn(.{}, Sender.run, .{ bound, &client });
+    const accepted = try platform.acceptSocket(listener);
+    t.join();
+    if (client == root.INVALID_HANDLE) {
+        platform.closeSocket(accepted.socket);
+        return error.ConnectFailed;
+    }
+    return .{ .listener = listener, .client = client, .server = accepted.socket };
+}
+
+test "NetShutdown：关写方向后对端读到 0 字节（EOF）" {
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    const pair = try makeTcpPair();
+    defer pair.close();
+    try l.associate(pair.server, 1);
+    try l.associate(pair.client, 2);
+
+    var sd = root.NetShutdown.init(pair.server, .write);
+    sd.c.callback = stopCb;
+    l.add(&sd.c);
+    try l.run();
+    try sd.getResult();
+
+    // 客户端应读到 0 字节（对端 FIN）。
+    //
+    // **不用阻塞读**：方向搞反时阻塞读会永久卡住，变异测试表现为
+    // 「挂死」而不是「断言失败」——挂死要靠外部超时才暴露，等于测试
+    // 没有牙。改用带超时的异步读，超时就红。
+    const Got = struct {
+        var recv_fired: bool = false;
+        fn onRecv(loop: *Loop, c: *Completion) void {
+            _ = c;
+            recv_fired = true;
+            loop.stop();
+        }
+        fn onDeadline(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    };
+    Got.recv_fired = false;
+
+    var buf: [64]u8 = undefined;
+    var r = root.NetRecv.init(pair.client, &buf);
+    r.c.callback = &Got.onRecv;
+    l.add(&r.c);
+    var deadline = root.Timer.init(300);
+    deadline.c.callback = &Got.onDeadline;
+    l.add(&deadline.c);
+    try l.run();
+
+    // **关键断言**：必须真的收到「0 字节 = FIN」，而不是超时后
+    // 默认值 0 蒙对。方向搞反时 recv 不触发，recv_fired 为 false。
+    try std.testing.expect(Got.recv_fired);
+    try std.testing.expect(r.c.err == null);
+    try std.testing.expectEqual(@as(usize, 0), r.c.bytes);
+}
+
+test "NetSendMsg：两个缓冲一次发出，对端按序收到拼接结果" {
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    const pair = try makeTcpPair();
+    defer pair.close();
+    try l.associate(pair.server, 1);
+
+    // **关键**：两个分开的缓冲，必须按顺序拼成 "hello world"。
+    // 分成两次 send 也能得到同样字节，但那样测不出 iovec 的顺序。
+    const bufs = [_][]const u8{ "hello", " world" };
+    var sm = root.NetSendMsg.init(pair.server, &bufs);
+    sm.c.callback = stopCb;
+    l.add(&sm.c);
+    try l.run();
+    try std.testing.expectEqual(@as(usize, 11), try sm.getResult());
+
+    // 客户端阻塞读回
+    var buf: [64]u8 = undefined;
+    var got: usize = 0;
+    while (got < 11) {
+        const n = try platform.recvBlocking(pair.client, buf[got..]);
+        if (n == 0) break;
+        got += n;
+    }
+    try std.testing.expectEqualStrings("hello world", buf[0..got]);
+}
+
+test "NetRecvMsg：一个数据包摊到两个缓冲，顺序与长度正确" {
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    const pair = try makeTcpPair();
+    defer pair.close();
+    try l.associate(pair.server, 1);
+
+    // 客户端先发 "HEADpayload"（4 + 7 = 11 字节）
+    _ = try platform.sendBlocking(pair.client, "HEADpayload");
+
+    // **关键**：两个缓冲分别接 4 和 7 字节。第一个只给 4 字节，
+    // 多出来的数据必须溢到第二个缓冲——这正是 recvmsg 的语义。
+    // 如果实现把两个缓冲当成两次独立 recv，head 会拿到 4 字节、
+    // body 留空，received 会报 4 而不是 11。
+    var head: [4]u8 = undefined;
+    var body: [16]u8 = undefined;
+    const rbufs = [_][]u8{ &head, &body };
+    var rm = root.NetRecvMsg.init(pair.server, &rbufs);
+    rm.c.callback = stopCb;
+    l.add(&rm.c);
+    try l.run();
+    const n = try rm.getResult();
+
+    try std.testing.expectEqual(@as(usize, 11), n);
+    try std.testing.expectEqualStrings("HEAD", &head);
+    try std.testing.expectEqualStrings("payload", body[0..7]);
+}
+
+test "NetPoll：socket 可读时立即完成" {
+    // Windows 后端没有 watchFd（IOCP 的通知模型与「等 fd 就绪」不同构），
+    // 所以 NetPoll 在那里如实返回 Unsupported。
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    const pair = try makeTcpPair();
+    defer pair.close();
+    try l.associate(pair.server, 1);
+
+    // 先发点数据，让 server 端确定可读
+    _ = try platform.sendBlocking(pair.client, "ping!");
+
+    var poll = root.NetPoll.init(pair.server, .recv);
+    poll.completion().callback = stopCb;
+    l.add(poll.completion());
+    try l.run();
+    try poll.getResult();
+    try std.testing.expect(poll.ready().read);
+}

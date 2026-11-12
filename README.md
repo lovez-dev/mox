@@ -1009,6 +1009,81 @@ loop.add(&recv2.c);
 结束才回调。调用方在回调里自己检查各子操作的结果。这是刻意的：批量场景下
 「一个失败就放弃」通常不是想要的，而且提前回调会让调用方读到还没填好的结果。
 
+## 分散聚合 I/O 与全方向关闭
+
+### `NetSendMsg` / `NetRecvMsg`：一次系统调用收发多个缓冲
+
+```zig
+// 一次 sendmsg：帧头 + 载荷在同一次系统调用里发出，中间不会被插入
+const bufs = [_][]const u8{ frame_header, payload };
+var sm = mox_io.NetSendMsg.init(socket, &bufs);
+loop.add(&sm.c);
+const sent = try sm.getResult();
+
+// 一次 recvmsg：数据摊到两个缓冲，省掉一次拷贝
+var head: [4]u8 = undefined;
+var body: [4096]u8 = undefined;
+const rbufs = [_][]u8{ &head, &body };
+var rm = mox_io.NetRecvMsg.init(socket, &rbufs);
+loop.add(&rm.c);
+const n = try rm.getResult();
+```
+
+**为什么不用两次 `send`**：两次 `send` 之间可能被其他写入插入——多路复用
+（HTTP/2、WebSocket 并发帧）时这会直接破坏帧边界。`sendmsg` 的 iovec 保证
+多段内容在一次系统调用里连续发出。
+
+**`recvmsg` 的语义要点**：内核按 iovec 顺序填满，第一个缓冲写满了才继续写
+第二个。上面例子里 `head` 只有 4 字节，多出来的数据**必须**溢到 `body`——
+测试专门打这个：如果实现退化成两次独立 `recv`，`received` 会报 4 而不是 11。
+
+**上限**：单个节点最多 32 段（`MSG_HDR_WORDS` 预算约束，见下）。超过报
+`error.TooManyBuffers`。
+
+**`hdr` 暂存区**：`msghdr` 与 iovec 数组必须活到完成包被收割，不能放栈上。
+节点自带 `hdr: [MSG_HDR_WORDS]usize` 就是干这个的，调用方不用管。
+
+后端差异：
+
+| 后端 | 实现 | 异步？ |
+|---|---|---|
+| Linux io_uring | 原生 `IORING_OP_SENDMSG`/`RECVMSG` | 是 |
+| Windows IOCP | `WSASend`/`WSARecv` 多 `WSABUF` | 是 |
+| Linux epoll / BSD kqueue | 同步 `sendmsg`/`recvmsg` | 否（提交时即完成） |
+
+epoll/kqueue 没有「异步 sendmsg」这种原语（它们的模型是「等可写再自己发」），
+所以走同步路径。语义完全一致，只是不占异步槽位。
+
+### `NetShutdown`：按方向关闭
+
+```zig
+// 只关写：对端读到 EOF，但仍可以继续给我们发
+loop.add(&(mox_io.NetShutdown.init(socket, .write).c));
+
+// 双向关（协议错误后强制断开）
+loop.add(&(mox_io.NetShutdown.init(socket, .both).c));
+```
+
+与 `NetClose` 的区别：`shutdown` 只改连接状态、**不释放句柄**，之后仍可以
+`recv` 探测对端是否已关，也可以正常 `close`。
+
+### `NetPoll`：等 socket 可读/可写
+
+```zig
+var poll = mox_io.NetPoll.init(socket, .recv);   // 或 .send
+loop.add(poll.completion());
+try poll.getResult();
+_ = poll.ready().read;
+```
+
+这是 `WatchFd` 的语义化封装——底层完全一样，只是调用方想说的是「等这个
+socket 能收了」而不是「等这个 fd 的 read 位」。
+
+**一次性通知**：回调触发后若要继续等，必须重新 `init` + `add`。
+
+**Windows 上返回 `Unsupported`**：IOCP 的通知模型与「等 fd 就绪」不同构
+（它是完成式，不是就绪式），这是刻意的能力缺口，不是漏实现。
+
 ## 内存文件（VFS）
 
 `Loop.memory_fs` 可以挂载编译期资源或测试替身，静态文件路由会优先命中它，

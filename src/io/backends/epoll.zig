@@ -133,6 +133,39 @@ fn vtShutdownSend(userdata: ?*anyopaque, socket: Handle) anyerror!void {
     return uring.shutdownSend(socket);
 }
 
+fn vtShutdown(userdata: ?*anyopaque, socket: Handle, how: root.ShutdownHow) anyerror!void {
+    _ = userdata;
+    return uring.shutdownSocket(socket, how);
+}
+
+fn vtSendMsg(
+    userdata: ?*anyopaque,
+    socket: Handle,
+    bufs: []const []const u8,
+    hdr: []usize,
+    scratch: *root.Scratch,
+) anyerror!void {
+    _ = userdata;
+    _ = hdr;
+    _ = scratch;
+    // epoll 后端没有原生 sendmsg 的异步形式（它只能等可写再同步 send），
+    // 这里直接同步发完。语义正确，只是不占异步槽位。
+    return uring.sendMsgBlocking(socket, bufs);
+}
+
+fn vtRecvMsg(
+    userdata: ?*anyopaque,
+    socket: Handle,
+    bufs: []const []u8,
+    hdr: []usize,
+    scratch: *root.Scratch,
+) anyerror!void {
+    _ = userdata;
+    _ = hdr;
+    _ = scratch;
+    return uring.recvMsgBlocking(socket, bufs);
+}
+
 fn vtBind(userdata: ?*anyopaque, socket: Handle, address: net.IpAddress) anyerror!void {
     _ = userdata;
     return uring.bindSocket(socket, address);
@@ -590,6 +623,9 @@ const vtable_storage: root.VTable = .{
     .setReuseAddress = vtSetReuseAddress,
     .setSockOpt = vtSetSockOpt,
     .shutdownSend = vtShutdownSend,
+    .shutdown = vtShutdown,
+    .sendMsg = vtSendMsg,
+    .recvMsg = vtRecvMsg,
     .bind = vtBind,
     .listen = vtListen,
     .fileSize = vtFileSize,

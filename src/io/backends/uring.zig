@@ -404,6 +404,92 @@ fn vtUdpSend(
     sqe.user_data = @intFromPtr(scratch);
 }
 
+/// 分散聚合 I/O 的后端私有状态：`msghdr` + iovec 数组。
+///
+/// iovec 数组长度取 32：够 HTTP/2 帧头 + 若干段载荷，且与
+/// `MSG_HDR_WORDS` 的预算对得上（见下方 comptime 断言）。
+const IOV_MAX = 32;
+
+const SendMsgHdr = extern struct {
+    msg: linux.msghdr_const,
+    iov: [IOV_MAX]std.posix.iovec_const,
+};
+
+const RecvMsgHdr = extern struct {
+    msg: linux.msghdr,
+    iov: [IOV_MAX]std.posix.iovec,
+};
+
+comptime {
+    if (@sizeOf(SendMsgHdr) > root.MSG_HDR_WORDS * @sizeOf(usize))
+        @compileError("SendMsgHdr 超出 hdr 预算");
+    if (@sizeOf(RecvMsgHdr) > root.MSG_HDR_WORDS * @sizeOf(usize))
+        @compileError("RecvMsgHdr 超出 hdr 预算");
+}
+
+fn vtSendMsg(
+    userdata: ?*anyopaque,
+    socket: Handle,
+    bufs: []const []const u8,
+    hdr: []usize,
+    scratch: *root.Scratch,
+) anyerror!void {
+    if (bufs.len == 0) return error.NoBuffers;
+    if (bufs.len > IOV_MAX) return error.TooManyBuffers;
+    const state = stateOf(userdata);
+    const h = udpHdr(SendMsgHdr, hdr);
+    for (bufs, 0..) |b, i| h.iov[i] = .{ .base = b.ptr, .len = b.len };
+    h.msg = .{
+        .name = null,
+        .namelen = 0,
+        .iov = &h.iov,
+        .iovlen = @intCast(bufs.len),
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    const sqe = getSqe(state);
+    // 带 MSG_NOSIGNAL：与 `vtSend` 同理，写已半关闭的连接不能把进程杀掉。
+    sqe.prep_sendmsg(fdOf(socket), &h.msg, linux.MSG.NOSIGNAL);
+    sqe.user_data = @intFromPtr(scratch);
+}
+
+fn vtRecvMsg(
+    userdata: ?*anyopaque,
+    socket: Handle,
+    bufs: []const []u8,
+    hdr: []usize,
+    scratch: *root.Scratch,
+) anyerror!void {
+    if (bufs.len == 0) return error.NoBuffers;
+    if (bufs.len > IOV_MAX) return error.TooManyBuffers;
+    const state = stateOf(userdata);
+    const h = udpHdr(RecvMsgHdr, hdr);
+    for (bufs, 0..) |b, i| h.iov[i] = .{ .base = b.ptr, .len = b.len };
+    h.msg = .{
+        .name = null,
+        .namelen = 0,
+        .iov = &h.iov,
+        .iovlen = @intCast(bufs.len),
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    const sqe = getSqe(state);
+    sqe.prep_recvmsg(fdOf(socket), &h.msg, 0);
+    sqe.user_data = @intFromPtr(scratch);
+}
+
+fn vtShutdown(userdata: ?*anyopaque, socket: Handle, how: root.ShutdownHow) anyerror!void {
+    _ = userdata;
+    const flag: i32 = switch (how) {
+        .read => linux.SHUT.RD,
+        .write => linux.SHUT.WR,
+        .both => linux.SHUT.RDWR,
+    };
+    _ = try cvt(linux.shutdown(fdOf(socket), flag));
+}
+
 fn vtClose(userdata: ?*anyopaque, socket: Handle) void {
     _ = userdata;
     _ = linux.close(fdOf(socket));
@@ -919,6 +1005,9 @@ const vtable_storage: root.VTable = .{
     .setReuseAddress = vtSetReuseAddress,
     .setSockOpt = vtSetSockOpt,
     .shutdownSend = vtShutdownSend,
+    .shutdown = vtShutdown,
+    .sendMsg = vtSendMsg,
+    .recvMsg = vtRecvMsg,
     .bind = vtBind,
     .listen = vtListen,
     .fileSize = vtFileSize,
@@ -1135,6 +1224,53 @@ pub fn setSockOpt(h: Handle, opt: root.SockOpt, value: u32) !void {
 /// 只关发送方向。调用后对端仍能读到我们已经发出的全部数据，是优雅收尾。
 pub fn shutdownSend(h: Handle) !void {
     _ = try cvt(linux.shutdown(fdOf(h), linux.SHUT.WR));
+}
+
+/// 按方向关闭。`shutdownSend` 只关写，这个能关读/写/双向。
+pub fn shutdownSocket(h: Handle, how: root.ShutdownHow) !void {
+    const flag: i32 = switch (how) {
+        .read => linux.SHUT.RD,
+        .write => linux.SHUT.WR,
+        .both => linux.SHUT.RDWR,
+    };
+    _ = try cvt(linux.shutdown(fdOf(h), flag));
+}
+
+/// 阻塞版分散聚合发送（epoll 后端与 kqueue 的同步路径用）。
+///
+/// 循环直到所有缓冲都发完或遇到短写：`sendmsg` 允许部分发送，调用方拿到的
+/// 是总字节数，短写意味着内核发送缓冲满了。
+pub fn sendMsgBlocking(h: Handle, bufs: []const []const u8) !void {
+    var iov: [IOV_MAX]std.posix.iovec_const = undefined;
+    if (bufs.len > IOV_MAX) return error.TooManyBuffers;
+    for (bufs, 0..) |b, i| iov[i] = .{ .base = b.ptr, .len = b.len };
+    var msg: linux.msghdr_const = .{
+        .name = null,
+        .namelen = 0,
+        .iov = &iov,
+        .iovlen = @intCast(bufs.len),
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    _ = try cvt(linux.sendmsg(fdOf(h), &msg, linux.MSG.NOSIGNAL));
+}
+
+/// 阻塞版分散聚合接收。
+pub fn recvMsgBlocking(h: Handle, bufs: []const []u8) !void {
+    var iov: [IOV_MAX]std.posix.iovec = undefined;
+    if (bufs.len > IOV_MAX) return error.TooManyBuffers;
+    for (bufs, 0..) |b, i| iov[i] = .{ .base = b.ptr, .len = b.len };
+    var msg: linux.msghdr = .{
+        .name = null,
+        .namelen = 0,
+        .iov = &iov,
+        .iovlen = @intCast(bufs.len),
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    _ = try cvt(linux.recvmsg(fdOf(h), &msg, 0));
 }
 
 pub fn closeSocket(h: Handle) void {

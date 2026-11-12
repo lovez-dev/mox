@@ -520,6 +520,43 @@ fn vtShutdownSend(userdata: ?*anyopaque, socket: root.Handle) anyerror!void {
     try shutdownSend(socket);
 }
 
+fn vtShutdown(userdata: ?*anyopaque, socket: root.Handle, how: root.ShutdownHow) anyerror!void {
+    _ = userdata;
+    const flag: c_int = switch (how) {
+        .read => c.SHUT.RD,
+        .write => c.SHUT.WR,
+        .both => c.SHUT.RDWR,
+    };
+    if (c.shutdown(fdOf(socket), flag) < 0) return error.ShutdownFailed;
+}
+
+fn vtSendMsg(
+    userdata: ?*anyopaque,
+    socket: root.Handle,
+    bufs: []const []const u8,
+    hdr: []usize,
+    scratch: *root.Scratch,
+) anyerror!void {
+    _ = userdata;
+    _ = hdr;
+    _ = scratch;
+    // kqueue 没有原生 sendmsg 的异步形式，同步发完即可。
+    try sendMsgBlocking(socket, bufs);
+}
+
+fn vtRecvMsg(
+    userdata: ?*anyopaque,
+    socket: root.Handle,
+    bufs: []const []u8,
+    hdr: []usize,
+    scratch: *root.Scratch,
+) anyerror!void {
+    _ = userdata;
+    _ = hdr;
+    _ = scratch;
+    try recvMsgBlocking(socket, bufs);
+}
+
 fn vtBind(userdata: ?*anyopaque, socket: root.Handle, address: net.IpAddress) anyerror!void {
     _ = userdata;
     try bindSocket(socket, address);
@@ -660,6 +697,9 @@ const vtable_storage: root.VTable = .{
     .setReuseAddress = vtSetReuseAddress,
     .setSockOpt = vtSetSockOpt,
     .shutdownSend = vtShutdownSend,
+    .shutdown = vtShutdown,
+    .sendMsg = vtSendMsg,
+    .recvMsg = vtRecvMsg,
     .bind = vtBind,
     .listen = vtListen,
     .fileSize = vtFileSize,
@@ -839,6 +879,45 @@ pub fn setSockOpt(h: Handle, opt: root.SockOpt, value: u32) !void {
 /// 对端仍能读完我们已发出的数据。
 pub fn shutdownSend(h: Handle) !void {
     if (c.shutdown(fdOf(h), c.SHUT.WR) < 0) return error.ShutdownFailed;
+}
+
+/// iovec 上限，与 `MSG_HDR_WORDS` 的预算对应。
+const IOV_MAX = 32;
+
+/// 阻塞版分散聚合发送。
+pub fn sendMsgBlocking(h: Handle, bufs: []const []const u8) !void {
+    if (bufs.len == 0) return error.NoBuffers;
+    if (bufs.len > IOV_MAX) return error.TooManyBuffers;
+    var iov: [IOV_MAX]std.posix.iovec_const = undefined;
+    for (bufs, 0..) |b, i| iov[i] = .{ .base = b.ptr, .len = b.len };
+    var msg: c.msghdr_const = .{
+        .name = null,
+        .namelen = 0,
+        .iov = @ptrCast(&iov),
+        .iovlen = @intCast(bufs.len),
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    if (c.sendmsg(fdOf(h), &msg, 0) < 0) return error.SendFailed;
+}
+
+/// 阻塞版分散聚合接收。
+pub fn recvMsgBlocking(h: Handle, bufs: []const []u8) !void {
+    if (bufs.len == 0) return error.NoBuffers;
+    if (bufs.len > IOV_MAX) return error.TooManyBuffers;
+    var iov: [IOV_MAX]std.posix.iovec = undefined;
+    for (bufs, 0..) |b, i| iov[i] = .{ .base = b.ptr, .len = b.len };
+    var msg: c.msghdr = .{
+        .name = null,
+        .namelen = 0,
+        .iov = @ptrCast(&iov),
+        .iovlen = @intCast(bufs.len),
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    if (c.recvmsg(fdOf(h), &msg, 0) < 0) return error.RecvFailed;
 }
 
 /// UDP 能力用的阻塞数据报 helper；在 `Work` 池线程里调用。
