@@ -14,6 +14,7 @@ const root = @import("io.zig");
 const Io = root.Io;
 const Work = root.Work;
 const Handle = root.Handle;
+const INVALID_HANDLE = root.INVALID_HANDLE;
 
 /// 进程内内存文件表。条目由调用方在启动时 `mount`，生命周期必须长于
 /// 任何 `ReadFile`；通常挂在 `Loop` 上，随循环一起销毁。
@@ -256,6 +257,129 @@ pub const DeleteFile = struct {
     }
 };
 
+// ---- 文件句柄层节点（阶段 A）----------------------------------------------
+// 路径式 API 每次调用都要重新 open/close；这四个节点把句柄交给调用方，
+// 让它「打开一次、读写多次、显式关闭」。全部走 `Work` 池：文件没有
+// 可移植的原生异步接口，用池线程阻塞是最诚实的做法。
+//
+// 生命周期约定（重要）：
+// - `OpenFile` 成功后句柄归调用方，必须由调用方 `CloseFile` 关闭。
+//   节点本身不关闭，否则调用方拿到的是已失效句柄。
+// - `path` / `bytes` / `buf` 都由调用方持有，必须活到回调触发为止。
+
+/// 打开文件，拿到句柄。
+pub const OpenFile = struct {
+    work: Work,
+    io: Io,
+    path: []const u8,
+    mode: root.FileMode = .read_only,
+    file: Handle = INVALID_HANDLE,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, path: []const u8, mode: root.FileMode) OpenFile {
+        return .{ .work = Work.init(run), .io = io, .path = path, .mode = mode };
+    }
+
+    fn run(w: *Work) void {
+        const self: *OpenFile = @fieldParentPtr("work", w);
+        const vt = self.io.vtable.openFile orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        self.file = vt(self.io.userdata, self.path, self.mode) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    /// 成功后返回句柄。**调用方负责关闭**。
+    pub fn getResult(self: *const OpenFile) !Handle {
+        if (self.err) |e| return e;
+        return self.file;
+    }
+};
+
+/// 从已打开的句柄按 `offset` 读入 `buf`。
+pub const ReadFileHandle = struct {
+    work: Work,
+    io: Io,
+    file: Handle,
+    offset: u64 = 0,
+    buf: []u8,
+    len: usize = 0,
+    err: ?anyerror = null,
+
+    pub fn init(io: Io, file: Handle, offset: u64, buf: []u8) ReadFileHandle {
+        return .{ .work = Work.init(run), .io = io, .file = file, .offset = offset, .buf = buf };
+    }
+
+    fn run(w: *Work) void {
+        const self: *ReadFileHandle = @fieldParentPtr("work", w);
+        const vt = self.io.vtable.readFileHandle orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        self.len = vt(self.io.userdata, self.file, self.offset, self.buf) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    /// 成功返回 `buf[0..实际字节数]`（文件尾短读不报错）。
+    pub fn getResult(self: *const ReadFileHandle) ![]const u8 {
+        if (self.err) |e| return e;
+        return self.buf[0..self.len];
+    }
+};
+
+/// 向已打开的句柄按 `offset` 写入 `bytes`。
+pub const WriteFileHandle = struct {
+    work: Work,
+    io: Io,
+    file: Handle,
+    offset: u64 = 0,
+    bytes: []const u8,
+    written: usize = 0,
+    err: ?anyerror = null,
+
+    /// `bytes` 由调用方持有，必须活到回调触发为止（不复制内容）。
+    pub fn init(io: Io, file: Handle, offset: u64, bytes: []const u8) WriteFileHandle {
+        return .{ .work = Work.init(run), .io = io, .file = file, .offset = offset, .bytes = bytes };
+    }
+
+    fn run(w: *Work) void {
+        const self: *WriteFileHandle = @fieldParentPtr("work", w);
+        const vt = self.io.vtable.writeFileHandle orelse {
+            self.err = error.Unsupported;
+            return;
+        };
+        self.written = vt(self.io.userdata, self.file, self.offset, self.bytes) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+
+    pub fn getResult(self: *const WriteFileHandle) !usize {
+        if (self.err) |e| return e;
+        return self.written;
+    }
+};
+
+/// 关闭句柄。**同步完成**：关闭本身不阻塞，没必要进池，
+/// 也避免「调用方以为关了、其实还在排队」的悬垂窗口。
+pub const CloseFile = struct {
+    io: Io,
+    file: Handle,
+
+    pub fn init(io: Io, file: Handle) CloseFile {
+        return .{ .io = io, .file = file };
+    }
+
+    /// 立即关闭。幂等：重复关闭或无效句柄不报错。
+    pub fn close(self: *const CloseFile) void {
+        if (self.io.vtable.closeFile) |vt| vt(self.io.userdata, self.file);
+    }
+};
 test "MemoryFs 查找与覆盖" {
     var fs = MemoryFs.init(std.testing.allocator);
     defer fs.deinit();

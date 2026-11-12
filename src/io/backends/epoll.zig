@@ -205,6 +205,27 @@ fn vtTruncateFile(userdata: ?*anyopaque, path: []const u8, size: u64) anyerror!v
     return uring.truncateFile(path, size);
 }
 
+// 文件句柄层：Linux 两后端共用同一套 syscall 实现（见 uring.zig）。
+fn vtOpenFile(userdata: ?*anyopaque, path: []const u8, mode: root.FileMode) anyerror!root.Handle {
+    _ = userdata;
+    return uring.openFile(path, mode);
+}
+
+fn vtReadFileHandle(userdata: ?*anyopaque, file: root.Handle, offset: u64, buf: []u8) anyerror!usize {
+    _ = userdata;
+    return uring.readFileHandle(file, offset, buf);
+}
+
+fn vtWriteFileHandle(userdata: ?*anyopaque, file: root.Handle, offset: u64, bytes: []const u8) anyerror!usize {
+    _ = userdata;
+    return uring.writeFileHandle(file, offset, bytes);
+}
+
+fn vtCloseFile(userdata: ?*anyopaque, file: root.Handle) void {
+    _ = userdata;
+    uring.closeFile(file);
+}
+
 fn vtDeleteFile(userdata: ?*anyopaque, path: []const u8) anyerror!void {
     _ = userdata;
     uring.deleteFile(path);
@@ -539,6 +560,10 @@ const vtable_storage: root.VTable = .{
     .readFileAt = vtReadFileAt,
     .appendFile = vtAppendFile,
     .truncateFile = vtTruncateFile,
+    .openFile = vtOpenFile,
+    .readFileHandle = vtReadFileHandle,
+    .writeFileHandle = vtWriteFileHandle,
+    .closeFile = vtCloseFile,
     .deleteFile = vtDeleteFile,
     .makeDir = vtMakeDir,
     .removeDir = vtRemoveDir,

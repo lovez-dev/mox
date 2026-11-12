@@ -820,6 +820,26 @@ fn vtTruncateFile(userdata: ?*anyopaque, path: []const u8, size: u64) anyerror!v
     return truncateFile(path, size);
 }
 
+fn vtOpenFile(userdata: ?*anyopaque, path: []const u8, mode: root.FileMode) anyerror!root.Handle {
+    _ = userdata;
+    return openFile(path, mode);
+}
+
+fn vtReadFileHandle(userdata: ?*anyopaque, file: root.Handle, offset: u64, buf: []u8) anyerror!usize {
+    _ = userdata;
+    return readFileHandle(file, offset, buf);
+}
+
+fn vtWriteFileHandle(userdata: ?*anyopaque, file: root.Handle, offset: u64, bytes: []const u8) anyerror!usize {
+    _ = userdata;
+    return writeFileHandle(file, offset, bytes);
+}
+
+fn vtCloseFile(userdata: ?*anyopaque, file: root.Handle) void {
+    _ = userdata;
+    closeFile(file);
+}
+
 fn vtMakeDir(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
     _ = userdata;
     return makeDir(path, mode);
@@ -871,6 +891,10 @@ const vtable_storage: root.VTable = .{
     .readFileAt = vtReadFileAt,
     .appendFile = vtAppendFile,
     .truncateFile = vtTruncateFile,
+    .openFile = vtOpenFile,
+    .readFileHandle = vtReadFileHandle,
+    .writeFileHandle = vtWriteFileHandle,
+    .closeFile = vtCloseFile,
     .deleteFile = vtDeleteFile,
     .makeDir = vtMakeDir,
     .removeDir = vtRemoveDir,
@@ -1362,6 +1386,56 @@ pub fn truncateFile(path: []const u8, size: u64) !void {
     const fd = try std.posix.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .WRONLY }, 0);
     defer _ = linux.close(fd);
     _ = try cvt(linux.ftruncate(fd, @intCast(size)));
+}
+
+// ---- 文件句柄层（阶段 A）--------------------------------------------------
+// 路径式 API 每次都要 open/close；这里把句柄暴露出去，让调用方能
+// 「打开一次、读写多次、显式关闭」，并支持随机访问（offset 显式传入）。
+// 句柄就是 fd，按 `root.Handle`（usize）对外。
+
+/// 打开文件并返回句柄（fd）。错误翻译与 `openSync` 一致。
+pub fn openFile(path: []const u8, mode: root.FileMode) !root.Handle {
+    var buf: [1024]u8 = undefined;
+    const pz = try pathZ(path, &buf);
+    const flags: linux.O = switch (mode) {
+        .read_only => .{ .ACCMODE = .RDONLY },
+        .write_only => .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+        .read_write => .{ .ACCMODE = .RDWR, .CREAT = true },
+        .append => .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true },
+    };
+    const fd = try openSync(pz, flags, 0o644);
+    return @intCast(fd);
+}
+
+/// 从 `offset` 读入 `buf`。返回实际读到的字节数；文件尾短读不报错。
+pub fn readFileHandle(file: root.Handle, offset: u64, buf: []u8) !usize {
+    const fd: linux.fd_t = @intCast(file);
+    var total: usize = 0;
+    while (total < buf.len) {
+        // pread 不移动文件偏移，多个读者可以并发用同一 fd 读不同区间。
+        const n = try cvt(linux.pread(fd, buf.ptr + total, buf.len - total, @intCast(offset + total)));
+        if (n == 0) break; // EOF
+        total += n;
+    }
+    return total;
+}
+
+/// 从 `offset` 写入全部 `bytes`。返回写入的字节数。
+pub fn writeFileHandle(file: root.Handle, offset: u64, bytes: []const u8) !usize {
+    const fd: linux.fd_t = @intCast(file);
+    var total: usize = 0;
+    while (total < bytes.len) {
+        const n = try cvt(linux.pwrite(fd, bytes.ptr + total, bytes.len - total, @intCast(offset + total)));
+        if (n == 0) return error.WriteZero;
+        total += n;
+    }
+    return total;
+}
+
+/// 关闭句柄。重复关闭或无效句柄不报错（幂等）。
+pub fn closeFile(file: root.Handle) void {
+    const fd: linux.fd_t = @intCast(file);
+    if (fd >= 0) _ = linux.close(fd);
 }
 
 // ---- 测试（在 Linux 运行；已在 WSL 验证） ----------------------------------

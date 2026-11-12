@@ -827,6 +827,51 @@ CI（`.github/workflows/test.yml`）分两块：
   一条卡住吞掉其余结果；另做示例构建、真包依赖验证与 x86_64 交叉编译校验。
 
 
+
+## 文件句柄层
+
+路径式 API（`ReadFile(path)` / `WriteFile(path)` / `SendFile(path)`）每次调用都要
+重新 `open`/`close`，拿不到句柄复用，也没法按偏移随机读写。文件句柄层补上这一块：
+
+```zig
+// 打开一次，拿句柄
+var open_node = mox_io.OpenFile.init(io, "/data/log.bin", .read_write);
+loop.add(&open_node.work.c);
+const h = try open_node.getResult();   // 句柄归调用方，必须自己关
+
+// 按显式 offset 读（同一句柄可反复用，不影响别的读者）
+var buf: [4096]u8 = undefined;
+var rd = mox_io.ReadFileHandle.init(io, h, 1024, &buf);
+loop.add(&rd.work.c);
+const bytes = try rd.getResult();      // 文件尾短读不报错
+
+// 按显式 offset 写
+var wr = mox_io.WriteFileHandle.init(io, h, 0, "header");
+loop.add(&wr.work.c);
+
+// 关闭（同步、幂等：重复关闭不报错）
+mox_io.CloseFile.init(io, h).close();
+```
+
+`OpenFile` 的 `FileMode`：`read_only`（必须已存在）、`write_only`（截断并创建）、
+`read_write`（不清空，不存在则创建）、`append`（末尾追加）。
+
+**为什么 `CloseFile` 是同步的**：关闭本身不阻塞，没必要进池线程；更重要的是
+避免「调用方以为已经关了、其实还在队列里排队」的悬垂窗口。
+
+**生命周期契约**：`OpenFile` 成功后句柄归调用方，节点不会替你关（否则你拿到
+的是已失效句柄）。`path` / `bytes` / `buf` 都由调用方持有，必须活到回调触发为止。
+
+**错误语义与其它后端一致**：`read_only` 打开不存在的文件返回 `error.FileNotFound`，
+权限不足返回 `error.AccessDenied`（Windows 侧把 `GetLastError` 的
+`ERROR_FILE_NOT_FOUND` / `ERROR_PATH_NOT_FOUND` / `ERROR_ACCESS_DENIED` 翻译成
+同一套语义错误，而不是一律 `OpenFailed`）。
+
+**实现差异**：Linux 用 `pread`/`pwrite`，BSD/Darwin 用 `pread`/`pwrite`，
+Windows 用 `SetFilePointerEx` + `ReadFile`/`WriteFile`。Windows 刻意**不用**
+`OVERLAPPED`——那会把文件 I/O 接到 IOCP 上变成异步语义，与另外两个后端的
+同步 `Work` 池语义不一致。
+
 ## 内存文件（VFS）
 
 `Loop.memory_fs` 可以挂载编译期资源或测试替身，静态文件路由会优先命中它，

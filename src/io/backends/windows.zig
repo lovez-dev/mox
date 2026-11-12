@@ -987,6 +987,26 @@ fn vtTruncateFile(userdata: ?*anyopaque, path: []const u8, size: u64) anyerror!v
     return truncateFile(path, size);
 }
 
+fn vtOpenFile(userdata: ?*anyopaque, path: []const u8, mode: root.FileMode) anyerror!root.Handle {
+    _ = userdata;
+    return openFile(path, mode);
+}
+
+fn vtReadFileHandle(userdata: ?*anyopaque, file: root.Handle, offset: u64, buf: []u8) anyerror!usize {
+    _ = userdata;
+    return readFileHandle(file, offset, buf);
+}
+
+fn vtWriteFileHandle(userdata: ?*anyopaque, file: root.Handle, offset: u64, bytes: []const u8) anyerror!usize {
+    _ = userdata;
+    return writeFileHandle(file, offset, bytes);
+}
+
+fn vtCloseFile(userdata: ?*anyopaque, file: root.Handle) void {
+    _ = userdata;
+    closeFile(file);
+}
+
 fn vtMakeDir(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
     _ = userdata;
     return makeDir(path, mode);
@@ -1038,6 +1058,10 @@ const vtable_storage: root.VTable = .{
     .readFileAt = vtReadFileAt,
     .appendFile = vtAppendFile,
     .truncateFile = vtTruncateFile,
+    .openFile = vtOpenFile,
+    .readFileHandle = vtReadFileHandle,
+    .writeFileHandle = vtWriteFileHandle,
+    .closeFile = vtCloseFile,
     .deleteFile = vtDeleteFile,
     .makeDir = vtMakeDir,
     .removeDir = vtRemoveDir,
@@ -1137,6 +1161,7 @@ const fl32 = struct {
 const GENERIC_READ: u32 = 0x80000000;
 const GENERIC_WRITE: u32 = 0x40000000;
 const FILE_SHARE_READ: u32 = 0x00000001;
+const FILE_SHARE_WRITE: u32 = 0x00000002;
 const OPEN_EXISTING: u32 = 3;
 const CREATE_ALWAYS: u32 = 2;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
@@ -1149,6 +1174,7 @@ const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFFFFFF;
 const ERROR_ALREADY_EXISTS: u32 = 183;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_PATH_NOT_FOUND: u32 = 3;
+const ERROR_ACCESS_DENIED: u32 = 5;
 
 fn invalidHandle() HANDLE {
     return @ptrFromInt(std.math.maxInt(usize));
@@ -1395,4 +1421,79 @@ pub fn truncateFile(path: []const u8, size: u64) anyerror!void {
     const dist: std.os.windows.LARGE_INTEGER = @intCast(size);
     if (!fl32.SetFilePointerEx(h, dist, null, FILE_BEGIN).toBool()) return error.RequestFailed;
     if (!fl32.SetEndOfFile(h).toBool()) return error.RequestFailed;
+}
+
+// ---- 文件句柄层（阶段 A）--------------------------------------------------
+// Windows 用 CreateFileW 拿 HANDLE，读写前用 SetFilePointerEx 定位到显式
+// offset（Windows 的 ReadFile/WriteFile 没有 pread/pwrite 那种带偏移的重载，
+// 除非走 OVERLAPPED 异步形式；同步场景用 SetFilePointerEx 更直接）。
+// 这里刻意**不用** OVERLAPPED：那会把文件 I/O 接到 IOCP 上，语义变成异步，
+// 与另外两个后端的同步 Work 池语义不一致。
+
+/// 打开文件并返回 HANDLE。
+pub fn openFile(path: []const u8, mode: root.FileMode) anyerror!root.Handle {
+    var wbuf: [1024]u16 = undefined;
+    const w = try widePath(path, &wbuf);
+    const access: u32 = switch (mode) {
+        .read_only => GENERIC_READ,
+        .write_only, .append => GENERIC_WRITE,
+        .read_write => GENERIC_READ | GENERIC_WRITE,
+    };
+    const disposition: u32 = switch (mode) {
+        .read_only => OPEN_EXISTING,
+        .write_only => CREATE_ALWAYS,
+        .read_write, .append => OPEN_ALWAYS,
+    };
+    const h = fl32.CreateFileW(w.ptr, access, FILE_SHARE_READ | FILE_SHARE_WRITE, null, disposition, FILE_ATTRIBUTE_NORMAL, null);
+    if (h == invalidHandle()) {
+        // 把 Win32 错误码翻译成与其它后端一致的语义错误。只报 OpenFailed
+        // 会让调用方没法区分「文件不存在」和「权限不足」——那是调用方
+        // 必须分开处理的两件事。
+        return switch (fl32.GetLastError()) {
+            ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND => error.FileNotFound,
+            ERROR_ACCESS_DENIED => error.AccessDenied,
+            else => error.OpenFailed,
+        };
+    }
+    return @intFromPtr(h);
+}
+
+/// 定位到 `offset`（`FILE_BEGIN` 起点）。失败返回错误。
+fn seekTo(h: HANDLE, offset: u64) anyerror!void {
+    const dist: std.os.windows.LARGE_INTEGER = @intCast(offset);
+    if (!fl32.SetFilePointerEx(h, dist, null, FILE_BEGIN).toBool()) return error.SeekFailed;
+}
+
+/// 从 `offset` 读入 `buf`。返回实际读到的字节数；文件尾短读不报错。
+pub fn readFileHandle(file: root.Handle, offset: u64, buf: []u8) anyerror!usize {
+    const h: HANDLE = @ptrFromInt(file);
+    try seekTo(h, offset);
+    var total: usize = 0;
+    while (total < buf.len) {
+        var got: u32 = 0;
+        if (!fl32.ReadFile(h, buf.ptr + total, @intCast(buf.len - total), &got, null).toBool()) return error.ReadFailed;
+        if (got == 0) break; // EOF
+        total += got;
+    }
+    return total;
+}
+
+/// 从 `offset` 写入全部 `bytes`。返回写入的字节数。
+pub fn writeFileHandle(file: root.Handle, offset: u64, bytes: []const u8) anyerror!usize {
+    const h: HANDLE = @ptrFromInt(file);
+    try seekTo(h, offset);
+    var total: usize = 0;
+    while (total < bytes.len) {
+        var written: u32 = 0;
+        if (!fl32.WriteFile(h, bytes.ptr + total, @intCast(bytes.len - total), &written, null).toBool()) return error.WriteFailed;
+        if (written == 0) return error.WriteZero;
+        total += written;
+    }
+    return total;
+}
+
+/// 关闭句柄。无效句柄不报错（幂等）。
+pub fn closeFile(file: root.Handle) void {
+    const h: HANDLE = @ptrFromInt(file);
+    if (h != invalidHandle()) _ = c.CloseHandle(h);
 }

@@ -561,6 +561,26 @@ fn vtTruncateFile(userdata: ?*anyopaque, path: []const u8, size: u64) anyerror!v
     return truncateFile(path, size);
 }
 
+fn vtOpenFile(userdata: ?*anyopaque, path: []const u8, mode: root.FileMode) anyerror!root.Handle {
+    _ = userdata;
+    return openFile(path, mode);
+}
+
+fn vtReadFileHandle(userdata: ?*anyopaque, file: root.Handle, offset: u64, buf: []u8) anyerror!usize {
+    _ = userdata;
+    return readFileHandle(file, offset, buf);
+}
+
+fn vtWriteFileHandle(userdata: ?*anyopaque, file: root.Handle, offset: u64, bytes: []const u8) anyerror!usize {
+    _ = userdata;
+    return writeFileHandle(file, offset, bytes);
+}
+
+fn vtCloseFile(userdata: ?*anyopaque, file: root.Handle) void {
+    _ = userdata;
+    closeFile(file);
+}
+
 fn vtMakeDir(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
     _ = userdata;
     return makeDir(path, mode);
@@ -612,6 +632,10 @@ const vtable_storage: root.VTable = .{
     .readFileAt = vtReadFileAt,
     .appendFile = vtAppendFile,
     .truncateFile = vtTruncateFile,
+    .openFile = vtOpenFile,
+    .readFileHandle = vtReadFileHandle,
+    .writeFileHandle = vtWriteFileHandle,
+    .closeFile = vtCloseFile,
     .deleteFile = vtDeleteFile,
     .makeDir = vtMakeDir,
     .removeDir = vtRemoveDir,
@@ -1085,6 +1109,66 @@ pub fn truncateFile(path: []const u8, size: u64) !void {
     if (fd < 0) return error.OpenFailed;
     defer _ = c.close(fd);
     if (c.ftruncate(fd, @intCast(size)) < 0) return error.TruncateFailed;
+}
+
+// ---- 文件句柄层（阶段 A）--------------------------------------------------
+// 与 Linux 后端同一套语义：打开一次拿句柄，之后按显式 offset 读写。
+// BSD/Darwin 的 pread/pwrite 不移动文件偏移，多读者可共用同一 fd。
+
+/// 打开文件并返回句柄（fd）。
+pub fn openFile(path: []const u8, mode: root.FileMode) !root.Handle {
+    var zbuf: [1024]u8 = undefined;
+    const z = try zpath(path, &zbuf);
+    const flags: c.O = switch (mode) {
+        .read_only => .{ .ACCMODE = .RDONLY },
+        .write_only => .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+        .read_write => .{ .ACCMODE = .RDWR, .CREAT = true },
+        .append => .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true },
+    };
+    const fd = c.open(z.ptr, flags, @as(c.mode_t, 0o644));
+    if (fd < 0) {
+        // 与 Linux 后端保持一致的语义错误：调用方需要区分「不存在」与「没权限」。
+        return switch (std.posix.errno(@as(isize, fd))) {
+            .NOENT => error.FileNotFound,
+            .ACCES => error.AccessDenied,
+            .ISDIR => error.IsDir,
+            .NAMETOOLONG => error.NameTooLong,
+            else => error.OpenFailed,
+        };
+    }
+    return @intCast(fd);
+}
+
+/// 从 `offset` 读入 `buf`。返回实际读到的字节数；文件尾短读不报错。
+pub fn readFileHandle(file: root.Handle, offset: u64, buf: []u8) !usize {
+    const fd: c.fd_t = @intCast(file);
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = c.pread(fd, buf.ptr + total, buf.len - total, @intCast(offset + total));
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break; // EOF
+        total += @intCast(n);
+    }
+    return total;
+}
+
+/// 从 `offset` 写入全部 `bytes`。返回写入的字节数。
+pub fn writeFileHandle(file: root.Handle, offset: u64, bytes: []const u8) !usize {
+    const fd: c.fd_t = @intCast(file);
+    var total: usize = 0;
+    while (total < bytes.len) {
+        const n = c.pwrite(fd, bytes.ptr + total, bytes.len - total, @intCast(offset + total));
+        if (n < 0) return error.WriteFailed;
+        if (n == 0) return error.WriteZero;
+        total += @intCast(n);
+    }
+    return total;
+}
+
+/// 关闭句柄。重复关闭或无效句柄不报错（幂等）。
+pub fn closeFile(file: root.Handle) void {
+    const fd: c.fd_t = @intCast(file);
+    if (fd >= 0) _ = c.close(fd);
 }
 
 test "kqueue backend type-checks end to end" {

@@ -8,6 +8,11 @@ const net = std.Io.net;
 const root = @import("io.zig");
 
 const Loop = root.Loop;
+// 文件句柄层（阶段 A）
+const OpenFile = root.OpenFile;
+const ReadFileHandle = root.ReadFileHandle;
+const WriteFileHandle = root.WriteFileHandle;
+const CloseFile = root.CloseFile;
 
 // Options：运行时配置必须真的传到后端，不能只是把参数接住扔掉。
 test "openWith 的 queue_size 非法值报错，合法值生效" {
@@ -2230,3 +2235,226 @@ test "io_uring 的 add 只排队不提交，enter 次数攒到 waitBatch" {
 
 fn noopCb(_: *Loop, _: *Completion) void {}
 fn noopDispose(_: *anyopaque) void {}
+
+// ---- 文件句柄层（阶段 A）--------------------------------------------------
+// 这些测试打的是「打开一次、读写多次、显式关闭」这条真实路径：
+// 句柄复用、随机访问（显式 offset）、以及 open 后 close 的配对。
+
+test "文件句柄：open → 写入 → 随机读 → close 全链路" {
+    // 回调一触发就停机：本层全部走 Work 池，单步驱动。
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "fh");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var fbuf: [600]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&fbuf, "{s}/h.txt", .{dir});
+    defer l.deleteFile(fpath);
+
+    // 1. 打开（读写，不存在则创建）
+    var open_node = OpenFile.init(l.io, fpath, .read_write);
+    open_node.work.c.callback = stopCb;
+    l.add(&open_node.work.c);
+    try l.run();
+    const h = try open_node.getResult();
+
+    // 2. 写入 "0123456789"
+    var write_node = WriteFileHandle.init(l.io, h, 0, "0123456789");
+    write_node.work.c.callback = stopCb;
+    l.add(&write_node.work.c);
+    try l.run();
+    try std.testing.expectEqual(@as(usize, 10), try write_node.getResult());
+
+    // 3. 随机访问：从 offset 4 读 3 字节 → "456"
+    //    这条是本层存在的意义：路径式 API 做不到「同一句柄按偏移读」。
+    var rbuf: [3]u8 = undefined;
+    var read_node = ReadFileHandle.init(l.io, h, 4, &rbuf);
+    read_node.work.c.callback = stopCb;
+    l.add(&read_node.work.c);
+    try l.run();
+    try std.testing.expectEqualStrings("456", try read_node.getResult());
+
+    // 4. 从 offset 0 读全部 → "0123456789"
+    var rbuf2: [10]u8 = undefined;
+    var read_all = ReadFileHandle.init(l.io, h, 0, &rbuf2);
+    read_all.work.c.callback = stopCb;
+    l.add(&read_all.work.c);
+    try l.run();
+    try std.testing.expectEqualStrings("0123456789", try read_all.getResult());
+
+    // 5. 覆盖写入中间段：offset 4 写 "XY" → "0123XY6789"
+    var over = WriteFileHandle.init(l.io, h, 4, "XY");
+    over.work.c.callback = stopCb;
+    l.add(&over.work.c);
+    try l.run();
+    try std.testing.expectEqual(@as(usize, 2), try over.getResult());
+
+    var rbuf3: [10]u8 = undefined;
+    var read_back = ReadFileHandle.init(l.io, h, 0, &rbuf3);
+    read_back.work.c.callback = stopCb;
+    l.add(&read_back.work.c);
+    try l.run();
+    try std.testing.expectEqualStrings("0123XY6789", try read_back.getResult());
+
+    // 6. 关闭
+    CloseFile.init(l.io, h).close();
+
+    // 注意：**不**在这里断言「关闭后再读会报某个具体错误」。
+    // 关闭后的句柄值是未定义行为——Windows 返回 SeekFailed、Linux 返回
+    // EBADF、macOS 可能报别的，甚至同一 fd 号被新文件复用时读到别的数据。
+    // 断言具体错误名等于把一个平台巧合当契约。这里只验证上面整条链路。
+}
+
+test "文件句柄：读超出文件尾短读不报错" {
+    // 回调一触发就停机：本层全部走 Work 池，单步驱动。
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "fheof");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var fbuf: [600]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&fbuf, "{s}/e.txt", .{dir});
+    defer l.deleteFile(fpath);
+
+    try l.writeFileAll(fpath, "abc"); // 3 字节
+
+    var open_node = OpenFile.init(l.io, fpath, .read_only);
+    open_node.work.c.callback = stopCb;
+    l.add(&open_node.work.c);
+    try l.run();
+    const h = try open_node.getResult();
+    defer CloseFile.init(l.io, h).close();
+
+    // 从 0 读 100 字节，只应拿到 3 字节（EOF 短读，不是错误）
+    var big: [100]u8 = undefined;
+    var read_node = ReadFileHandle.init(l.io, h, 0, &big);
+    read_node.work.c.callback = stopCb;
+    l.add(&read_node.work.c);
+    try l.run();
+    try std.testing.expectEqualStrings("abc", try read_node.getResult());
+
+    // 从文件尾之后读，应拿到 0 字节（仍不是错误）
+    var tail: [10]u8 = undefined;
+    var tail_node = ReadFileHandle.init(l.io, h, 100, &tail);
+    tail_node.work.c.callback = stopCb;
+    l.add(&tail_node.work.c);
+    try l.run();
+    try std.testing.expectEqual(@as(usize, 0), (try tail_node.getResult()).len);
+}
+
+test "文件句柄：open 不存在的文件返回 FileNotFound" {
+    // 回调一触发就停机：本层全部走 Work 池，单步驱动。
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "fhnf");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var fbuf: [600]u8 = undefined;
+    const missing = try std.fmt.bufPrint(&fbuf, "{s}/nope.txt", .{dir});
+
+    // read_only 不创建，必须报错
+    var open_node = OpenFile.init(l.io, missing, .read_only);
+    open_node.work.c.callback = stopCb;
+    l.add(&open_node.work.c);
+    try l.run();
+    try std.testing.expectError(error.FileNotFound, open_node.getResult());
+}
+
+test "文件句柄：write_only 打开会清空既有内容" {
+    // 回调一触发就停机：本层全部走 Work 池，单步驱动。
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "fhtr");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var fbuf: [600]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&fbuf, "{s}/t.txt", .{dir});
+    defer l.deleteFile(fpath);
+
+    try l.writeFileAll(fpath, "old-content-here");
+
+    var open_node = OpenFile.init(l.io, fpath, .write_only);
+    open_node.work.c.callback = stopCb;
+    l.add(&open_node.work.c);
+    try l.run();
+    const h = try open_node.getResult();
+
+    var w = WriteFileHandle.init(l.io, h, 0, "new");
+    w.work.c.callback = stopCb;
+    l.add(&w.work.c);
+    try l.run();
+    try std.testing.expectEqual(@as(usize, 3), try w.getResult());
+    CloseFile.init(l.io, h).close();
+
+    // 文件应只剩 "new"（TRUNC 生效）
+    var buf: [64]u8 = undefined;
+    const n = try l.io.vtable.readFileInto(l.io.userdata, fpath, &buf);
+    try std.testing.expectEqualStrings("new", buf[0..n]);
+}
+
+test "文件句柄：CloseFile 重复关闭不 panic（幂等）" {
+    // 回调一触发就停机：本层全部走 Work 池，单步驱动。
+    const stopCb = struct {
+        fn cb(loop: *Loop, c: *Completion) void {
+            _ = c;
+            loop.stop();
+        }
+    }.cb;
+    var l = try testLoop();
+    defer l.deinit();
+
+    var pbuf: [512]u8 = undefined;
+    const dir = try tmpDir(&pbuf, "fhidem");
+    try l.makeDir(dir, 0o755);
+    defer l.removeDir(dir) catch {};
+
+    var fbuf: [600]u8 = undefined;
+    const fpath = try std.fmt.bufPrint(&fbuf, "{s}/i.txt", .{dir});
+    defer l.deleteFile(fpath);
+
+    var open_node = OpenFile.init(l.io, fpath, .read_write);
+    open_node.work.c.callback = stopCb;
+    l.add(&open_node.work.c);
+    try l.run();
+    const h = try open_node.getResult();
+
+    CloseFile.init(l.io, h).close();
+    CloseFile.init(l.io, h).close(); // 第二次不能崩
+    CloseFile.init(l.io, h).close(); // 第三次也不能
+}

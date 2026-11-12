@@ -99,6 +99,18 @@ pub const Io = struct {
 /// 够静态服务判断「是不是普通文件」用。
 pub const FileKind = enum { file, directory, sym_link, other };
 
+/// 打开文件的方式。`read_write` 同时允许读写（随机访问更新场景）。
+pub const FileMode = enum {
+    /// 只读。文件必须已存在。
+    read_only,
+    /// 只写，打开时清空内容（不存在则创建）。
+    write_only,
+    /// 读写，不清空；文件不存在则创建。
+    read_write,
+    /// 只写，在末尾追加（不存在则创建）。
+    append,
+};
+
 /// 路径元数据。`mtime_ms` 是 Unix 毫秒，便于直接做 `If-Modified-Since`。
 /// 拿不到时置 0（调用方据此认为「未知」，而不是假装 1970）。
 pub const Stat = struct {
@@ -152,6 +164,21 @@ pub const VTable = struct {
     readFileAt: *const fn (userdata: ?*anyopaque, path: []const u8, offset: u64, buf: []u8) anyerror!usize,
     /// 在文件末尾阻塞追加 `bytes`（`Work` 池线程）；文件不存在时创建。
     appendFile: *const fn (userdata: ?*anyopaque, path: []const u8, bytes: []const u8) anyerror!void,
+
+    // ---- 文件句柄层（阶段 A）--------------------------------------------
+    // 路径式 API 每次调用都要重新 open/close，无法复用句柄、无法随机读、
+    // 也没法在「打开后到关闭前」持有稳定状态。下面四个原语补上这一层：
+    // 打开一次拿 Handle，之后用 Handle 读写，最后显式关闭。
+    // 全部在 `Work` 池线程执行（文件没有可移植的原生异步接口）。
+
+    /// 按 `FileMode` 打开文件并返回句柄。`create` 为真时文件不存在则创建。
+    openFile: ?*const fn (userdata: ?*anyopaque, path: []const u8, mode: FileMode) anyerror!Handle = null,
+    /// 从 `offset` 读入 `buf`，返回实际读到的字节数（文件尾短读，不报错）。
+    readFileHandle: ?*const fn (userdata: ?*anyopaque, file: Handle, offset: u64, buf: []u8) anyerror!usize = null,
+    /// 从 `offset` 写入全部 `bytes`，返回写入字节数。
+    writeFileHandle: ?*const fn (userdata: ?*anyopaque, file: Handle, offset: u64, bytes: []const u8) anyerror!usize = null,
+    /// 关闭句柄。句柄无效或重复关闭不报错（幂等）。
+    closeFile: ?*const fn (userdata: ?*anyopaque, file: Handle) void = null,
     /// 把文件阻塞截断到 `size` 字节（`Work` 池线程）。
     truncateFile: *const fn (userdata: ?*anyopaque, path: []const u8, size: u64) anyerror!void,
     /// 删除文件（`Work` 池线程）。平台层实现返回 `void`，**所有**失败
@@ -309,6 +336,10 @@ pub const ReadFile = @import("file.zig").ReadFile;
 pub const WriteFile = @import("file.zig").WriteFile;
 pub const TruncateFile = @import("file.zig").TruncateFile;
 pub const DeleteFile = @import("file.zig").DeleteFile;
+pub const OpenFile = @import("file.zig").OpenFile;
+pub const ReadFileHandle = @import("file.zig").ReadFileHandle;
+pub const WriteFileHandle = @import("file.zig").WriteFileHandle;
+pub const CloseFile = @import("file.zig").CloseFile;
 
 /// 编译期选定的本目标后端。新增后端 = 写一个导出 `create(allocator) !Io`
 /// 的文件，再在这里加一个分支。
