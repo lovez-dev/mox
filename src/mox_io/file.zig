@@ -150,11 +150,7 @@ pub const SendFile = struct {
 
     fn run(w: *Work) void {
         const self: *SendFile = @fieldParentPtr("work", w);
-        const f = self.io.vtable.sendFileTo orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        self.sent = f(self.io.userdata, self.socket, self.path, self.offset, self.count) catch |e| {
+        self.sent = self.io.sendFile(self.socket, self.path, self.offset, self.count) catch |e| {
             self.err = errors.normalize(e);
             return;
         };

@@ -58,6 +58,25 @@ pub fn build(b: *std.Build) void {
     const io_tests = b.addTest(.{ .root_module = mox_io });
     test_step.dependOn(&b.addRunArtifact(io_tests).step);
 
+    // 强制 epoll 跑同一套契约测试，防止默认 io_uring 掩盖回落路径的问题。
+    if (target.result.os.tag == .linux) {
+        const epoll_step = b.step("test-epoll", "Run Web and I/O tests with epoll forced (Linux)");
+        const epoll_io = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mox_io/tests_epoll.zig"),
+            .target = target,
+            .optimize = optimize,
+        }) });
+        const epoll_web_module = b.createModule(.{
+            .root_source_file = b.path("src/tests_epoll.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        epoll_web_module.addImport("mox_io", mox_io);
+        const epoll_web = b.addTest(.{ .root_module = epoll_web_module });
+        epoll_step.dependOn(&b.addRunArtifact(epoll_io).step);
+        epoll_step.dependOn(&b.addRunArtifact(epoll_web).step);
+    }
+
     // 性能基线：`zig build bench -Drounds=<往返次数>`。
     const bench_options = b.addOptions();
     bench_options.addOption(usize, "rounds", b.option(usize, "rounds", "TCP echo 往返次数") orelse 2000);

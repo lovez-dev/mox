@@ -110,6 +110,10 @@ jobs:
       - name: mox + mox_io 全量测试
         run: zig build test --summary all
 
+      - name: 强制 epoll 的 Web + I/O 全量测试
+        if: runner.os == 'Linux'
+        run: zig build test-epoll --summary all
+
       - name: 单独跑 io 模块根测试
         run: zig test src/mox_io/mox_io.zig
 

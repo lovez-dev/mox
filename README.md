@@ -336,11 +336,19 @@ src/
   http.zig          HTTP/1.1 解析与序列化
   router.zig        段前缀树路由
   middleware.zig    编译期中间件折叠
-  server.zig        完成式 HTTP 服务状态机
+  server.zig        HTTP 服务公共入口
+  server/
+    runtime.zig     服务与连接生命周期、HTTP 请求调度
+    websocket.zig   WebSocket 握手与帧收发
+    sse.zig         SSE 推送与 tick 调度
+    file_response.zig 静态文件响应
+    metrics.zig     请求指标与指标端点
+    tests.zig       服务端到端与生命周期回归
+  tests_epoll.zig   强制 epoll 的 Web 测试入口
   mox_io/
     mox_io.zig      公共门面与构造入口
     types.zig       跨层共享数据类型
-    io.zig          Io / VTable 契约与 Options
+    io.zig          Io 同步操作、VTable 契约与 Options
     errors.zig      统一的公开错误集合
     sys.zig         POSIX errno 映射
     platform.zig    编译期平台后端选择
@@ -352,6 +360,7 @@ src/
     pool.zig        Work 线程池
     file.zig        阻塞文件读兜底
     tests.zig       事件循环测试
+    tests_epoll.zig 强制 epoll 的 I/O 测试入口
     udp.zig         UDP 可选能力
     dns.zig         DNS 可选能力（建立在 UDP 之上）
     process.zig     子进程：spawn / 异步等退出 / 进程组
@@ -360,6 +369,8 @@ src/
       windows.zig   IOCP + 手写 Winsock 层
       uring.zig     io_uring 环
       linux.zig     Linux 后端门面（默认 uring，失败回落 epoll）
+      linux_sys.zig Linux 共用 socket、文件系统与地址编组
+      blocking_net.zig 同步 TCP 操作组的后端适配
       epoll.zig     epoll 就绪→完成桥接
       kqueue.zig    kqueue 就绪→完成桥接
 examples/basic.zig   端到端示例
@@ -368,6 +379,22 @@ bench/echo.zig       TCP echo 性能基线
 bench/blocking.zig   纯阻塞 echo 对照尺子
 bench/concurrent.zig 多连接并发吞吐尺子
 ```
+
+## 代码边界
+
+- `Io` 提供同步系统操作；`Tcp` / `Listener` 和文件 `Work` 节点通过传入的
+  `Io` 调用后端，支持自定义实现。同步方法会阻塞调用线程。
+- `Loop` 负责提交、完成回调、定时器、取消及停机。旧同步方法保留为兼容转发；
+  新代码使用 `loop.io`。内存 VFS 和失败计数仍由 `Loop` 管理。
+- Linux 的 io_uring 与 epoll 共同依赖 `linux_sys.zig`，epoll 不依赖 uring。
+  共用系统层不包含事件循环状态。
+- Web 的协议模块处理协议行为，统一调用 `runtime` 的发送、关闭和回收入口。
+  连接对象、在飞节点与取消项始终由同一套生命周期管理。
+- `server.zig` 与 `mox_io.zig` 是公共入口；内部模块的协作接口不代表新的公共 API。
+
+Linux 上运行 `zig build test-epoll --summary all`，会强制整个 Web/I/O 测试进程
+使用 epoll，显式要求 io_uring 的专项用例仍会自行选择该后端。CI 同时跑默认后端
+与此入口，防止默认 io_uring 掩盖 epoll 的回归。
 
 ## 跨线程提交
 
@@ -835,15 +862,15 @@ CI（`.github/workflows/test.yml`）分两块：
 
 ### 本轮重构验证（2026-11-14）
 
-本轮拆分了公共门面、共享类型、后端契约、平台选择和错误映射，新增同步 TCP
-便捷封装，并重构 epoll/kqueue 的 fd 方向队列。epoll 的双向监听各自使用独立
-池节点；取消或关闭只投递一次完成包，回归覆盖超过 64 个双向监听的批量关闭。
+本轮进一步抽出 Linux 共用系统层，将同步操作归到 `Io`，统一 TCP/文件节点的
+调用路径，并按协议拆分服务层。保留公共 API 与兼容入口；新增自定义 `Io` 的
+TCP 调用及短写续发回归。epoll 双向监听取消与批量关闭回归继续通过。
 
 | 环境 / 检查 | 本轮结果 |
 |---|---|
-| Windows x86_64 / IOCP | `zig build test`：174 通过、17 跳过、0 失败 |
-| Linux x86_64 / WSL2 默认 io_uring | Web 67 通过；I/O 132 通过、7 跳过、0 失败（含 epoll 专属回归） |
-| Linux x86_64 / 强制 epoll | 测试入口先设 `platform.forced = .epoll`：Web 67 通过；I/O 124 通过、15 跳过；另各有 1 个入口配置测试通过 |
+| Windows x86_64 / IOCP | `zig build test`：176 通过、17 跳过、0 失败 |
+| Linux x86_64 / WSL2 默认 io_uring | Web 68 通过；I/O 133 通过、7 跳过、0 失败（含 epoll 专属回归） |
+| Linux x86_64 / 强制 epoll | Web 69 通过；I/O 126 通过、15 跳过、0 失败（含测试入口配置用例） |
 | macOS arm64 | Web 与 I/O 测试交叉编译成功；本轮运行时结果待真实 macOS CI 验证 |
 | Linux arm64 / Windows arm64 / FreeBSD x86_64 | I/O 测试交叉类型检查成功（`--test-no-exec -fno-emit-bin`），未在这些目标上实跑 |
 | 示例与外部包依赖 | `zig build`、`zig build test-package` 通过 |
