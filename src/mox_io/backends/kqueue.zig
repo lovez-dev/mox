@@ -1029,7 +1029,10 @@ fn vtDeleteFile(userdata: ?*anyopaque, path: []const u8) anyerror!void {
     try deleteFileChecked(path);
 }
 
+const blocking_net = @import("blocking_net.zig").adapt(@This());
+
 const vtable_storage: io_mod.VTable = .{
+    .blockingNet = &blocking_net,
     .deinit = vtDeinit,
     .now = vtNow,
     .createSocket = vtCreateSocket,

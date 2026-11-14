@@ -166,3 +166,9 @@ pub const Ready = packed struct(u8) {
         return self.read or self.write or self.failed or self.hangup;
     }
 };
+
+/// 阻塞 accept 的结果；新套接字由调用方关闭。
+pub const Accepted = struct {
+    socket: Handle,
+    address: std.Io.net.IpAddress,
+};

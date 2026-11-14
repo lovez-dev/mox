@@ -2,7 +2,7 @@
 //!
 //! 文件没有可移植的原生异步接口，因此阻塞读是通用兜底。读操作只持有 `Io`
 //! 的值拷贝（`{ userdata, vtable }` 是平凡的），从而能安全地在池线程里调用
-//! `io.vtable.readFileInto`，不必触碰只属于循环线程的 `*Loop`。
+//! `io.readFileInto`，不必触碰只属于循环线程的 `*Loop`。
 //!
 //! `MemoryFs` 是可选的内存文件源：命中时不再 open/read/close 真实磁盘，
 //! 仍走 `Loop.add → Work → 回调` 这条链路，但池线程只做一次 memcpy、不做
@@ -106,12 +106,12 @@ pub const ReadFile = struct {
             return;
         }
         self.len = if (self.offset == 0)
-            self.io.vtable.readFileInto(self.io.userdata, self.path, self.buf) catch |e| {
+            self.io.readFileInto(self.path, self.buf) catch |e| {
                 self.err = errors.normalize(e);
                 return;
             }
         else
-            self.io.vtable.readFileAt(self.io.userdata, self.path, self.offset, self.buf) catch |e| {
+            self.io.readFileAt(self.path, self.offset, self.buf) catch |e| {
                 self.err = errors.normalize(e);
                 return;
             };
@@ -194,11 +194,11 @@ pub const WriteFile = struct {
     fn run(w: *Work) void {
         const self: *WriteFile = @fieldParentPtr("work", w);
         switch (self.mode) {
-            .overwrite => self.io.vtable.writeFileAll(self.io.userdata, self.path, self.bytes) catch |e| {
+            .overwrite => self.io.writeFileAll(self.path, self.bytes) catch |e| {
                 self.err = errors.normalize(e);
                 return;
             },
-            .append => self.io.vtable.appendFile(self.io.userdata, self.path, self.bytes) catch |e| {
+            .append => self.io.appendFile(self.path, self.bytes) catch |e| {
                 self.err = errors.normalize(e);
                 return;
             },
@@ -227,7 +227,7 @@ pub const TruncateFile = struct {
 
     fn run(w: *Work) void {
         const self: *TruncateFile = @fieldParentPtr("work", w);
-        self.io.vtable.truncateFile(self.io.userdata, self.path, self.size) catch |e| {
+        self.io.truncateFile(self.path, self.size) catch |e| {
             self.err = errors.normalize(e);
         };
     }
@@ -252,7 +252,7 @@ pub const DeleteFile = struct {
 
     fn run(w: *Work) void {
         const self: *DeleteFile = @fieldParentPtr("work", w);
-        self.io.vtable.deleteFile(self.io.userdata, self.path) catch |e| {
+        self.io.deleteFile(self.path) catch |e| {
             self.err = errors.normalize(e);
         };
     }
@@ -287,11 +287,7 @@ pub const OpenFile = struct {
 
     fn run(w: *Work) void {
         const self: *OpenFile = @fieldParentPtr("work", w);
-        const vt = self.io.vtable.openFile orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        self.file = vt(self.io.userdata, self.path, self.mode) catch |e| {
+        self.file = self.io.openFile(self.path, self.mode) catch |e| {
             self.err = errors.normalize(e);
             return;
         };
@@ -320,11 +316,7 @@ pub const ReadFileHandle = struct {
 
     fn run(w: *Work) void {
         const self: *ReadFileHandle = @fieldParentPtr("work", w);
-        const vt = self.io.vtable.readFileHandle orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        self.len = vt(self.io.userdata, self.file, self.offset, self.buf) catch |e| {
+        self.len = self.io.readFileHandle(self.file, self.offset, self.buf) catch |e| {
             self.err = errors.normalize(e);
             return;
         };
@@ -354,11 +346,7 @@ pub const WriteFileHandle = struct {
 
     fn run(w: *Work) void {
         const self: *WriteFileHandle = @fieldParentPtr("work", w);
-        const vt = self.io.vtable.writeFileHandle orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        self.written = vt(self.io.userdata, self.file, self.offset, self.bytes) catch |e| {
+        self.written = self.io.writeFileHandle(self.file, self.offset, self.bytes) catch |e| {
             self.err = errors.normalize(e);
             return;
         };
@@ -392,7 +380,7 @@ pub const CloseFile = struct {
     pub fn close(self: *CloseFile) void {
         if (self.closed) return;
         self.closed = true;
-        if (self.io.vtable.closeFile) |vt| vt(self.io.userdata, self.file);
+        self.io.closeFile(self.file);
     }
 };
 
@@ -413,11 +401,7 @@ pub const StatFile = struct {
 
     fn run(w: *Work) void {
         const self: *StatFile = @fieldParentPtr("work", w);
-        const vt = self.io.vtable.statFile orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        self.stat = vt(self.io.userdata, self.file) catch |e| {
+        self.stat = self.io.statFile(self.file) catch |e| {
             self.err = errors.normalize(e);
             return;
         };
@@ -443,11 +427,7 @@ pub const SetFileSize = struct {
 
     fn run(w: *Work) void {
         const self: *SetFileSize = @fieldParentPtr("work", w);
-        const vt = self.io.vtable.setFileSize orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        vt(self.io.userdata, self.file, self.size) catch |e| {
+        self.io.setFileSize(self.file, self.size) catch |e| {
             self.err = errors.normalize(e);
             return;
         };
@@ -471,11 +451,7 @@ pub const SyncFile = struct {
 
     fn run(w: *Work) void {
         const self: *SyncFile = @fieldParentPtr("work", w);
-        const vt = self.io.vtable.syncFile orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        vt(self.io.userdata, self.file) catch |e| {
+        self.io.syncFile(self.file) catch |e| {
             self.err = errors.normalize(e);
             return;
         };
@@ -505,11 +481,7 @@ pub const ReadLink = struct {
 
     fn run(w: *Work) void {
         const self: *ReadLink = @fieldParentPtr("work", w);
-        const vt = self.io.vtable.readLink orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        self.len = vt(self.io.userdata, self.link_path, self.buf) catch |e| {
+        self.len = self.io.readLink(self.link_path, self.buf) catch |e| {
             self.err = errors.normalize(e);
             return;
         };
@@ -536,11 +508,7 @@ pub const OpenDir = struct {
 
     fn run(w: *Work) void {
         const self: *OpenDir = @fieldParentPtr("work", w);
-        const vt = self.io.vtable.openDir orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        self.dir = vt(self.io.userdata, self.path) catch |e| {
+        self.dir = self.io.openDir(self.path) catch |e| {
             self.err = errors.normalize(e);
             return;
         };
@@ -568,11 +536,7 @@ pub const ReadDirHandle = struct {
 
     fn run(w: *Work) void {
         const self: *ReadDirHandle = @fieldParentPtr("work", w);
-        const vt = self.io.vtable.readDirHandle orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        self.count = vt(self.io.userdata, self.dir, self.buf) catch |e| {
+        self.count = self.io.readDirHandle(self.dir, self.buf) catch |e| {
             self.err = errors.normalize(e);
             return;
         };
@@ -602,7 +566,7 @@ pub const CloseDir = struct {
     pub fn close(self: *CloseDir) void {
         if (self.closed) return;
         self.closed = true;
-        if (self.io.vtable.closeDir) |vt| vt(self.io.userdata, self.dir);
+        self.io.closeDir(self.dir);
     }
 };
 
@@ -623,11 +587,7 @@ pub const SetFilePermissions = struct {
 
     fn run(w: *Work) void {
         const self: *SetFilePermissions = @fieldParentPtr("work", w);
-        const vt = self.io.vtable.setFilePermissions orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        vt(self.io.userdata, self.file, self.mode) catch |e| {
+        self.io.setFilePermissions(self.file, self.mode) catch |e| {
             self.err = errors.normalize(e);
             return;
         };
@@ -653,11 +613,7 @@ pub const SetFileOwner = struct {
 
     fn run(w: *Work) void {
         const self: *SetFileOwner = @fieldParentPtr("work", w);
-        const vt = self.io.vtable.setFileOwner orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        vt(self.io.userdata, self.file, self.uid, self.gid) catch |e| {
+        self.io.setFileOwner(self.file, self.uid, self.gid) catch |e| {
             self.err = errors.normalize(e);
             return;
         };
@@ -683,11 +639,7 @@ pub const SetFileTimestamps = struct {
 
     fn run(w: *Work) void {
         const self: *SetFileTimestamps = @fieldParentPtr("work", w);
-        const vt = self.io.vtable.setFileTimestamps orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        vt(self.io.userdata, self.file, self.atime_ns, self.mtime_ns) catch |e| {
+        self.io.setFileTimestamps(self.file, self.atime_ns, self.mtime_ns) catch |e| {
             self.err = errors.normalize(e);
             return;
         };
@@ -712,11 +664,7 @@ pub const SetPermissions = struct {
 
     fn run(w: *Work) void {
         const self: *SetPermissions = @fieldParentPtr("work", w);
-        const vt = self.io.vtable.setPermissions orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        vt(self.io.userdata, self.path, self.mode) catch |e| {
+        self.io.setPermissions(self.path, self.mode) catch |e| {
             self.err = errors.normalize(e);
             return;
         };
@@ -742,11 +690,7 @@ pub const SetOwner = struct {
 
     fn run(w: *Work) void {
         const self: *SetOwner = @fieldParentPtr("work", w);
-        const vt = self.io.vtable.setOwner orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        vt(self.io.userdata, self.path, self.uid, self.gid) catch |e| {
+        self.io.setOwner(self.path, self.uid, self.gid) catch |e| {
             self.err = errors.normalize(e);
             return;
         };
@@ -772,11 +716,7 @@ pub const SetTimestamps = struct {
 
     fn run(w: *Work) void {
         const self: *SetTimestamps = @fieldParentPtr("work", w);
-        const vt = self.io.vtable.setTimestamps orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        vt(self.io.userdata, self.path, self.atime_ns, self.mtime_ns) catch |e| {
+        self.io.setTimestamps(self.path, self.atime_ns, self.mtime_ns) catch |e| {
             self.err = errors.normalize(e);
             return;
         };
@@ -801,11 +741,7 @@ pub const Access = struct {
 
     fn run(w: *Work) void {
         const self: *Access = @fieldParentPtr("work", w);
-        const vt = self.io.vtable.access orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        vt(self.io.userdata, self.path, self.mode) catch |e| {
+        self.io.access(self.path, self.mode) catch |e| {
             self.err = errors.normalize(e);
             return;
         };
@@ -831,11 +767,7 @@ pub const RealPath = struct {
 
     fn run(w: *Work) void {
         const self: *RealPath = @fieldParentPtr("work", w);
-        const vt = self.io.vtable.realPath orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        self.len = vt(self.io.userdata, self.path, self.buf) catch |e| {
+        self.len = self.io.realPath(self.path, self.buf) catch |e| {
             self.err = errors.normalize(e);
             return;
         };
@@ -861,11 +793,7 @@ pub const HardLink = struct {
 
     fn run(w: *Work) void {
         const self: *HardLink = @fieldParentPtr("work", w);
-        const vt = self.io.vtable.hardLink orelse {
-            self.err = error.Unsupported;
-            return;
-        };
-        vt(self.io.userdata, self.old_path, self.new_path) catch |e| {
+        self.io.hardLink(self.old_path, self.new_path) catch |e| {
             self.err = errors.normalize(e);
             return;
         };

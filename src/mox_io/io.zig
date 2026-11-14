@@ -42,11 +42,260 @@ pub const Io = struct {
         const table = self.caps orelse return null;
         return table.get(T, id);
     }
+
+    // 同步系统操作。异步操作使用 Loop + Completion；这些方法会阻塞调用线程。
+    pub fn associate(self: Io, socket: Handle, key: usize) !void {
+        try self.vtable.associate(self.userdata, socket, key);
+    }
+
+    pub fn sendFile(self: Io, socket: Handle, path: []const u8, offset: u64, count: usize) !usize {
+        const f = self.vtable.sendFileTo orelse return error.Unsupported;
+        return f(self.userdata, socket, path, offset, count);
+    }
+
+    pub fn createUnixSocket(self: Io) !Handle {
+        const f = self.vtable.createUnix orelse return error.Unsupported;
+        return f(self.userdata);
+    }
+
+    pub fn bindUnix(self: Io, socket: Handle, path: []const u8) !void {
+        const f = self.vtable.bindUnix orelse return error.Unsupported;
+        return f(self.userdata, socket, path);
+    }
+
+    pub fn createSocket(self: Io, address: std.Io.net.IpAddress) !Handle {
+        return self.vtable.createSocket(self.userdata, address);
+    }
+
+    pub fn setReuseAddress(self: Io, socket: Handle, on: bool) !void {
+        try self.vtable.setReuseAddress(self.userdata, socket, on);
+    }
+
+    pub fn setSockOpt(self: Io, socket: Handle, opt: SockOpt, value: u32) !void {
+        const f = self.vtable.setSockOpt orelse return error.Unsupported;
+        try f(self.userdata, socket, opt, value);
+    }
+
+    pub fn shutdownSend(self: Io, socket: Handle) !void {
+        const f = self.vtable.shutdownSend orelse return error.Unsupported;
+        try f(self.userdata, socket);
+    }
+
+    pub fn bind(self: Io, socket: Handle, address: std.Io.net.IpAddress) !void {
+        try self.vtable.bind(self.userdata, socket, address);
+    }
+
+    pub fn listen(self: Io, socket: Handle, backlog: c_int) !void {
+        try self.vtable.listen(self.userdata, socket, backlog);
+    }
+
+    pub fn close(self: Io, socket: Handle) void {
+        self.vtable.close(self.userdata, socket);
+    }
+
+    pub fn makeDir(self: Io, path: []const u8, mode: u32) !void {
+        return self.vtable.makeDir(self.userdata, path, mode);
+    }
+
+    pub fn removeDir(self: Io, path: []const u8) !void {
+        return self.vtable.removeDir(self.userdata, path);
+    }
+
+    pub fn rename(self: Io, old_path: []const u8, new_path: []const u8) !void {
+        return self.vtable.rename(self.userdata, old_path, new_path);
+    }
+
+    pub fn symLink(self: Io, target: []const u8, link_path: []const u8) !void {
+        return self.vtable.symLink(self.userdata, target, link_path);
+    }
+
+    pub fn hardLink(self: Io, old_path: []const u8, new_path: []const u8) !void {
+        const f = self.vtable.hardLink orelse return error.Unsupported;
+        return f(self.userdata, old_path, new_path);
+    }
+
+    pub fn statPath(self: Io, path: []const u8) !types.Stat {
+        return self.vtable.statPath(self.userdata, path);
+    }
+
+    pub fn listDir(self: Io, path: []const u8, buf: []types.DirEntry) !usize {
+        return self.vtable.listDir(self.userdata, path, buf);
+    }
+
+    pub fn writeFileAll(self: Io, path: []const u8, bytes: []const u8) !void {
+        return self.vtable.writeFileAll(self.userdata, path, bytes);
+    }
+
+    pub fn truncate(self: Io, path: []const u8, size: u64) !void {
+        return self.vtable.truncateFile(self.userdata, path, size);
+    }
+
+    pub fn readLink(self: Io, link_path: []const u8, buf: []u8) !usize {
+        const f = self.vtable.readLink orelse return error.Unsupported;
+        return f(self.userdata, link_path, buf);
+    }
+
+    pub fn access(self: Io, path: []const u8, mode: u32) !void {
+        const f = self.vtable.access orelse return error.Unsupported;
+        return f(self.userdata, path, mode);
+    }
+
+    pub fn realPath(self: Io, path: []const u8, buf: []u8) !usize {
+        const f = self.vtable.realPath orelse return error.Unsupported;
+        return f(self.userdata, path, buf);
+    }
+
+    pub fn fileSize(self: Io, path: []const u8) !u64 {
+        return self.vtable.fileSize(self.userdata, path);
+    }
+    pub fn deleteFile(self: Io, path: []const u8) !void {
+        return self.vtable.deleteFile(self.userdata, path);
+    }
+    pub fn closeChecked(self: Io, socket: Handle) !void {
+        const f = self.vtable.closeChecked orelse {
+            self.close(socket);
+            return;
+        };
+        return f(self.userdata, socket);
+    }
+
+    pub fn connectBlocking(self: Io, socket: Handle, address: std.Io.net.IpAddress) !void {
+        const table = self.vtable.blockingNet orelse return error.Unsupported;
+        return table.connectBlocking(self.userdata, socket, address);
+    }
+
+    pub fn acceptBlocking(self: Io, socket: Handle) !types.Accepted {
+        const table = self.vtable.blockingNet orelse return error.Unsupported;
+        return table.acceptBlocking(self.userdata, socket);
+    }
+
+    pub fn localAddress(self: Io, socket: Handle) !std.Io.net.IpAddress {
+        const table = self.vtable.blockingNet orelse return error.Unsupported;
+        return table.localAddress(self.userdata, socket);
+    }
+
+    pub fn sendBlocking(self: Io, socket: Handle, bytes: []const u8) !usize {
+        const table = self.vtable.blockingNet orelse return error.Unsupported;
+        return table.sendBlocking(self.userdata, socket, bytes);
+    }
+
+    pub fn recvBlocking(self: Io, socket: Handle, buf: []u8) !usize {
+        const table = self.vtable.blockingNet orelse return error.Unsupported;
+        return table.recvBlocking(self.userdata, socket, buf);
+    }
+
+    pub fn readFileInto(self: Io, path: []const u8, buf: []u8) !usize {
+        return self.vtable.readFileInto(self.userdata, path, buf);
+    }
+
+    pub fn readFileAt(self: Io, path: []const u8, offset: u64, buf: []u8) !usize {
+        return self.vtable.readFileAt(self.userdata, path, offset, buf);
+    }
+
+    pub fn appendFile(self: Io, path: []const u8, bytes: []const u8) !void {
+        return self.vtable.appendFile(self.userdata, path, bytes);
+    }
+
+    pub fn truncateFile(self: Io, path: []const u8, size: u64) !void {
+        return self.vtable.truncateFile(self.userdata, path, size);
+    }
+
+    pub fn openFile(self: Io, path: []const u8, mode: FileMode) !Handle {
+        const f = self.vtable.openFile orelse return error.Unsupported;
+        return f(self.userdata, path, mode);
+    }
+
+    pub fn readFileHandle(self: Io, file: Handle, offset: u64, buf: []u8) !usize {
+        const f = self.vtable.readFileHandle orelse return error.Unsupported;
+        return f(self.userdata, file, offset, buf);
+    }
+
+    pub fn writeFileHandle(self: Io, file: Handle, offset: u64, bytes: []const u8) !usize {
+        const f = self.vtable.writeFileHandle orelse return error.Unsupported;
+        return f(self.userdata, file, offset, bytes);
+    }
+
+    pub fn closeFile(self: Io, file: Handle) void {
+        const f = self.vtable.closeFile orelse return;
+        return f(self.userdata, file);
+    }
+
+    pub fn statFile(self: Io, file: Handle) !Stat {
+        const f = self.vtable.statFile orelse return error.Unsupported;
+        return f(self.userdata, file);
+    }
+
+    pub fn setFileSize(self: Io, file: Handle, size: u64) !void {
+        const f = self.vtable.setFileSize orelse return error.Unsupported;
+        return f(self.userdata, file, size);
+    }
+
+    pub fn syncFile(self: Io, file: Handle) !void {
+        const f = self.vtable.syncFile orelse return error.Unsupported;
+        return f(self.userdata, file);
+    }
+
+    pub fn setFilePermissions(self: Io, file: Handle, mode: u32) !void {
+        const f = self.vtable.setFilePermissions orelse return error.Unsupported;
+        return f(self.userdata, file, mode);
+    }
+
+    pub fn setFileOwner(self: Io, file: Handle, uid: u32, gid: u32) !void {
+        const f = self.vtable.setFileOwner orelse return error.Unsupported;
+        return f(self.userdata, file, uid, gid);
+    }
+
+    pub fn setFileTimestamps(self: Io, file: Handle, atime_ns: i64, mtime_ns: i64) !void {
+        const f = self.vtable.setFileTimestamps orelse return error.Unsupported;
+        return f(self.userdata, file, atime_ns, mtime_ns);
+    }
+
+    pub fn setPermissions(self: Io, path: []const u8, mode: u32) !void {
+        const f = self.vtable.setPermissions orelse return error.Unsupported;
+        return f(self.userdata, path, mode);
+    }
+
+    pub fn setOwner(self: Io, path: []const u8, uid: u32, gid: u32) !void {
+        const f = self.vtable.setOwner orelse return error.Unsupported;
+        return f(self.userdata, path, uid, gid);
+    }
+
+    pub fn setTimestamps(self: Io, path: []const u8, atime_ns: i64, mtime_ns: i64) !void {
+        const f = self.vtable.setTimestamps orelse return error.Unsupported;
+        return f(self.userdata, path, atime_ns, mtime_ns);
+    }
+
+    pub fn openDir(self: Io, path: []const u8) !Handle {
+        const f = self.vtable.openDir orelse return error.Unsupported;
+        return f(self.userdata, path);
+    }
+
+    pub fn readDirHandle(self: Io, dir: Handle, buf: []DirEntry) !usize {
+        const f = self.vtable.readDirHandle orelse return error.Unsupported;
+        return f(self.userdata, dir, buf);
+    }
+
+    pub fn closeDir(self: Io, dir: Handle) void {
+        const f = self.vtable.closeDir orelse return;
+        return f(self.userdata, dir);
+    }
 };
 
 const CapTable = types.CapTable;
 
+/// 同步 TCP 操作组。后端可省略；Io 调用时返回 Unsupported。
+/// 与完成式 recv/send/accept/connect 分开，避免把同步调用误提交为异步操作。
+pub const BlockingNet = struct {
+    connectBlocking: *const fn (?*anyopaque, Handle, std.Io.net.IpAddress) anyerror!void,
+    acceptBlocking: *const fn (?*anyopaque, Handle) anyerror!types.Accepted,
+    localAddress: *const fn (?*anyopaque, Handle) anyerror!std.Io.net.IpAddress,
+    sendBlocking: *const fn (?*anyopaque, Handle, []const u8) anyerror!usize,
+    recvBlocking: *const fn (?*anyopaque, Handle, []u8) anyerror!usize,
+};
+
 pub const VTable = struct {
+    blockingNet: ?*const BlockingNet = null,
+
     /// 释放后端资源（`userdata` 指向的状态），只调一次。
     deinit: *const fn (userdata: ?*anyopaque) void,
 

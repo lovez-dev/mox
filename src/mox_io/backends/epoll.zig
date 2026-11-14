@@ -917,7 +917,10 @@ fn vtNotify(userdata: ?*anyopaque) void {
     _ = linux.write(state.efd, std.mem.asBytes(&one), @sizeOf(u64));
 }
 
+const blocking_net = @import("blocking_net.zig").adapt(system);
+
 const vtable_storage: io_mod.VTable = .{
+    .blockingNet = &blocking_net,
     .deinit = vtDeinit,
     .now = vtNow,
     .createSocket = vtCreateSocket,

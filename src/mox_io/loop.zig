@@ -657,27 +657,24 @@ pub const Loop = struct {
     /// 把套接字的 I/O（以及其上投递的 AcceptEx）路由到本后端。
     /// 监听套接字必须先关联再接受。
     pub fn associate(self: *Loop, socket: Handle, key: usize) !void {
-        try self.io.vtable.associate(self.io.userdata, socket, key);
+        return self.io.associate(socket, key);
     }
 
     /// 零拷贝把文件送进 socket（阻塞，`sendfile`）。不支持时返回
     /// `error.Unsupported`。异步场景请用 `SendFile` 节点。
     pub fn sendFile(self: *Loop, socket: Handle, path: []const u8, offset: u64, count: usize) !usize {
-        const f = self.io.vtable.sendFileTo orelse return error.Unsupported;
-        return f(self.io.userdata, socket, path, offset, count);
+        return self.io.sendFile(socket, path, offset, count);
     }
 
     /// 建一个 Unix domain socket（`AF_UNIX` + `SOCK_STREAM`）。
     /// 后端不支持时（Windows）返回 `error.Unsupported`。
     pub fn createUnixSocket(self: *Loop) !Handle {
-        const f = self.io.vtable.createUnix orelse return error.Unsupported;
-        return f(self.io.userdata);
+        return self.io.createUnixSocket();
     }
 
     /// 把 UDS 绑到文件系统路径。路径已存在时返回 `error.PathAlreadyExists`。
     pub fn bindUnix(self: *Loop, socket: Handle, path: []const u8) !void {
-        const f = self.io.vtable.bindUnix orelse return error.Unsupported;
-        return f(self.io.userdata, socket, path);
+        return self.io.bindUnix(socket, path);
     }
 
     /// 连到 UDS。不支持时返回 `error.Unsupported`。
@@ -688,40 +685,38 @@ pub const Loop = struct {
 
     /// 创建一个与 `address` 同族、可用于重叠 I/O 的 TCP 套接字。
     pub fn createSocket(self: *Loop, address: std.Io.net.IpAddress) !Handle {
-        return self.io.vtable.createSocket(self.io.userdata, address);
+        return self.io.createSocket(address);
     }
 
     /// 监听前设置 `SO_REUSEADDR`。
     pub fn setReuseAddress(self: *Loop, socket: Handle, on: bool) !void {
-        try self.io.vtable.setReuseAddress(self.io.userdata, socket, on);
+        return self.io.setReuseAddress(socket, on);
     }
 
     /// 设置一个套接字选项。后端未提供该能力时返回 `error.Unsupported`。
     pub fn setSockOpt(self: *Loop, socket: Handle, opt: SockOpt, value: u32) !void {
-        const f = self.io.vtable.setSockOpt orelse return error.Unsupported;
-        try f(self.io.userdata, socket, opt, value);
+        return self.io.setSockOpt(socket, opt, value);
     }
 
     /// 半关闭发送方向：对端仍能读完已发出的数据，之后再 `close` 才是优雅收尾。
     pub fn shutdownSend(self: *Loop, socket: Handle) !void {
-        const f = self.io.vtable.shutdownSend orelse return error.Unsupported;
-        try f(self.io.userdata, socket);
+        return self.io.shutdownSend(socket);
     }
 
     /// 把套接字绑定到 `address`。
     pub fn bind(self: *Loop, socket: Handle, address: std.Io.net.IpAddress) !void {
-        try self.io.vtable.bind(self.io.userdata, socket, address);
+        return self.io.bind(socket, address);
     }
 
     /// 开始监听。
     pub fn listen(self: *Loop, socket: Handle, backlog: c_int) !void {
-        try self.io.vtable.listen(self.io.userdata, socket, backlog);
+        return self.io.listen(socket, backlog);
     }
 
     /// 关闭套接字（与 `NetClose` 走同一个后端入口）。**吞掉错误**：
     /// 关 fd 失败通常是「重复关闭」，按惯例不该让调用方 panic。
     pub fn close(self: *Loop, socket: Handle) void {
-        self.io.vtable.close(self.io.userdata, socket);
+        return self.io.close(socket);
     }
 
     /// 关闭套接字并回报失败。与 `close` 的唯一区别是错误不被吞掉：
@@ -730,11 +725,7 @@ pub const Loop = struct {
     /// 后端未实现该槽位时按成功处理（等价于 `close`）。
     /// 失败会累加 `close_failures`，便于生产环境观测。
     pub fn closeChecked(self: *Loop, socket: Handle) !void {
-        const f = self.io.vtable.closeChecked orelse {
-            self.io.vtable.close(self.io.userdata, socket);
-            return;
-        };
-        f(self.io.userdata, socket) catch |e| {
+        self.io.closeChecked(socket) catch |e| {
             self.close_failures += 1;
             return e;
         };
@@ -750,7 +741,7 @@ pub const Loop = struct {
     /// 其长度，不触碰磁盘；未命中才回落到后端的 `fileSize`。
     pub fn fileSize(self: *Loop, path: []const u8) !u64 {
         if (self.memory_fs.size(path)) |n| return n;
-        return self.io.vtable.fileSize(self.io.userdata, path);
+        return self.io.fileSize(path);
     }
 
     // ---- 可观测接口 ---------------------------------------------------------
@@ -771,75 +762,70 @@ pub const Loop = struct {
     }
     // ---- 目录与元数据（阻塞调用，在 `Work` 池线程里跑才不卡循环） ----------
     //
-    // 这些是**同步**入口：直接调平台层，会阻塞当前线程。放在 `Loop` 上是为了
-    // 让 `Work` 节点内部能拿到同一个 `io`；用户代码在循环线程里直接调用会卡住
-    // 整个循环，异步场景请用 `MakeDir` / `RemoveDir` 等节点。
+    // 兼容入口：统一转发给 Io 的同步操作。新代码直接使用 loop.io；
+    // 循环线程中的异步场景请用 Work 节点。
 
     pub fn makeDir(self: *Loop, path: []const u8, mode: u32) !void {
-        return self.io.vtable.makeDir(self.io.userdata, path, mode);
+        return self.io.makeDir(path, mode);
     }
 
     pub fn removeDir(self: *Loop, path: []const u8) !void {
-        return self.io.vtable.removeDir(self.io.userdata, path);
+        return self.io.removeDir(path);
     }
 
     pub fn rename(self: *Loop, old_path: []const u8, new_path: []const u8) !void {
-        return self.io.vtable.rename(self.io.userdata, old_path, new_path);
+        return self.io.rename(old_path, new_path);
     }
 
     pub fn symLink(self: *Loop, target: []const u8, link_path: []const u8) !void {
-        return self.io.vtable.symLink(self.io.userdata, target, link_path);
+        return self.io.symLink(target, link_path);
     }
 
     /// 创建硬链接（`link(2)`）。两个路径指向同一 inode。
     /// 后端未提供该原语时返回 `error.Unsupported`。
     pub fn hardLink(self: *Loop, old_path: []const u8, new_path: []const u8) !void {
-        const f = self.io.vtable.hardLink orelse return error.Unsupported;
-        return f(self.io.userdata, old_path, new_path);
+        return self.io.hardLink(old_path, new_path);
     }
     pub fn statPath(self: *Loop, path: []const u8) !types.Stat {
-        return self.io.vtable.statPath(self.io.userdata, path);
+        return self.io.statPath(path);
     }
 
     pub fn listDir(self: *Loop, path: []const u8, buf: []types.DirEntry) !usize {
-        return self.io.vtable.listDir(self.io.userdata, path, buf);
+        return self.io.listDir(path, buf);
     }
 
     /// 同步整文件写入（阻塞）。`WriteFile` 节点内部也走这条路。
     pub fn writeFileAll(self: *Loop, path: []const u8, bytes: []const u8) !void {
-        return self.io.vtable.writeFileAll(self.io.userdata, path, bytes);
+        return self.io.writeFileAll(path, bytes);
     }
 
     /// 同步删除文件（阻塞）。保留 void 签名以兼容 `defer` 清理；
     /// 真实错误由后端报出并累加到 `delete_failures`，不再静默丢弃。
     pub fn deleteFile(self: *Loop, path: []const u8) void {
-        self.io.vtable.deleteFile(self.io.userdata, path) catch {
+        self.io.deleteFile(path) catch {
             self.delete_failures += 1;
         };
     }
 
     /// 同步把文件截断/扩展到 `size` 字节（阻塞）。
     pub fn truncate(self: *Loop, path: []const u8, size: u64) !void {
-        return self.io.vtable.truncateFile(self.io.userdata, path, size);
+        return self.io.truncate(path, size);
     }
 
     /// 读符号链接目标路径，返回写入 `buf` 的长度（超出缓冲报 `NameTooLong`）。
     /// 后端未提供该原语时返回 `error.Unsupported`。
     pub fn readLink(self: *Loop, link_path: []const u8, buf: []u8) !usize {
-        const f = self.io.vtable.readLink orelse return error.Unsupported;
-        return f(self.io.userdata, link_path, buf);
+        return self.io.readLink(link_path, buf);
     }
 
     /// 检查路径可达性（`access(2)`）。`mode` 为 POSIX 检查位（R_OK=4/W_OK=2/X_OK=1）。
     pub fn access(self: *Loop, path: []const u8, mode: u32) !void {
-        const f = self.io.vtable.access orelse return error.Unsupported;
-        return f(self.io.userdata, path, mode);
+        return self.io.access(path, mode);
     }
 
     /// 解析路径为绝对路径（`realpath`），结果写入 `buf`，返回长度。
     pub fn realPath(self: *Loop, path: []const u8, buf: []u8) !usize {
-        const f = self.io.vtable.realPath orelse return error.Unsupported;
-        return f(self.io.userdata, path, buf);
+        return self.io.realPath(path, buf);
     }
 
     // ---- 内部实现 ---------------------------------------------------------

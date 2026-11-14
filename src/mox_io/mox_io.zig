@@ -1,4 +1,4 @@
-//! `mox_io` 模块根：I/O 抽象契约 + 门面 + 后端选择器。
+//! `mox_io` 公共门面：导出类型、完成节点、同步操作与 Loop 构造入口。
 //!
 //! 目录平铺：`completion` 是节点、`loop` 是引擎、`queue`/`timer`/`pool`
 //! 是数据结构、`file` 是阻塞兜底、`tests` 聚合测试、`backends/` 是平台实现。
@@ -11,9 +11,8 @@
 //! 交给 `Loop.add`，完成后由 `Loop.run` 回填结果并回调。每连接开销是固定节点，
 //! 而非纤程栈——这是选它而非 `std.Io` 的原因。
 //!
-//! 分层：`root.zig`（契约 + 门面 + 选择器）→ `completion.zig`（节点类型族）
-//! → `loop.zig`（引擎）→ `backends/`（各平台实现）。后端只认本文件，
-//! 引擎只通过 `root.vtable.*` 驱动后端，运行时零平台类型。
+//! 依赖方向：types/errors → io 契约 → 完成节点、Loop、后端。
+//! 同步操作经 Io 调用，异步操作经 Loop 驱动；平台选择只在构造时发生。
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -41,6 +40,8 @@ pub const DirEntry = types.DirEntry;
 /// 后端契约：`Io` + `VTable`。定义在 `io.zig`（接口层不依赖实现模块）。
 pub const Io = io_mod.Io;
 pub const VTable = io_mod.VTable;
+pub const BlockingNet = io_mod.BlockingNet;
+pub const Accepted = types.Accepted;
 pub const Options = io_mod.Options;
 
 // ---- 模块门面 -------------------------------------------------------------

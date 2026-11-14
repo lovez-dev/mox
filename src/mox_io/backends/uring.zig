@@ -878,7 +878,10 @@ fn vtNotify(userdata: ?*anyopaque) void {
 
 // ---- 套接字 / 文件辅助操作（经 VTable 暴露给上层） ------------------------
 
+const blocking_net = @import("blocking_net.zig").adapt(system);
+
 const vtable_storage: io_mod.VTable = .{
+    .blockingNet = &blocking_net,
     .deinit = vtDeinit,
     .now = vtNow,
     .createSocket = vtCreateSocket,
