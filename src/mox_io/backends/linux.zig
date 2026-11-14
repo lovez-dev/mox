@@ -5,7 +5,7 @@
 //! 此时自动回落到 `epoll`。`MOX_IO_BACKEND=epoll` 可强制回落，供 CI 与
 //! 排障覆盖 epoll 路径；正常用户无需设置。
 //!
-//! 下面这些同步辅助函数与事件循环无关，统一转发给 `uring.zig`；
+//! 下面这些同步辅助函数与事件循环无关，统一转发给 `linux_sys.zig`；
 //! 真正的后端差异只在 `create()` 返回的 `Io.vtable` 里。
 
 const std = @import("std");
@@ -13,33 +13,34 @@ const types = @import("../types.zig");
 const io_mod = @import("../io.zig");
 const completion = @import("../completion.zig");
 const uring = @import("uring.zig");
+const system = @import("linux_sys.zig");
 const epoll = @import("epoll.zig");
 
-pub const createSocket = uring.createSocket;
-pub const createTcpSocket = uring.createTcpSocket;
-pub const createUdpSocket = uring.createUdpSocket;
-pub const recvFromBlocking = uring.recvFromBlocking;
-pub const sendToBlocking = uring.sendToBlocking;
-pub const bindSocket = uring.bindSocket;
-pub const listenSocket = uring.listenSocket;
-pub const localAddress = uring.localAddress;
-pub const acceptSocket = uring.acceptSocket;
-pub const connectSocket = uring.connectSocket;
-pub const setReuseAddress = uring.setReuseAddress;
-pub const setSockOpt = uring.setSockOpt;
-pub const shutdownSend = uring.shutdownSend;
-pub const closeSocket = uring.closeSocket;
-pub const sendBlocking = uring.sendBlocking;
-pub const recvBlocking = uring.recvBlocking;
-pub const tickCount = uring.tickCount;
-pub const fileSize = uring.fileSize;
-pub const readFileInto = uring.readFileInto;
-pub const writeFileAll = uring.writeFileAll;
-pub const deleteFile = uring.deleteFile;
-pub const deleteFileChecked = uring.deleteFileChecked;
-pub const readFileAt = uring.readFileAt;
-pub const appendFile = uring.appendFile;
-pub const truncateFile = uring.truncateFile;
+pub const createSocket = system.createSocket;
+pub const createTcpSocket = system.createTcpSocket;
+pub const createUdpSocket = system.createUdpSocket;
+pub const recvFromBlocking = system.recvFromBlocking;
+pub const sendToBlocking = system.sendToBlocking;
+pub const bindSocket = system.bindSocket;
+pub const listenSocket = system.listenSocket;
+pub const localAddress = system.localAddress;
+pub const acceptSocket = system.acceptSocket;
+pub const connectSocket = system.connectSocket;
+pub const setReuseAddress = system.setReuseAddress;
+pub const setSockOpt = system.setSockOpt;
+pub const shutdownSend = system.shutdownSend;
+pub const closeSocket = system.closeSocket;
+pub const sendBlocking = system.sendBlocking;
+pub const recvBlocking = system.recvBlocking;
+pub const tickCount = system.tickCount;
+pub const fileSize = system.fileSize;
+pub const readFileInto = system.readFileInto;
+pub const writeFileAll = system.writeFileAll;
+pub const deleteFile = system.deleteFile;
+pub const deleteFileChecked = system.deleteFileChecked;
+pub const readFileAt = system.readFileAt;
+pub const appendFile = system.appendFile;
+pub const truncateFile = system.truncateFile;
 
 /// 当前进程实际选中的后端，便于测试与日志观测。
 pub const Choice = enum { uring, epoll };

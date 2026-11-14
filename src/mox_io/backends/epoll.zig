@@ -6,7 +6,7 @@
 //! 事件后就地执行非阻塞 `recv/send/accept/...`，再合成循环期望的完成包。
 //!
 //! 同步辅助函数（建 socket / bind / listen / 文件读写）直接复用
-//! `uring.zig` 里与环无关的 pub 实现，避免重复一套 POSIX 编组代码。
+//! `linux_sys.zig` 里与环无关的 pub 实现，避免重复一套 POSIX 编组代码。
 //! `Work` 唤醒用 `eventfd` 注册进同一个 epoll 实例，无需额外线程。
 
 const std = @import("std");
@@ -16,7 +16,7 @@ const io_mod = @import("../io.zig");
 const completion = @import("../completion.zig");
 const sys = @import("../sys.zig");
 const loop_mod = @import("../loop.zig");
-const uring = @import("uring.zig");
+const system = @import("linux_sys.zig");
 const net = std.Io.net;
 
 const Handle = types.Handle;
@@ -334,29 +334,17 @@ fn vtNow(userdata: ?*anyopaque) u64 {
     return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
 }
 
-fn vtCreateSocket(userdata: ?*anyopaque, address: net.IpAddress) anyerror!Handle {
-    _ = userdata;
-    return uring.createTcpSocket(address);
-}
+const vtCreateSocket = system.vtCreateSocket;
 
-fn vtSetReuseAddress(userdata: ?*anyopaque, socket: Handle, on: bool) anyerror!void {
-    _ = userdata;
-    return uring.setReuseAddress(socket, on);
-}
+const vtSetReuseAddress = system.vtSetReuseAddress;
 
-fn vtSetSockOpt(userdata: ?*anyopaque, socket: Handle, opt: types.SockOpt, value: u32) anyerror!void {
-    _ = userdata;
-    return uring.setSockOpt(socket, opt, value);
-}
+const vtSetSockOpt = system.vtSetSockOpt;
 
-fn vtShutdownSend(userdata: ?*anyopaque, socket: Handle) anyerror!void {
-    _ = userdata;
-    return uring.shutdownSend(socket);
-}
+const vtShutdownSend = system.vtShutdownSend;
 
 fn vtShutdown(userdata: ?*anyopaque, socket: Handle, how: types.ShutdownHow) anyerror!void {
     _ = userdata;
-    return uring.shutdownSocket(socket, how);
+    return system.shutdownSocket(socket, how);
 }
 
 fn vtSendMsg(
@@ -401,187 +389,79 @@ fn vtRecvMsg(
     });
 }
 
-fn vtBind(userdata: ?*anyopaque, socket: Handle, address: net.IpAddress) anyerror!void {
-    _ = userdata;
-    return uring.bindSocket(socket, address);
-}
+const vtBind = system.vtBind;
 
-fn vtListen(userdata: ?*anyopaque, socket: Handle, backlog: c_int) anyerror!void {
-    _ = userdata;
-    return uring.listenSocket(socket, backlog);
-}
+const vtListen = system.vtListen;
 
-fn vtFileSize(userdata: ?*anyopaque, path: []const u8) anyerror!u64 {
-    _ = userdata;
-    return uring.fileSize(path);
-}
+const vtFileSize = system.vtFileSize;
 
-fn vtMakeDir(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
-    _ = userdata;
-    return uring.makeDir(path, mode);
-}
+const vtMakeDir = system.vtMakeDir;
 
-fn vtRemoveDir(userdata: ?*anyopaque, path: []const u8) anyerror!void {
-    _ = userdata;
-    return uring.removeDir(path);
-}
+const vtRemoveDir = system.vtRemoveDir;
 
-fn vtRename(userdata: ?*anyopaque, old_path: []const u8, new_path: []const u8) anyerror!void {
-    _ = userdata;
-    return uring.rename(old_path, new_path);
-}
+const vtRename = system.vtRename;
 
-fn vtSymLink(userdata: ?*anyopaque, target: []const u8, link_path: []const u8) anyerror!void {
-    _ = userdata;
-    return uring.symLink(target, link_path);
-}
+const vtSymLink = system.vtSymLink;
 
-fn vtStatPath(userdata: ?*anyopaque, path: []const u8) anyerror!types.Stat {
-    _ = userdata;
-    const st = try uring.stat(path);
-    return .{ .kind = @fromBackingInt(@intCast(@backingInt(st.kind))), .size = st.size, .mtime_ms = st.mtime_ms };
-}
+const vtStatPath = system.vtStatPath;
 
-fn vtListDir(userdata: ?*anyopaque, path: []const u8, buf: []types.DirEntry) anyerror!usize {
-    _ = userdata;
-    // 两个后端的 `DirEntry` 布局一致（同样的 name/len/is_dir），直接按内存复用。
-    return uring.listDir(path, @ptrCast(buf));
-}
+const vtListDir = system.vtListDir;
 
-fn vtReadFileInto(userdata: ?*anyopaque, path: []const u8, buf: []u8) anyerror!usize {
-    _ = userdata;
-    return uring.readFileInto(path, buf);
-}
+const vtReadFileInto = system.vtReadFileInto;
 
-fn vtWriteFileAll(userdata: ?*anyopaque, path: []const u8, bytes: []const u8) anyerror!void {
-    _ = userdata;
-    return uring.writeFileAll(path, bytes);
-}
+const vtWriteFileAll = system.vtWriteFileAll;
 
-fn vtReadFileAt(userdata: ?*anyopaque, path: []const u8, offset: u64, buf: []u8) anyerror!usize {
-    _ = userdata;
-    return uring.readFileAt(path, offset, buf);
-}
+const vtReadFileAt = system.vtReadFileAt;
 
-fn vtAppendFile(userdata: ?*anyopaque, path: []const u8, bytes: []const u8) anyerror!void {
-    _ = userdata;
-    return uring.appendFile(path, bytes);
-}
+const vtAppendFile = system.vtAppendFile;
 
-fn vtTruncateFile(userdata: ?*anyopaque, path: []const u8, size: u64) anyerror!void {
-    _ = userdata;
-    return uring.truncateFile(path, size);
-}
+const vtTruncateFile = system.vtTruncateFile;
 
-// 文件句柄层：Linux 两后端共用同一套 syscall 实现（见 uring.zig）。
-fn vtOpenFile(userdata: ?*anyopaque, path: []const u8, mode: types.FileMode) anyerror!types.Handle {
-    _ = userdata;
-    return uring.openFile(path, mode);
-}
+// 文件句柄层：Linux 两后端共用同一套 syscall 实现（见 linux_sys.zig）。
+const vtOpenFile = system.vtOpenFile;
 
-fn vtReadFileHandle(userdata: ?*anyopaque, file: types.Handle, offset: u64, buf: []u8) anyerror!usize {
-    _ = userdata;
-    return uring.readFileHandle(file, offset, buf);
-}
+const vtReadFileHandle = system.vtReadFileHandle;
 
-fn vtWriteFileHandle(userdata: ?*anyopaque, file: types.Handle, offset: u64, bytes: []const u8) anyerror!usize {
-    _ = userdata;
-    return uring.writeFileHandle(file, offset, bytes);
-}
+const vtWriteFileHandle = system.vtWriteFileHandle;
 
-fn vtCloseFile(userdata: ?*anyopaque, file: types.Handle) void {
-    _ = userdata;
-    uring.closeFile(file);
-}
+const vtCloseFile = system.vtCloseFile;
 
 // 句柄级元数据与同步：与 uring 后端共用同一套 syscall 实现。
-fn vtStatFile(userdata: ?*anyopaque, file: types.Handle) anyerror!types.Stat {
-    _ = userdata;
-    const st = try uring.statFile(file);
-    return .{ .kind = @fromBackingInt(@intCast(@backingInt(st.kind))), .size = st.size, .mtime_ms = st.mtime_ms };
-}
+const vtStatFile = system.vtStatFile;
 
-fn vtSetFileSize(userdata: ?*anyopaque, file: types.Handle, size: u64) anyerror!void {
-    _ = userdata;
-    return uring.setFileSize(file, size);
-}
+const vtSetFileSize = system.vtSetFileSize;
 
-fn vtSyncFile(userdata: ?*anyopaque, file: types.Handle) anyerror!void {
-    _ = userdata;
-    return uring.syncFile(file);
-}
+const vtSyncFile = system.vtSyncFile;
 
 // 阶段 F：与 uring 后端共用同一套实现（同属 Linux）。
-fn vtSetFilePermissions(userdata: ?*anyopaque, file: types.Handle, mode: u32) anyerror!void {
-    _ = userdata;
-    return uring.setFilePermissions(file, mode);
-}
+const vtSetFilePermissions = system.vtSetFilePermissions;
 
-fn vtSetFileOwner(userdata: ?*anyopaque, file: types.Handle, uid: u32, gid: u32) anyerror!void {
-    _ = userdata;
-    return uring.setFileOwner(file, uid, gid);
-}
+const vtSetFileOwner = system.vtSetFileOwner;
 
-fn vtSetFileTimestamps(userdata: ?*anyopaque, file: types.Handle, atime_ns: i64, mtime_ns: i64) anyerror!void {
-    _ = userdata;
-    return uring.setFileTimestamps(file, atime_ns, mtime_ns);
-}
+const vtSetFileTimestamps = system.vtSetFileTimestamps;
 
-fn vtSetPermissions(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
-    _ = userdata;
-    return uring.setPermissions(path, mode);
-}
+const vtSetPermissions = system.vtSetPermissions;
 
-fn vtSetOwner(userdata: ?*anyopaque, path: []const u8, uid: u32, gid: u32) anyerror!void {
-    _ = userdata;
-    return uring.setOwner(path, uid, gid);
-}
+const vtSetOwner = system.vtSetOwner;
 
-fn vtSetTimestamps(userdata: ?*anyopaque, path: []const u8, atime_ns: i64, mtime_ns: i64) anyerror!void {
-    _ = userdata;
-    return uring.setTimestamps(path, atime_ns, mtime_ns);
-}
+const vtSetTimestamps = system.vtSetTimestamps;
 
-fn vtAccess(userdata: ?*anyopaque, path: []const u8, mode: u32) anyerror!void {
-    _ = userdata;
-    return uring.access(path, mode);
-}
+const vtAccess = system.vtAccess;
 
-fn vtRealPath(userdata: ?*anyopaque, path: []const u8, buf: []u8) anyerror!usize {
-    _ = userdata;
-    return uring.realPath(path, buf);
-}
+const vtRealPath = system.vtRealPath;
 
-fn vtHardLink(userdata: ?*anyopaque, old_path: []const u8, new_path: []const u8) anyerror!void {
-    _ = userdata;
-    return uring.hardLink(old_path, new_path);
-}
+const vtHardLink = system.vtHardLink;
 
 // 阶段 C：与 uring 后端共用同一套实现（同属 Linux）。
-fn vtReadLink(userdata: ?*anyopaque, link_path: []const u8, buf: []u8) anyerror!usize {
-    _ = userdata;
-    return uring.readLink(link_path, buf);
-}
+const vtReadLink = system.vtReadLink;
 
-fn vtOpenDir(userdata: ?*anyopaque, path: []const u8) anyerror!types.Handle {
-    _ = userdata;
-    return uring.openDir(path);
-}
+const vtOpenDir = system.vtOpenDir;
 
-fn vtReadDirHandle(userdata: ?*anyopaque, dir: types.Handle, buf: []types.DirEntry) anyerror!usize {
-    _ = userdata;
-    return uring.readDirHandle(dir, buf);
-}
+const vtReadDirHandle = system.vtReadDirHandle;
 
-fn vtCloseDir(userdata: ?*anyopaque, dir: types.Handle) void {
-    _ = userdata;
-    uring.closeDir(dir);
-}
+const vtCloseDir = system.vtCloseDir;
 
-fn vtDeleteFile(userdata: ?*anyopaque, path: []const u8) anyerror!void {
-    _ = userdata;
-    try uring.deleteFileChecked(path);
-}
+const vtDeleteFile = system.vtDeleteFile;
 
 fn vtAssociate(userdata: ?*anyopaque, socket: Handle, key: usize) anyerror!void {
     _ = userdata;
@@ -589,20 +469,11 @@ fn vtAssociate(userdata: ?*anyopaque, socket: Handle, key: usize) anyerror!void 
     _ = key;
 }
 
-fn vtSendFileTo(userdata: ?*anyopaque, socket: types.Handle, path: []const u8, offset: u64, count: usize) anyerror!usize {
-    _ = userdata;
-    return uring.vtSendFileTo(null, socket, path, offset, count);
-}
+const vtSendFileTo = system.vtSendFileTo;
 
-fn vtCreateUnix(userdata: ?*anyopaque) anyerror!types.Handle {
-    _ = userdata;
-    return uring.vtCreateUnix(null);
-}
+const vtCreateUnix = system.vtCreateUnix;
 
-fn vtBindUnix(userdata: ?*anyopaque, socket: types.Handle, path: []const u8) anyerror!void {
-    _ = userdata;
-    return uring.vtBindUnix(null, socket, path);
-}
+const vtBindUnix = system.vtBindUnix;
 
 /// epoll 是就绪模型，没有「异步 connect」：非阻塞 `connect` 返回 EINPROGRESS
 /// 后要等 `EPOLL.OUT`，由调用方通过 `WatchFd` 或 `NetConnect` 语义处理。
@@ -610,7 +481,7 @@ fn vtBindUnix(userdata: ?*anyopaque, socket: types.Handle, path: []const u8) any
 fn vtConnectUnix(userdata: ?*anyopaque, socket: types.Handle, path: []const u8, scratch: *types.Scratch) anyerror!?void {
     _ = userdata;
     var sa: linux.sockaddr.un = undefined;
-    const len = try uring.buildUnixSockaddrPub(path, &sa);
+    const len = try system.buildUnixSockaddrPub(path, &sa);
     if (len > @sizeOf(types.Scratch)) return error.NameTooLong;
     @memcpy(std.mem.asBytes(scratch)[0..len], std.mem.asBytes(&sa)[0..len]);
     const rc = linux.connect(fdOf(socket), @ptrCast(@alignCast(scratch)), len);
@@ -979,7 +850,7 @@ fn finishOne(state: *State, p: Pending, ev_events: u32) types.Ref {
         .sendmsg => {
             // 可写了：这时 sendmsg 不会阻塞。
             const bufs = p.msg_bufs orelse &.{};
-            var iov: [uring.IOV_MAX]std.posix.iovec_const = undefined;
+            var iov: [system.IOV_MAX]std.posix.iovec_const = undefined;
             for (bufs, 0..) |b, i| iov[i] = .{ .base = b.ptr, .len = b.len };
             var msg: linux.msghdr_const = .{
                 .name = null,
@@ -994,7 +865,7 @@ fn finishOne(state: *State, p: Pending, ev_events: u32) types.Ref {
         },
         .recvmsg => {
             const bufs = p.msg_bufs orelse &.{};
-            var iov: [uring.IOV_MAX]std.posix.iovec = undefined;
+            var iov: [system.IOV_MAX]std.posix.iovec = undefined;
             for (bufs, 0..) |b, i| iov[i] = .{ .base = @constCast(b.ptr), .len = b.len };
             var msg: linux.msghdr = .{
                 .name = null,
@@ -1177,7 +1048,7 @@ fn createBody(alloc: std.mem.Allocator, queue_size: u16) !io_mod.Io {
     };
     return .{ .userdata = state, .vtable = &vtable_storage };
 }
-// ---- 与 uring.zig 共用的 POSIX 小工具 -------------------------------------
+// ---- 与 linux_sys.zig 共用的 POSIX 小工具 -------------------------------------
 
 /// 把 `IpAddress` 编成 sockaddr 写进 `storage`，返回长度。
 fn buildSockaddr(address: net.IpAddress, storage: *[128]u8) linux.socklen_t {
@@ -1236,20 +1107,20 @@ test "epoll: accept + recv + send 全链路" {
     defer l.deinit();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
-    const listener = try uring.createTcpSocket(bind_addr);
-    defer uring.closeSocket(listener);
-    try uring.setReuseAddress(listener, true);
-    try uring.bindSocket(listener, bind_addr);
-    const bound = try uring.localAddress(listener);
-    try uring.listenSocket(listener, 16);
+    const listener = try system.createTcpSocket(bind_addr);
+    defer system.closeSocket(listener);
+    try system.setReuseAddress(listener, true);
+    try system.bindSocket(listener, bind_addr);
+    const bound = try system.localAddress(listener);
+    try system.listenSocket(listener, 16);
 
-    const accept_sock = try uring.createTcpSocket(bind_addr);
+    const accept_sock = try system.createTcpSocket(bind_addr);
 
     const Client = struct {
         fn run(addr: net.IpAddress) void {
-            const c = uring.createTcpSocket(addr) catch return;
-            defer uring.closeSocket(c);
-            uring.connectSocket(c, addr) catch return;
+            const c = system.createTcpSocket(addr) catch return;
+            defer system.closeSocket(c);
+            system.connectSocket(c, addr) catch return;
             _ = linux.write(fdOf(c), "hello", 5);
         }
     };
@@ -1286,7 +1157,7 @@ test "epoll: accept + recv + send 全链路" {
 
     try std.testing.expectEqual(@as(usize, 5), Ctx.got);
     try std.testing.expectEqualStrings("hello", Ctx.buf[0..Ctx.got]);
-    uring.closeSocket(Ctx.accepted);
+    system.closeSocket(Ctx.accepted);
 }
 
 test "epoll: Work 池任务经 eventfd 唤醒并完成回调" {
@@ -1318,15 +1189,15 @@ test "epoll: 异步 connect 完成" {
     defer l.deinit();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
-    const listener = try uring.createTcpSocket(bind_addr);
-    defer uring.closeSocket(listener);
-    try uring.setReuseAddress(listener, true);
-    try uring.bindSocket(listener, bind_addr);
-    const bound = try uring.localAddress(listener);
-    try uring.listenSocket(listener, 16);
+    const listener = try system.createTcpSocket(bind_addr);
+    defer system.closeSocket(listener);
+    try system.setReuseAddress(listener, true);
+    try system.bindSocket(listener, bind_addr);
+    const bound = try system.localAddress(listener);
+    try system.listenSocket(listener, 16);
 
-    const client = try uring.createTcpSocket(bind_addr);
-    defer uring.closeSocket(client);
+    const client = try system.createTcpSocket(bind_addr);
+    defer system.closeSocket(client);
 
     const Ctx = struct {
         var ok: bool = false;
@@ -1346,8 +1217,8 @@ test "epoll: 异步 connect 完成" {
     try l.run();
 
     try std.testing.expect(Ctx.ok);
-    const accepted = try uring.acceptSocket(listener);
-    uring.closeSocket(accepted.socket);
+    const accepted = try system.acceptSocket(listener);
+    system.closeSocket(accepted.socket);
 }
 
 test "epoll: 同一 fd 连续 recv，ONESHOT 重挂不丢事件" {
@@ -1355,19 +1226,19 @@ test "epoll: 同一 fd 连续 recv，ONESHOT 重挂不丢事件" {
     defer l.deinit();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
-    const listener = try uring.createTcpSocket(bind_addr);
-    defer uring.closeSocket(listener);
-    try uring.setReuseAddress(listener, true);
-    try uring.bindSocket(listener, bind_addr);
-    const bound = try uring.localAddress(listener);
-    try uring.listenSocket(listener, 16);
-    const accept_sock = try uring.createTcpSocket(bind_addr);
+    const listener = try system.createTcpSocket(bind_addr);
+    defer system.closeSocket(listener);
+    try system.setReuseAddress(listener, true);
+    try system.bindSocket(listener, bind_addr);
+    const bound = try system.localAddress(listener);
+    try system.listenSocket(listener, 16);
+    const accept_sock = try system.createTcpSocket(bind_addr);
 
     const Client = struct {
         fn run(addr: net.IpAddress) void {
-            const c = uring.createTcpSocket(addr) catch return;
-            defer uring.closeSocket(c);
-            uring.connectSocket(c, addr) catch return;
+            const c = system.createTcpSocket(addr) catch return;
+            defer system.closeSocket(c);
+            system.connectSocket(c, addr) catch return;
             _ = linux.write(fdOf(c), "one", 3);
             const pause = linux.timespec{ .sec = 0, .nsec = 30 * 1_000_000 };
             _ = linux.nanosleep(&pause, null);
@@ -1416,7 +1287,7 @@ test "epoll: 同一 fd 连续 recv，ONESHOT 重挂不丢事件" {
 
     try std.testing.expectEqual(@as(usize, 2), Ctx.rounds);
     try std.testing.expectEqual(@as(usize, 6), Ctx.total);
-    uring.closeSocket(Ctx.accepted);
+    system.closeSocket(Ctx.accepted);
 }
 
 test "epoll: WatchFd 监视管道可读" {
