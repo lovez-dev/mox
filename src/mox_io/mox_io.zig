@@ -99,7 +99,7 @@ pub const OpenDir = @import("file.zig").OpenDir;
 pub const ReadDirHandle = @import("file.zig").ReadDirHandle;
 pub const CloseDir = @import("file.zig").CloseDir;
 
-/// 编译期选定的本目标后端。新增后端 = 写一个导出 `create(allocator) !Io`
+/// 编译期选定的本目标后端。新增后端 = 写一个导出 `create(allocator, options) !Io`
 /// 的文件，再在这里加一个分支。
 ///
 /// kqueue 后端目前只在 Darwin 与 FreeBSD 上验证过可编译；NetBSD / OpenBSD /
@@ -178,27 +178,19 @@ fn withCaps(io_value: Io) Io {
     return out;
 }
 
-/// 用平台默认后端、默认配置构造一个 `Loop`。
-///
-/// 保留单参数入口是为了向后兼容：现有调用点（`server.zig`、bench、示例）
-/// 全都不用改。要调参用 `openWith`。
-pub fn open(alloc: std.mem.Allocator) !Loop {
-    return openWith(alloc, .{});
-}
-
 /// 用自定义配置构造一个 `Loop`。
 ///
 /// ```zig
-/// var loop = try mox_io.openWith(gpa, .{
+/// var loop = try mox_io.open(gpa, .{
 ///     .queue_size = 512,
 ///     .max_workers = 8,
 ///     .backend = .epoll,
 /// });
 /// ```
-pub fn openWith(alloc: std.mem.Allocator, opts: Options) !Loop {
+pub fn open(alloc: std.mem.Allocator, opts: Options) !Loop {
     const resolved = try opts.validate();
-    const io_value = withCaps(try platform.createWith(alloc, resolved));
-    return Loop.initWithOptions(io_value, alloc, resolved);
+    const io_value = withCaps(try platform.create(alloc, resolved));
+    return Loop.init(io_value, alloc, resolved);
 }
 
 test {

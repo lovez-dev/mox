@@ -50,29 +50,25 @@ pub var chosen: Choice = .uring;
 /// 正常用户不用管；这是进程级变量，只在 `open()` 时读一次，不在热路径。
 pub var forced: ?Choice = null;
 
-pub fn create(alloc: std.mem.Allocator) !io_mod.Io {
-    return createWith(alloc, .{});
-}
-
 /// 带配置的入口。`Options.backend` 覆盖进程级 `forced`；两者都没设时
 /// 优先 io_uring，setup 失败自动回落 epoll。
-pub fn createWith(alloc: std.mem.Allocator, opts: io_mod.Options) !io_mod.Io {
+pub fn create(alloc: std.mem.Allocator, opts: io_mod.Options) !io_mod.Io {
     const force_epoll = if (opts.backend) |b| switch (b) {
         .epoll => true,
         .uring => false,
     } else forced == .epoll;
     if (force_epoll) {
         chosen = .epoll;
-        return epoll.createWith(alloc, opts);
+        return epoll.create(alloc, opts);
     }
-    const io = uring.createWith(alloc, opts) catch |err| {
+    const io = uring.create(alloc, opts) catch |err| {
         // `io_uring_setup` 失败（ENOSYS / EPERM / seccomp 拦截）时回落；
         // mmap 之类的资源失败也一并回落，epoll 不依赖这些资源。
         // 显式点名 `.uring` 时不悄悄换后端——用户要的是那个后端，换掉
         // 会让「我配了 uring」变成假象。
         if (err == error.OutOfMemory or opts.backend == .uring) return err;
         chosen = .epoll;
-        return epoll.createWith(alloc, opts);
+        return epoll.create(alloc, opts);
     };
     chosen = .uring;
     return io;
@@ -84,7 +80,7 @@ test "Linux 后端选择：forced 覆盖与默认回落" {
 
     // 显式覆盖：跳过 io_uring，直接建 epoll。
     forced = .epoll;
-    var io = try create(std.testing.allocator);
+    var io = try create(std.testing.allocator, .{});
     try std.testing.expectEqual(Choice.epoll, chosen);
     io.vtable.deinit(io.userdata);
 
@@ -93,11 +89,11 @@ test "Linux 后端选择：forced 覆盖与默认回落" {
     // 改成无条件选 epoll，支持 uring 的机器会立刻变红。
     forced = null;
     const uring_ok = blk: {
-        const probe = uring.create(std.testing.allocator) catch break :blk false;
+        const probe = uring.create(std.testing.allocator, .{}) catch break :blk false;
         probe.vtable.deinit(probe.userdata);
         break :blk true;
     };
-    io = try create(std.testing.allocator);
+    io = try create(std.testing.allocator, .{});
     defer io.vtable.deinit(io.userdata);
     try std.testing.expectEqual(
         if (uring_ok) Choice.uring else Choice.epoll,

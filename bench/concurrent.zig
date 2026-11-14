@@ -126,7 +126,7 @@ pub fn main() !void {
     }
     defer for (sockets) |s| platform.closeSocket(s);
 
-    var loop = try io.open(gpa);
+    var loop = try io.open(gpa, .{});
     defer loop.deinit();
 
     var state: State = .{ .conns = conns };
@@ -134,7 +134,7 @@ pub fn main() !void {
     defer gpa.free(echos);
     i = 0;
     while (i < conns) : (i += 1) {
-        try loop.associate(sockets[i], i + 1);
+        try loop.io.associate(sockets[i], i + 1);
         echos[i] = .{ .loop = &loop, .socket = sockets[i], .target = rounds, .state = &state };
         echos[i].postRecv();
     }

@@ -96,9 +96,9 @@ pub fn main() !void {
     const accepted = try platform.acceptSocket(listener);
     defer platform.closeSocket(accepted.socket);
 
-    var loop = try io.open(gpa);
+    var loop = try io.open(gpa, .{});
     defer loop.deinit();
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
 
     var echo: Echo = .{ .loop = &loop, .socket = accepted.socket, .target = rounds };
     echo.postRecv();

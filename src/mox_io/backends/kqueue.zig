@@ -1100,15 +1100,10 @@ const vtable_storage: io_mod.VTable = .{
     .notify = vtNotify,
 };
 
-/// 无配置入口，保留给旧调用点。
-pub fn create(alloc: std.mem.Allocator) !io_mod.Io {
-    return createWith(alloc, .{});
-}
-
 /// 带配置的入口：`queue_size` 决定 `pending` / `cancelled` 容器的**预分配**
 /// 容量（`events` 固定 64，对应 kevent 批量）。容器启动时一次备齐，
 /// 稳态 submit / reap / cancel 不再 malloc。
-pub fn createWith(alloc: std.mem.Allocator, opts: io_mod.Options) !io_mod.Io {
+pub fn create(alloc: std.mem.Allocator, opts: io_mod.Options) !io_mod.Io {
     return createBody(alloc, opts.queue_size);
 }
 
@@ -1900,7 +1895,7 @@ fn kqPair() ![2]i32 {
 
 test "kqueue: 同一 fd 全双工 recv+send 不丢方向" {
     if (!can_run_runtime) return error.SkipZigTest;
-    var l = loop_mod.Loop.init(try create(std.testing.allocator));
+    var l = loop_mod.Loop.init(try create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     const pair = try kqPair();
@@ -1967,7 +1962,7 @@ test "kqueue: 同一 fd 全双工 recv+send 不丢方向" {
 test "kqueue: 同一 fd 同方向多个 recv 依次完成" {
     if (!can_run_runtime) return error.SkipZigTest;
     const n: usize = 4;
-    var l = loop_mod.Loop.init(try create(std.testing.allocator));
+    var l = loop_mod.Loop.init(try create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     const pair = try kqPair();

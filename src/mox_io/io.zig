@@ -63,6 +63,12 @@ pub const Io = struct {
         return f(self.userdata, socket, path);
     }
 
+    /// 提交 UDS 连接。null 表示在飞，完成经 waitBatch 返回；scratch 必须保持有效。
+    pub fn connectUnix(self: Io, socket: Handle, path: []const u8, scratch: *Scratch) !?void {
+        const f = self.vtable.connectUnix orelse return error.Unsupported;
+        return f(self.userdata, socket, path, scratch);
+    }
+
     pub fn createSocket(self: Io, address: std.Io.net.IpAddress) !Handle {
         return self.vtable.createSocket(self.userdata, address);
     }
@@ -572,8 +578,7 @@ pub const VTable = struct {
     /// `EBADF` / `WSAENOTSOCK` 映射为 `error.NotOpen`，其余为 `error.CloseFailed`。
     ///
     /// 可选槽位：`null` 表示该后端不区分（等价于 `close` 成功返回）。
-    /// 存在的理由与 `deleteFileChecked` 一样 —— 「静默失败」在生产环境里
-    /// 排障成本极高；`delete_failures` 计数器就是为此存在的。
+    /// 调用方直接处理关闭失败，与 deleteFile 的错误返回一致。
     closeChecked: ?*const fn (userdata: ?*anyopaque, socket: Handle) anyerror!void = null,
 
     /// 批量收割完成包：一次系统调用最多填 `refs.len` 个，返回实际数量。

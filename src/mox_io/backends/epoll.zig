@@ -481,7 +481,7 @@ const vtBindUnix = system.vtBindUnix;
 fn vtConnectUnix(userdata: ?*anyopaque, socket: types.Handle, path: []const u8, scratch: *types.Scratch) anyerror!?void {
     _ = userdata;
     var sa: linux.sockaddr.un = undefined;
-    const len = try system.buildUnixSockaddrPub(path, &sa);
+    const len = try system.buildUnixSockaddr(path, &sa);
     if (len > @sizeOf(types.Scratch)) return error.NameTooLong;
     @memcpy(std.mem.asBytes(scratch)[0..len], std.mem.asBytes(&sa)[0..len]);
     const rc = linux.connect(fdOf(socket), @ptrCast(@alignCast(scratch)), len);
@@ -988,15 +988,10 @@ const vtable_storage: io_mod.VTable = .{
     .notify = vtNotify,
 };
 
-/// 无配置入口，保留给旧调用点。
-pub fn create(alloc: std.mem.Allocator) !io_mod.Io {
-    return createWith(alloc, .{});
-}
-
 /// 带配置的入口：`queue_size` 决定 fd-slot 表与完成包环形缓冲的**预分配**
 /// 容量。这一步是「稳态 0 malloc」的关键——所有容器在启动时一次性备齐，
 /// 之后 submit / reap / cancel 都只写已分配的内存。
-pub fn createWith(alloc: std.mem.Allocator, opts: io_mod.Options) !io_mod.Io {
+pub fn create(alloc: std.mem.Allocator, opts: io_mod.Options) !io_mod.Io {
     return createBody(alloc, opts.queue_size);
 }
 
@@ -1087,7 +1082,7 @@ fn setNonblock(fd: i32) void {
 // ---- 测试（只在 Linux 目标编译；在 WSL 里真跑 epoll 路径） ----------------
 
 test "epoll: 定时器经 waitBatch 触发" {
-    var l = loop_mod.Loop.init(try create(std.testing.allocator));
+    var l = loop_mod.Loop.init(try create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     const Ctx = struct {
@@ -1106,7 +1101,7 @@ test "epoll: 定时器经 waitBatch 触发" {
 }
 
 test "epoll: accept + recv + send 全链路" {
-    var l = loop_mod.Loop.init(try create(std.testing.allocator));
+    var l = loop_mod.Loop.init(try create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
@@ -1164,7 +1159,7 @@ test "epoll: accept + recv + send 全链路" {
 }
 
 test "epoll: Work 池任务经 eventfd 唤醒并完成回调" {
-    var l = loop_mod.Loop.init(try create(std.testing.allocator));
+    var l = loop_mod.Loop.init(try create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     const Ctx = struct {
@@ -1188,7 +1183,7 @@ test "epoll: Work 池任务经 eventfd 唤醒并完成回调" {
 }
 
 test "epoll: 异步 connect 完成" {
-    var l = loop_mod.Loop.init(try create(std.testing.allocator));
+    var l = loop_mod.Loop.init(try create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
@@ -1225,7 +1220,7 @@ test "epoll: 异步 connect 完成" {
 }
 
 test "epoll: 同一 fd 连续 recv，ONESHOT 重挂不丢事件" {
-    var l = loop_mod.Loop.init(try create(std.testing.allocator));
+    var l = loop_mod.Loop.init(try create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
@@ -1294,7 +1289,7 @@ test "epoll: 同一 fd 连续 recv，ONESHOT 重挂不丢事件" {
 }
 
 test "epoll: WatchFd 监视管道可读" {
-    var l = loop_mod.Loop.init(try create(std.testing.allocator));
+    var l = loop_mod.Loop.init(try create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     var fds: [2]i32 = undefined;
@@ -1335,7 +1330,7 @@ test "epoll: WatchFd 监视管道可读" {
 // 一起禁用后剩余方向也不会重挂 —— 读操作静默等不到回调（watchdog 超时）。
 // 这里用 socketpair 构造「写方向立刻就绪、读方向稍后才到」的时序。
 test "epoll: 同一 fd 全双工 recv+send 不丢方向" {
-    var l = loop_mod.Loop.init(try create(std.testing.allocator));
+    var l = loop_mod.Loop.init(try create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     var pair: [2]i32 = undefined;
@@ -1400,7 +1395,7 @@ test "epoll: 同一 fd 全双工 recv+send 不丢方向" {
 // 同 fd 同方向多个在飞操作（4 个 recv）：旧实现的「每方向单 slot」会直接
 // 拒绝或覆盖；新实现的 FIFO 链必须让每一个都恰好回调一次。
 test "epoll: 同一 fd 同方向多个 recv 依次完成" {
-    var l = loop_mod.Loop.init(try create(std.testing.allocator));
+    var l = loop_mod.Loop.init(try create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     var pair: [2]i32 = undefined;
@@ -1447,7 +1442,7 @@ test "epoll: 同一 fd 同方向多个 recv 依次完成" {
 }
 
 test "epoll: 双向 watch 取消后保留另一读操作，池格子不重复归还" {
-    const io = try create(std.testing.allocator);
+    const io = try create(std.testing.allocator, .{});
     defer io.vtable.deinit(io.userdata);
     var pair: [2]i32 = undefined;
     _ = try cvt(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &pair));
@@ -1478,7 +1473,7 @@ test "epoll: 双向 watch 取消后保留另一读操作，池格子不重复归
 }
 
 test "epoll: 关闭超过 64 个双向 watch 时每个操作只完成一次" {
-    const io = try create(std.testing.allocator);
+    const io = try create(std.testing.allocator, .{});
     defer io.vtable.deinit(io.userdata);
     var pair: [2]i32 = undefined;
     _ = try cvt(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &pair));

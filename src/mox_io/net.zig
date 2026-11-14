@@ -147,7 +147,7 @@ pub fn listenLoopback(io: io_mod.Io, backlog: c_int) !Listener {
 // ---- 轻量自检 -------------------------------------------------------------
 
 test "net: 薄门面能建监听、accept、收发" {
-    const io = try @import("platform.zig").platform.create(std.testing.allocator);
+    const io = try @import("platform.zig").platform.create(std.testing.allocator, .{});
     defer io.vtable.deinit(io.userdata);
     const listener = try listenLoopback(io, 16);
     defer listener.close();
@@ -171,7 +171,7 @@ test "net: 薄门面能建监听、accept、收发" {
 }
 
 test "net: TCP 的连接、短写续发、接收和关闭均使用传入的 Io" {
-    const backend = try @import("platform.zig").platform.create(std.testing.allocator);
+    const backend = try @import("platform.zig").platform.create(std.testing.allocator, .{});
     defer backend.vtable.deinit(backend.userdata);
     const Fake = struct {
         connected: bool = false,

@@ -20,110 +20,6 @@ const file_mod = @import("../file.zig");
 const loop_mod = @import("../loop.zig");
 const net = std.Io.net;
 const system = @import("linux_sys.zig");
-pub const IOV_MAX = system.IOV_MAX;
-pub const buildUnixSockaddrPub = system.buildUnixSockaddrPub;
-const buildUnixSockaddr = system.buildUnixSockaddr;
-pub const vtCreateUnix = system.vtCreateUnix;
-pub const vtBindUnix = system.vtBindUnix;
-const openSync = system.openSync;
-pub const vtSendFileTo = system.vtSendFileTo;
-const buildSockaddr = system.buildSockaddr;
-pub const createSocket = system.createSocket;
-pub const createTcpSocket = system.createTcpSocket;
-pub const createUdpSocket = system.createUdpSocket;
-pub const recvFromBlocking = system.recvFromBlocking;
-pub const sendToBlocking = system.sendToBlocking;
-pub const bindSocket = system.bindSocket;
-pub const listenSocket = system.listenSocket;
-pub const localAddress = system.localAddress;
-pub const acceptSocket = system.acceptSocket;
-pub const connectSocket = system.connectSocket;
-pub const setReuseAddress = system.setReuseAddress;
-pub const setSockOpt = system.setSockOpt;
-pub const shutdownSend = system.shutdownSend;
-pub const shutdownSocket = system.shutdownSocket;
-pub const sendMsgBlocking = system.sendMsgBlocking;
-pub const recvMsgBlocking = system.recvMsgBlocking;
-pub const closeSocket = system.closeSocket;
-pub const sendBlocking = system.sendBlocking;
-pub const recvBlocking = system.recvBlocking;
-pub const tickCount = system.tickCount;
-pub const fileSize = system.fileSize;
-pub const readFileInto = system.readFileInto;
-pub const writeFileAll = system.writeFileAll;
-pub const makeDir = system.makeDir;
-pub const removeDir = system.removeDir;
-pub const rename = system.rename;
-pub const symLink = system.symLink;
-pub const FileKind = system.FileKind;
-pub const Stat = system.Stat;
-pub const stat = system.stat;
-pub const listDir = system.listDir;
-pub const DirEntry = system.DirEntry;
-pub const deleteFile = system.deleteFile;
-pub const deleteFileChecked = system.deleteFileChecked;
-pub const readFileAt = system.readFileAt;
-pub const appendFile = system.appendFile;
-pub const truncateFile = system.truncateFile;
-pub const openFile = system.openFile;
-pub const readFileHandle = system.readFileHandle;
-pub const writeFileHandle = system.writeFileHandle;
-pub const closeFile = system.closeFile;
-pub const statFile = system.statFile;
-pub const setFileSize = system.setFileSize;
-pub const syncFile = system.syncFile;
-pub const setFilePermissions = system.setFilePermissions;
-pub const setFileOwner = system.setFileOwner;
-pub const setFileTimestamps = system.setFileTimestamps;
-pub const setPermissions = system.setPermissions;
-pub const setOwner = system.setOwner;
-pub const setTimestamps = system.setTimestamps;
-pub const access = system.access;
-pub const realPath = system.realPath;
-pub const hardLink = system.hardLink;
-pub const readLink = system.readLink;
-pub const openDir = system.openDir;
-pub const readDirHandle = system.readDirHandle;
-pub const closeDir = system.closeDir;
-const vtCreateSocket = system.vtCreateSocket;
-const vtSetReuseAddress = system.vtSetReuseAddress;
-const vtSetSockOpt = system.vtSetSockOpt;
-const vtShutdownSend = system.vtShutdownSend;
-const vtBind = system.vtBind;
-const vtListen = system.vtListen;
-const vtFileSize = system.vtFileSize;
-const vtReadFileInto = system.vtReadFileInto;
-const vtWriteFileAll = system.vtWriteFileAll;
-const vtReadFileAt = system.vtReadFileAt;
-const vtAppendFile = system.vtAppendFile;
-const vtTruncateFile = system.vtTruncateFile;
-const vtOpenFile = system.vtOpenFile;
-const vtReadFileHandle = system.vtReadFileHandle;
-const vtWriteFileHandle = system.vtWriteFileHandle;
-const vtCloseFile = system.vtCloseFile;
-const vtStatFile = system.vtStatFile;
-const vtSetFileSize = system.vtSetFileSize;
-const vtSyncFile = system.vtSyncFile;
-const vtSetFilePermissions = system.vtSetFilePermissions;
-const vtSetFileOwner = system.vtSetFileOwner;
-const vtSetFileTimestamps = system.vtSetFileTimestamps;
-const vtSetPermissions = system.vtSetPermissions;
-const vtSetOwner = system.vtSetOwner;
-const vtSetTimestamps = system.vtSetTimestamps;
-const vtAccess = system.vtAccess;
-const vtRealPath = system.vtRealPath;
-const vtHardLink = system.vtHardLink;
-const vtReadLink = system.vtReadLink;
-const vtOpenDir = system.vtOpenDir;
-const vtReadDirHandle = system.vtReadDirHandle;
-const vtCloseDir = system.vtCloseDir;
-const vtMakeDir = system.vtMakeDir;
-const vtRemoveDir = system.vtRemoveDir;
-const vtRename = system.vtRename;
-const vtSymLink = system.vtSymLink;
-const vtStatPath = system.vtStatPath;
-const vtListDir = system.vtListDir;
-const vtDeleteFile = system.vtDeleteFile;
 
 const Handle = types.Handle;
 const INVALID_HANDLE = types.INVALID_HANDLE;
@@ -131,9 +27,6 @@ const INVALID_HANDLE = types.INVALID_HANDLE;
 const io_uring_sqe = linux.io_uring_sqe;
 const io_uring_params = linux.io_uring_params;
 const io_uring_cqe = linux.io_uring_cqe;
-
-/// `create(alloc)` 无配置入口用的默认队列容量，与 `Options.queue_size` 一致。
-const DEFAULT_QUEUE_SIZE: u16 = 256;
 
 /// CQ 环相对 SQ 环的倍数。CQ 必须显著大于 SQ：`getSqe` 可能连续提交满
 /// 一个 SQ 环，内核立刻产出同样多的完成包；CQ 与 SQ 等大时第一批就填满 CQ。
@@ -169,7 +62,7 @@ const State = struct {
 
     /// CQE 溢出暂存：`reapCq` 收满 `refs`、或 `getSqe` 为腾 CQ 空位而提前
     /// 收割时，完成包先搬到这里，下次 `waitBatch` 优先吐出。容量 = CQ 环
-    /// 大小，在 `createWith` 里按 `queue_size` 堆分配。
+    /// 大小，在 `create` 里按 `queue_size` 堆分配。
     ///
     /// 用环形缓冲（head/tail mod len）而不是移位数组：出队 O(1) 而非 O(n)，
     /// 在大批量提交导致频繁溢出时避免热路径上的线性移位。
@@ -241,11 +134,6 @@ fn signed(rc: usize) isize {
 fn cvt(rc: usize) !usize {
     if (signed(rc) < 0) return sys.fromSyscall(signed(rc));
     return rc;
-}
-
-fn cvtFd(rc: usize) !i32 {
-    _ = try cvt(rc);
-    return @intCast(rc);
 }
 
 // ---- 环的初始化 ------------------------------------------------------------
@@ -445,7 +333,7 @@ const UdpRecvHdr = extern struct {
     iov: [1]std.posix.iovec,
 };
 
-/// 异步 UDP 发送的状态，额外需要 sockaddr 存储（`buildSockaddr` 写在这里）。
+/// 异步 UDP 发送的状态，额外需要 sockaddr 存储（`system.buildSockaddr` 写在这里）。
 const UdpSendHdr = extern struct {
     msg: linux.msghdr_const,
     iov: [1]std.posix.iovec_const,
@@ -498,7 +386,7 @@ fn vtUdpSend(
 ) anyerror!void {
     const state = stateOf(userdata);
     const h = udpHdr(UdpSendHdr, hdr);
-    const len = buildSockaddr(to, &h.addr);
+    const len = system.buildSockaddr(to, &h.addr);
     h.iov = .{.{ .base = buf.ptr, .len = buf.len }};
     h.msg = .{
         .name = @ptrCast(@alignCast(&h.addr)),
@@ -520,12 +408,12 @@ fn vtUdpSend(
 /// `MSG_HDR_WORDS` 的预算对得上（见下方 comptime 断言）。
 const SendMsgHdr = extern struct {
     msg: linux.msghdr_const,
-    iov: [IOV_MAX]std.posix.iovec_const,
+    iov: [system.IOV_MAX]std.posix.iovec_const,
 };
 
 const RecvMsgHdr = extern struct {
     msg: linux.msghdr,
-    iov: [IOV_MAX]std.posix.iovec,
+    iov: [system.IOV_MAX]std.posix.iovec,
 };
 
 comptime {
@@ -543,7 +431,7 @@ fn vtSendMsg(
     scratch: *types.Scratch,
 ) anyerror!void {
     if (bufs.len == 0) return error.NoBuffers;
-    if (bufs.len > IOV_MAX) return error.TooManyBuffers;
+    if (bufs.len > system.IOV_MAX) return error.TooManyBuffers;
     const state = stateOf(userdata);
     const h = udpHdr(SendMsgHdr, hdr);
     for (bufs, 0..) |b, i| h.iov[i] = .{ .base = b.ptr, .len = b.len };
@@ -570,7 +458,7 @@ fn vtRecvMsg(
     scratch: *types.Scratch,
 ) anyerror!void {
     if (bufs.len == 0) return error.NoBuffers;
-    if (bufs.len > IOV_MAX) return error.TooManyBuffers;
+    if (bufs.len > system.IOV_MAX) return error.TooManyBuffers;
     const state = stateOf(userdata);
     const h = udpHdr(RecvMsgHdr, hdr);
     for (bufs, 0..) |b, i| h.iov[i] = .{ .base = b.ptr, .len = b.len };
@@ -655,7 +543,7 @@ fn vtUpdateAccept(userdata: ?*anyopaque, listen: Handle, accept_socket: Handle) 
 
 fn vtConnect(userdata: ?*anyopaque, socket: Handle, address: net.IpAddress, scratch: *types.Scratch) anyerror!void {
     const state = stateOf(userdata);
-    const len = buildSockaddr(address, &scratch.bytes);
+    const len = system.buildSockaddr(address, &scratch.bytes);
     const sa: *const linux.sockaddr = @ptrCast(@alignCast(&scratch.bytes));
     const sqe = getSqe(state);
     sqe.prep_connect(fdOf(socket), sa, len);
@@ -780,7 +668,7 @@ fn vtWatchFd(userdata: ?*anyopaque, fd: Handle, want: types.Ready, scratch: *typ
 pub fn vtConnectUnix(userdata: ?*anyopaque, socket: types.Handle, path: []const u8, scratch: *types.Scratch) anyerror!?void {
     const state = stateOf(userdata);
     var sa: linux.sockaddr.un = undefined;
-    const len = try buildUnixSockaddr(path, &sa);
+    const len = try system.buildUnixSockaddr(path, &sa);
     // UDS 的 `sockaddr_un` 必须活到内核读完，不能放栈上。`Scratch` 只有
     // 64 字节，扣掉结构头（2 字节 family）后路径上限约 62 字节。
     //
@@ -833,7 +721,7 @@ fn vtReadFileAsync(
     scratch: *types.Scratch,
 ) anyerror!?void {
     const state = stateOf(userdata);
-    const fd = try openSync(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    const fd = try system.openSync(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     errdefer _ = linux.close(fd);
     stashFd(scratch, fd);
 
@@ -851,7 +739,7 @@ fn vtWriteFileAsync(
     scratch: *types.Scratch,
 ) anyerror!?void {
     const state = stateOf(userdata);
-    const fd = try openSync(
+    const fd = try system.openSync(
         path,
         .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true },
         0o644,
@@ -884,48 +772,48 @@ const vtable_storage: io_mod.VTable = .{
     .blockingNet = &blocking_net,
     .deinit = vtDeinit,
     .now = vtNow,
-    .createSocket = vtCreateSocket,
-    .setReuseAddress = vtSetReuseAddress,
-    .setSockOpt = vtSetSockOpt,
-    .shutdownSend = vtShutdownSend,
+    .createSocket = system.vtCreateSocket,
+    .setReuseAddress = system.vtSetReuseAddress,
+    .setSockOpt = system.vtSetSockOpt,
+    .shutdownSend = system.vtShutdownSend,
     .shutdown = vtShutdown,
     .sendMsg = vtSendMsg,
     .recvMsg = vtRecvMsg,
-    .bind = vtBind,
-    .listen = vtListen,
-    .fileSize = vtFileSize,
-    .readFileInto = vtReadFileInto,
-    .writeFileAll = vtWriteFileAll,
-    .readFileAt = vtReadFileAt,
-    .appendFile = vtAppendFile,
-    .truncateFile = vtTruncateFile,
-    .openFile = vtOpenFile,
-    .readFileHandle = vtReadFileHandle,
-    .writeFileHandle = vtWriteFileHandle,
-    .closeFile = vtCloseFile,
-    .statFile = vtStatFile,
-    .setFileSize = vtSetFileSize,
-    .syncFile = vtSyncFile,
-    .setFilePermissions = vtSetFilePermissions,
-    .setFileOwner = vtSetFileOwner,
-    .setFileTimestamps = vtSetFileTimestamps,
-    .setPermissions = vtSetPermissions,
-    .setOwner = vtSetOwner,
-    .setTimestamps = vtSetTimestamps,
-    .access = vtAccess,
-    .realPath = vtRealPath,
-    .hardLink = vtHardLink,
-    .deleteFile = vtDeleteFile,
-    .makeDir = vtMakeDir,
-    .removeDir = vtRemoveDir,
-    .rename = vtRename,
-    .symLink = vtSymLink,
-    .readLink = vtReadLink,
-    .openDir = vtOpenDir,
-    .readDirHandle = vtReadDirHandle,
-    .closeDir = vtCloseDir,
-    .statPath = vtStatPath,
-    .listDir = vtListDir,
+    .bind = system.vtBind,
+    .listen = system.vtListen,
+    .fileSize = system.vtFileSize,
+    .readFileInto = system.vtReadFileInto,
+    .writeFileAll = system.vtWriteFileAll,
+    .readFileAt = system.vtReadFileAt,
+    .appendFile = system.vtAppendFile,
+    .truncateFile = system.vtTruncateFile,
+    .openFile = system.vtOpenFile,
+    .readFileHandle = system.vtReadFileHandle,
+    .writeFileHandle = system.vtWriteFileHandle,
+    .closeFile = system.vtCloseFile,
+    .statFile = system.vtStatFile,
+    .setFileSize = system.vtSetFileSize,
+    .syncFile = system.vtSyncFile,
+    .setFilePermissions = system.vtSetFilePermissions,
+    .setFileOwner = system.vtSetFileOwner,
+    .setFileTimestamps = system.vtSetFileTimestamps,
+    .setPermissions = system.vtSetPermissions,
+    .setOwner = system.vtSetOwner,
+    .setTimestamps = system.vtSetTimestamps,
+    .access = system.vtAccess,
+    .realPath = system.vtRealPath,
+    .hardLink = system.vtHardLink,
+    .deleteFile = system.vtDeleteFile,
+    .makeDir = system.vtMakeDir,
+    .removeDir = system.vtRemoveDir,
+    .rename = system.vtRename,
+    .symLink = system.vtSymLink,
+    .readLink = system.vtReadLink,
+    .openDir = system.vtOpenDir,
+    .readDirHandle = system.vtReadDirHandle,
+    .closeDir = system.vtCloseDir,
+    .statPath = system.vtStatPath,
+    .listDir = system.vtListDir,
     .associate = vtAssociate,
     .recv = vtRecv,
     .send = vtSend,
@@ -941,9 +829,9 @@ const vtable_storage: io_mod.VTable = .{
     .netPoll = vtWatchFd,
     .readFileAsync = vtReadFileAsync,
     .writeFileAsync = vtWriteFileAsync,
-    .sendFileTo = vtSendFileTo,
-    .createUnix = vtCreateUnix,
-    .bindUnix = vtBindUnix,
+    .sendFileTo = system.vtSendFileTo,
+    .createUnix = system.vtCreateUnix,
+    .bindUnix = system.vtBindUnix,
     .connectUnix = vtConnectUnix,
     .close = vtClose,
     .closeChecked = vtCloseChecked,
@@ -951,13 +839,8 @@ const vtable_storage: io_mod.VTable = .{
     .notify = vtNotify,
 };
 
-/// 无配置入口，保留给旧调用点。
-pub fn create(alloc: std.mem.Allocator) !io_mod.Io {
-    return createWith(alloc, .{});
-}
-
 /// 带配置的入口：`queue_size` 决定 SQ 环大小，CQ 环与溢出队列随之缩放。
-pub fn createWith(alloc: std.mem.Allocator, opts: io_mod.Options) !io_mod.Io {
+pub fn create(alloc: std.mem.Allocator, opts: io_mod.Options) !io_mod.Io {
     const qs = opts.queue_size;
     const state = try alloc.create(State);
     errdefer alloc.destroy(state);
@@ -997,11 +880,11 @@ pub fn createWith(alloc: std.mem.Allocator, opts: io_mod.Options) !io_mod.Io {
 /// 在 `io_uring_disabled=1` 或旧内核上 `create` 会失败——那不是 mox 的
 /// 缺陷，而是环境不支持，此时跳过。其它错误仍然照常抛出。
 fn testLoop() !?loop_mod.Loop {
-    const io_value = create(std.testing.allocator) catch |e| switch (e) {
+    const io_value = create(std.testing.allocator, .{}) catch |e| switch (e) {
         error.SetupFailed => return null,
         else => return e,
     };
-    return loop_mod.Loop.init(io_value);
+    return loop_mod.Loop.init(io_value, std.testing.allocator, .{});
 }
 
 test "io_uring: a timer fires through the loop" {
@@ -1032,21 +915,21 @@ test "io_uring: accept, receive and send through the loop" {
     defer l.deinit();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
-    const listener = try createTcpSocket(bind_addr);
-    defer closeSocket(listener);
-    try setReuseAddress(listener, true);
-    try bindSocket(listener, bind_addr);
-    const bound = try localAddress(listener);
-    try listenSocket(listener, 16);
+    const listener = try system.createTcpSocket(bind_addr);
+    defer system.closeSocket(listener);
+    try system.setReuseAddress(listener, true);
+    try system.bindSocket(listener, bind_addr);
+    const bound = try system.localAddress(listener);
+    try system.listenSocket(listener, 16);
 
-    const accept_sock = try createTcpSocket(bind_addr);
-    defer closeSocket(accept_sock);
+    const accept_sock = try system.createTcpSocket(bind_addr);
+    defer system.closeSocket(accept_sock);
 
     const Client = struct {
         fn run(addr: net.IpAddress) void {
-            const c = createTcpSocket(addr) catch return;
-            defer closeSocket(c);
-            connectSocket(c, addr) catch return;
+            const c = system.createTcpSocket(addr) catch return;
+            defer system.closeSocket(c);
+            system.connectSocket(c, addr) catch return;
             _ = linux.write(fdOf(c), "hello", 5);
         }
     };
@@ -1075,14 +958,14 @@ test "io_uring: accept, receive and send through the loop" {
         }
     };
 
-    try l.associate(listener, 0);
+    try l.io.associate(listener, 0);
     var acc = completion.NetAccept.init(listener, accept_sock);
     acc.c.callback = &Ctx.onAccept;
     l.add(&acc.c);
     try l.run();
 
     t.join();
-    if (Ctx.accepted != INVALID_HANDLE) closeSocket(Ctx.accepted);
+    if (Ctx.accepted != INVALID_HANDLE) system.closeSocket(Ctx.accepted);
     try std.testing.expectEqualStrings("hello", Ctx.buf[0..Ctx.got]);
 }
 
@@ -1121,23 +1004,23 @@ test "io_uring: an async connect completes through the loop" {
     defer l.deinit();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
-    const listener = try createTcpSocket(bind_addr);
-    defer closeSocket(listener);
-    try setReuseAddress(listener, true);
-    try bindSocket(listener, bind_addr);
-    const bound = try localAddress(listener);
-    try listenSocket(listener, 16);
+    const listener = try system.createTcpSocket(bind_addr);
+    defer system.closeSocket(listener);
+    try system.setReuseAddress(listener, true);
+    try system.bindSocket(listener, bind_addr);
+    const bound = try system.localAddress(listener);
+    try system.listenSocket(listener, 16);
 
     const Acceptor = struct {
         fn run(h: Handle) void {
-            const peer = acceptSocket(h) catch return;
-            closeSocket(peer.socket);
+            const peer = system.acceptSocket(h) catch return;
+            system.closeSocket(peer.socket);
         }
     };
     const t = try std.Thread.spawn(.{}, Acceptor.run, .{listener});
 
-    const client = try createTcpSocket(bound);
-    defer closeSocket(client);
+    const client = try system.createTcpSocket(bound);
+    defer system.closeSocket(client);
 
     const Ctx = struct {
         var ok = false;
@@ -1167,8 +1050,8 @@ test "io_uring: ReadFile reads a file off the loop thread" {
     defer l.deinit();
 
     const path = "zig-cache-mox-uring-readfile.txt";
-    try writeFileAll(path, "static-asset-body");
-    defer deleteFile(path);
+    try system.writeFileAll(path, "static-asset-body");
+    defer system.deleteFile(path);
 
     const Ctx = struct {
         var ok = false;

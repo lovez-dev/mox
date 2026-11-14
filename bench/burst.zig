@@ -32,7 +32,7 @@ pub fn main() !void {
 
     const ops: usize = @import("build_options").ops;
 
-    var loop = try io.open(gpa);
+    var loop = try io.open(gpa, .{});
     defer loop.deinit();
 
     // 这个尺子测的是 io_uring 的环管理：`readFileAsync` 只有 Linux 的
@@ -45,7 +45,7 @@ pub fn main() !void {
 
     // 准备一个文件当读源。
     const tmp_path = "/tmp/mox_bench_burst.dat";
-    try loop.writeFileAll(tmp_path, "0123456789abcdef0123456789abcdef");
+    try loop.io.writeFileAll(tmp_path, "0123456789abcdef0123456789abcdef");
 
     var zpath_buf: [256]u8 = undefined;
     @memcpy(zpath_buf[0..tmp_path.len], tmp_path);

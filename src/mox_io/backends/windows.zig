@@ -1370,15 +1370,9 @@ const vtable_storage: io_mod.VTable = .{
     .notify = vtNotify,
 };
 
-/// 拉起 IOCP 后端，交回一个可供循环驱动的 `Io`。
-/// 无配置入口，保留给旧调用点。
-pub fn create(alloc: std.mem.Allocator) !io_mod.Io {
-    return createWith(alloc, .{});
-}
-
 /// 带配置的入口。IOCP 的 `OVERLAPPED_ENTRY` 批量数组仍是编译期定长 64，
 /// 所以这里只接住参数、不改动行为；`Options` 的其余字段由 Loop 层消费。
-pub fn createWith(alloc: std.mem.Allocator, opts: io_mod.Options) !io_mod.Io {
+pub fn create(alloc: std.mem.Allocator, opts: io_mod.Options) !io_mod.Io {
     _ = opts;
     return createBody(alloc);
 }

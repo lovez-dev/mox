@@ -25,10 +25,6 @@ fn cvtFd(rc: usize) !i32 {
     return @intCast(rc);
 }
 
-pub fn buildUnixSockaddrPub(path: []const u8, storage: *linux.sockaddr.un) !linux.socklen_t {
-    return buildUnixSockaddr(path, storage);
-}
-
 pub fn buildUnixSockaddr(path: []const u8, storage: *linux.sockaddr.un) !linux.socklen_t {
     // 留一个字节给 NUL。
     if (path.len >= storage.path.len) return error.NameTooLong;

@@ -45,7 +45,7 @@ pub fn serveWith(config: Config, mount_hook: ?MountHook) !void {
     var router = try Router.init(config.gpa, config.routes);
     defer router.deinit();
 
-    var loop = try mox_io.open(config.gpa);
+    var loop = try mox_io.open(config.gpa, .{});
     defer loop.deinit();
 
     if (mount_hook) |hook| try hook(&loop);
@@ -56,7 +56,7 @@ pub fn serveWith(config: Config, mount_hook: ?MountHook) !void {
     try loop.io.bind(listener, config.address);
     try loop.io.listen(listener, 128);
     // 让接受完成经由本后端；必须早于第一次 AcceptEx。
-    try loop.associate(listener, 0);
+    try loop.io.associate(listener, 0);
 
     var server = Server{
         .alloc = config.gpa,
@@ -258,7 +258,7 @@ fn onAccept(loop: *Loop, c: *Completion) void {
         return;
     }
 
-    server.loop.associate(client, 1) catch {
+    server.loop.io.associate(client, 1) catch {
         server.loop.io.close(client);
         postAccept(server);
         return;

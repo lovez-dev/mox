@@ -24,21 +24,21 @@ const ReadDirHandle = root.ReadDirHandle;
 const CloseDir = root.CloseDir;
 
 // Options：运行时配置必须真的传到后端，不能只是把参数接住扔掉。
-test "openWith 的 queue_size 非法值报错，合法值生效" {
+test "open 的 queue_size 非法值报错，合法值生效" {
     // 0 和 3（非 2 的幂）都要明确报错，不能静默截断——静默改尺寸会让
     // 用户以为自己测的是另一种配置。
-    try std.testing.expectError(error.InvalidQueueSize, root.openWith(std.testing.allocator, .{ .queue_size = 0 }));
-    try std.testing.expectError(error.InvalidQueueSize, root.openWith(std.testing.allocator, .{ .queue_size = 3 }));
+    try std.testing.expectError(error.InvalidQueueSize, root.open(std.testing.allocator, .{ .queue_size = 0 }));
+    try std.testing.expectError(error.InvalidQueueSize, root.open(std.testing.allocator, .{ .queue_size = 3 }));
 }
 
-test "openWith 的 queue_size 改变后端环容量与在飞窗口" {
+test "open 的 queue_size 改变后端环容量与在飞窗口" {
     // 只在能观测到 SQ/CQ 环的 io_uring 后端上验证；epoll 现在也按
     // queue_size 预分配 fd-slot / Pending 池 / queued 环，但没有可观测字段。
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
-    var small = try root.openWith(std.testing.allocator, .{ .queue_size = 64, .backend = .uring });
+    var small = try root.open(std.testing.allocator, .{ .queue_size = 64, .backend = .uring });
     defer small.deinit();
-    var large = try root.openWith(std.testing.allocator, .{ .queue_size = 512, .backend = .uring });
+    var large = try root.open(std.testing.allocator, .{ .queue_size = 512, .backend = .uring });
     defer large.deinit();
 
     // CQ 容量 = queue_size × 8，在飞窗口 = 它的一半 = queue_size × 4。
@@ -57,11 +57,11 @@ test "openWith 的 queue_size 改变后端环容量与在飞窗口" {
     try std.testing.expectEqual(@as(u32, 512 * 8), s512[1]);
 }
 
-test "openWith 的 inflight_max 显式值被钳制到 CQ 容量一半" {
+test "open 的 inflight_max 显式值被钳制到 CQ 容量一半" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
     // 传一个大到会灌爆 CQ 环的值（1<<20），必须被钳制而不是照单全收。
-    var l = try root.openWith(std.testing.allocator, .{
+    var l = try root.open(std.testing.allocator, .{
         .queue_size = 64,
         .inflight_max = 1 << 20,
         .backend = .uring,
@@ -70,8 +70,8 @@ test "openWith 的 inflight_max 显式值被钳制到 CQ 容量一半" {
     try std.testing.expectEqual(@as(usize, 64 * 4), l.inflight_max);
 }
 
-test "openWith 的 max_workers 生效" {
-    var l = try root.openWith(std.testing.allocator, .{ .max_workers = 2 });
+test "open 的 max_workers 生效" {
+    var l = try root.open(std.testing.allocator, .{ .max_workers = 2 });
     defer l.deinit();
     try std.testing.expectEqual(@as(usize, 2), l.pool.max_workers);
 }
@@ -82,17 +82,17 @@ test "不同 queue_size 的 Loop 都能完成大批量提交" {
 
     // 关键回归：queue_size 缩到 64 时 CQ 只有 512 格，仍不能丢完成包。
     // 窗口必须跟着缩小，否则一次 add 3000 个操作就会灌爆 CQ。
-    var l = try root.openWith(std.testing.allocator, .{ .queue_size = 64, .backend = .uring });
+    var l = try root.open(std.testing.allocator, .{ .queue_size = 64, .backend = .uring });
     defer l.deinit();
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "qsz");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
     var fbuf: [600]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&fbuf, "{s}/q.txt", .{dir});
-    defer l.deleteFile(fpath);
-    try l.writeFileAll(fpath, "q");
+    defer l.io.deleteFile(fpath) catch {};
+    try l.io.writeFileAll(fpath, "q");
     var zbuf: [700]u8 = undefined;
     @memcpy(zbuf[0..fpath.len], fpath);
     zbuf[fpath.len] = 0;
@@ -141,7 +141,7 @@ const platform = root.platform;
 const Process = root.Process;
 const ProcessWait = root.ProcessWait;
 fn testLoop() !Loop {
-    return Loop.init(try platform.create(std.testing.allocator));
+    return Loop.init(try platform.create(std.testing.allocator, .{}), std.testing.allocator, .{});
 }
 
 test "a timer fires through the loop" {
@@ -192,7 +192,7 @@ test "a socket receive completes through the loop" {
 
     const accepted = try platform.acceptSocket(listener);
     defer platform.closeSocket(accepted.socket);
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
 
     const Ctx = struct {
         var calls: usize = 0;
@@ -244,7 +244,7 @@ test "accept and receive through the loop" {
                 l.stop();
                 return;
             };
-            l.associate(accepted, 2) catch {};
+            l.io.associate(accepted, 2) catch {};
             recv = NetRecv.init(accepted, &buf);
             recv.c.callback = &onRecv;
             l.add(&recv.c);
@@ -269,7 +269,7 @@ test "accept and receive through the loop" {
     };
     const thread = try std.Thread.spawn(.{}, Sender.run, .{bound});
 
-    try loop.associate(listener, 0);
+    try loop.io.associate(listener, 0);
     var acc = NetAccept.init(listener, accept_sock);
     acc.c.callback = &Ctx.onAccept;
     loop.add(&acc.c);
@@ -351,7 +351,7 @@ test "an async connect completes through the loop" {
 
     var conn = NetConnect.init(client, bound);
     conn.c.callback = &Ctx.cb;
-    try loop.associate(client, 5);
+    try loop.io.associate(client, 5);
     loop.add(&conn.c);
     try loop.run();
 
@@ -360,7 +360,7 @@ test "an async connect completes through the loop" {
 }
 
 test "ReadFile reads a file off the loop thread" {
-    var l = Loop.init(try platform.create(std.testing.allocator));
+    var l = Loop.init(try platform.create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     const path = "zig-cache-mox-readfile-test.txt";
@@ -389,7 +389,7 @@ test "ReadFile reads a file off the loop thread" {
 // 内存文件走完整条 `Loop.add → Work → 回调` 链路，但路径在磁盘上不存在：
 // 若实现回落到了 `readFileInto`，这条测试会直接失败。
 test "MemoryFs 命中时不碰磁盘且结果进入回调" {
-    var l = Loop.init(try platform.create(std.testing.allocator));
+    var l = Loop.init(try platform.create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     const path = "這個路徑在磁盤上絕對不存在/memory-only.bin";
@@ -418,7 +418,7 @@ test "MemoryFs 命中时不碰磁盘且结果进入回调" {
 
 // 缓冲区小于内存文件时必须报错，而不是静默截断。
 test "MemoryFs 缓冲区不足时返回 BufferTooSmall" {
-    var l = Loop.init(try platform.create(std.testing.allocator));
+    var l = Loop.init(try platform.create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
     try l.mountMemory("/big", "0123456789");
 
@@ -443,7 +443,7 @@ test "MemoryFs 缓冲区不足时返回 BufferTooSmall" {
 
 // 未挂载的路径仍回落到真实文件，避免 VFS 把原有行为吃掉。
 test "MemoryFs 未命中时回落到后端 readFileInto" {
-    var l = Loop.init(try platform.create(std.testing.allocator));
+    var l = Loop.init(try platform.create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     const path = "zig-cache-mox-vfs-fallback-test.txt";
@@ -494,7 +494,7 @@ test "取消在飞操作后不回调，只回收对象" {
     const thread = try std.Thread.spawn(.{}, Sender.run, .{bound});
     const accepted = try platform.acceptSocket(listener);
     defer platform.closeSocket(accepted.socket);
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
 
     const Ctx = struct {
         var callback_calls: usize = 0;
@@ -560,7 +560,7 @@ test "跨线程 submit 的操作在循环线程回调" {
 }
 
 test "UDP 能力可查询并完成一次数据报收发" {
-    var loop = try root.open(std.testing.allocator);
+    var loop = try root.open(std.testing.allocator, .{});
     defer loop.deinit();
 
     const udp = root.udp.Udp.get(loop.io) orelse return error.SkipZigTest;
@@ -603,7 +603,7 @@ test "UDP 能力可查询并完成一次数据报收发" {
 
 test "无人应答的 UDP 接收走内核异步路径，且停机不被线程池拖住" {
     if (@import("builtin").os.tag == .windows) try platform.startup();
-    var loop = try root.open(std.testing.allocator);
+    var loop = try root.open(std.testing.allocator, .{});
 
     const udp = root.udp.Udp.get(loop.io) orelse return error.SkipZigTest;
     // 前提是后端提供了原生异步 UDP。回落到线程池的后端确实会占住一个池线程，
@@ -689,7 +689,7 @@ test "取消定时器立即回收，不等待完成包" {
 }
 
 test "能力表同时容纳 UDP 与 DNS，未注册能力仍返回 null" {
-    var loop = try root.open(std.testing.allocator);
+    var loop = try root.open(std.testing.allocator, .{});
     defer loop.deinit();
 
     try std.testing.expect(loop.io.capability(*const root.udp.VTable, root.udp.id) != null);
@@ -873,7 +873,7 @@ test "drainRetired 超时可观测：永不回来的取消项记一次超时且�
 // WriteFile 与 ReadFile 对称：都内嵌 Work 节点、回调落在循环线程。
 // 这里写一个临时文件再读回来，端到端验证字节真的落盘。
 test "WriteFile 通过 Work 池写文件，可被 ReadFile 读回" {
-    var l = Loop.init(try platform.create(std.testing.allocator));
+    var l = Loop.init(try platform.create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     const path = "zig-cache-mox-writefile-test.txt";
@@ -908,7 +908,7 @@ test "WriteFile 通过 Work 池写文件，可被 ReadFile 读回" {
 
 // 失败路径必须把池线程里的错误带回回调，而不是静默成功。
 test "WriteFile 写入失败时把错误交给回调" {
-    var l = Loop.init(try platform.create(std.testing.allocator));
+    var l = Loop.init(try platform.create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     const Ctx = struct {
@@ -1043,7 +1043,7 @@ test "unwatchdog 主动撤销后操作按原样完成" {
 
 // 偏移读：从中间开始读，验证随机访问与文件尾短读。
 test "ReadFile 支持偏移读与文件尾短读" {
-    var l = Loop.init(try platform.create(std.testing.allocator));
+    var l = Loop.init(try platform.create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     const path = "zig-cache-mox-readat-test.txt";
@@ -1074,7 +1074,7 @@ test "ReadFile 支持偏移读与文件尾短读" {
 
 // 追加写：两次追加后内容应为两段拼接，既有内容不被覆盖。
 test "WriteFile 追加模式保留既有内容" {
-    var l = Loop.init(try platform.create(std.testing.allocator));
+    var l = Loop.init(try platform.create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     const path = "zig-cache-mox-append-test.txt";
@@ -1109,7 +1109,7 @@ test "WriteFile 追加模式保留既有内容" {
 
 // 截断：把 10 字节文件截到 4 字节后，读回来只有前 4 字节。
 test "TruncateFile 缩短文件后再读只剩前缀" {
-    var l = Loop.init(try platform.create(std.testing.allocator));
+    var l = Loop.init(try platform.create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     const path = "zig-cache-mox-truncate-test.txt";
@@ -1139,7 +1139,7 @@ test "TruncateFile 缩短文件后再读只剩前缀" {
 
 // 删除：删掉后读应报 FileNotFound；再删一次仍成功（幂等）。
 test "DeleteFile 删除文件且重复删除不报错" {
-    var l = Loop.init(try platform.create(std.testing.allocator));
+    var l = Loop.init(try platform.create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     const path = "zig-cache-mox-delete-test.txt";
@@ -1177,41 +1177,40 @@ test "DeleteFile 删除文件且重复删除不报错" {
     } else |_| {}
 }
 
-// 幂等（ENOENT）不能掩盖真正的删除失败：删一个非空目录应被计数。
-test "deleteFile 失败不再静默：delete_failures 可观测" {
-    var l = Loop.init(try platform.create(std.testing.allocator));
+// 幂等（ENOENT）不能掩盖真正的删除失败：删一个非空目录必须返回错误。
+test "Io.deleteFile 直接返回目录删除失败" {
+    var l = Loop.init(try platform.create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer l.deinit();
 
     const dir = "zig-cache-mox-delete-dir";
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
     const path = dir ++ "/f";
     try platform.writeFileAll(path, "x");
-    defer l.deleteFile(path);
+    defer l.io.deleteFile(path) catch {};
 
-    try std.testing.expectEqual(@as(usize, 0), l.delete_failures);
     // unlink 一个目录：Linux EISDIR / Windows ERROR_ACCESS_DENIED，都不是 ENOENT。
-    l.deleteFile(dir);
-    try std.testing.expect(l.delete_failures > 0);
+    if (l.io.deleteFile(dir)) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expect(err == error.IsDirectory or err == error.AccessDenied or err == error.DeleteFailed);
+    }
 }
 
 // `closeChecked`：有效句柄关闭成功；重复关闭报 `error.NotOpen`，
-// 并累加 `close_failures`（`close` 本身吞错，不可见）。
+// 调用方直接处理返回的错误。
 test "closeChecked 区分成功与失败：重复关闭报 NotOpen" {
     var l = try testLoop();
     defer l.deinit();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
     const sock = try platform.createTcpSocket(bind_addr);
-    try std.testing.expectEqual(@as(usize, 0), l.close_failures);
 
     // 第一次关闭：成功。
-    try l.closeChecked(sock);
-    try std.testing.expectEqual(@as(usize, 0), l.close_failures);
+    try l.io.closeChecked(sock);
 
     // 第二次关闭：句柄已失效，必须报错而不是静默成功。
-    try std.testing.expectError(error.NotOpen, l.closeChecked(sock));
-    try std.testing.expectEqual(@as(usize, 1), l.close_failures);
+    try std.testing.expectError(error.NotOpen, l.io.closeChecked(sock));
 }
 
 // 子进程：同步 spawn 后异步等退出，退出码应被带回回调。
@@ -1481,7 +1480,7 @@ test "makeDir 递归创建、stat 识别为目录、removeDir 删掉" {
 
     var pbuf: [512]u8 = undefined;
     const base = try tmpDir(&pbuf, "mkdir");
-    defer l.removeDir(base) catch {};
+    defer l.io.removeDir(base) catch {};
 
     // 中间两级都不存在，验证 mkdir -p 语义。
     var deepbuf: [600]u8 = undefined;
@@ -1491,16 +1490,16 @@ test "makeDir 递归创建、stat 识别为目录、removeDir 删掉" {
         if (builtin.os.tag == .windows) '\\' else '/',
     });
 
-    try l.makeDir(deep, 0o755);
+    try l.io.makeDir(deep, 0o755);
 
-    const st = try l.statPath(deep);
+    const st = try l.io.statPath(deep);
     try std.testing.expectEqual(root.FileKind.directory, st.kind);
 
     // 重复创建不报错（幂等）。
-    try l.makeDir(deep, 0o755);
+    try l.io.makeDir(deep, 0o755);
 
-    try l.removeDir(deep);
-    try std.testing.expectError(error.FileNotFound, l.statPath(deep));
+    try l.io.removeDir(deep);
+    try std.testing.expectError(error.FileNotFound, l.io.statPath(deep));
     // 中间层 `a` 还留在 base 里：先删掉它，否则 defer 的 removeDir(base)
     // 会因目录非空静默失败（`catch {}` 吞掉），把残留目录留在盘上。
     var midbuf: [560]u8 = undefined;
@@ -1508,7 +1507,7 @@ test "makeDir 递归创建、stat 识别为目录、removeDir 删掉" {
         base,
         if (builtin.os.tag == .windows) '\\' else '/',
     });
-    try l.removeDir(mid);
+    try l.io.removeDir(mid);
 }
 
 test "removeDir 对非空目录报 DirNotEmpty" {
@@ -1517,18 +1516,18 @@ test "removeDir 对非空目录报 DirNotEmpty" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "rmnonempty");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const file = try std.fmt.bufPrint(&fbuf, "{s}{c}f.txt", .{
         dir,
         if (builtin.os.tag == .windows) '\\' else '/',
     });
-    try l.writeFileAll(file, "x");
-    defer l.deleteFile(file);
+    try l.io.writeFileAll(file, "x");
+    defer l.io.deleteFile(file) catch {};
 
-    try std.testing.expectError(error.DirNotEmpty, l.removeDir(dir));
+    try std.testing.expectError(error.DirNotEmpty, l.io.removeDir(dir));
 }
 
 test "rename 移动文件，原路径消失、新路径可读" {
@@ -1537,8 +1536,8 @@ test "rename 移动文件，原路径消失、新路径可读" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "rename");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     const sep = if (builtin.os.tag == .windows) '\\' else '/';
     var abuf: [600]u8 = undefined;
@@ -1546,16 +1545,16 @@ test "rename 移动文件，原路径消失、新路径可读" {
     const from = try std.fmt.bufPrint(&abuf, "{s}{c}from.txt", .{ dir, sep });
     const to = try std.fmt.bufPrint(&bbuf, "{s}{c}to.txt", .{ dir, sep });
 
-    try l.writeFileAll(from, "payload");
+    try l.io.writeFileAll(from, "payload");
 
-    try l.rename(from, to);
+    try l.io.rename(from, to);
 
-    try std.testing.expectError(error.FileNotFound, l.statPath(from));
-    const st = try l.statPath(to);
+    try std.testing.expectError(error.FileNotFound, l.io.statPath(from));
+    const st = try l.io.statPath(to);
     try std.testing.expectEqual(root.FileKind.file, st.kind);
     try std.testing.expectEqual(@as(u64, 7), st.size);
 
-    l.deleteFile(to);
+    l.io.deleteFile(to) catch {};
 }
 
 test "stat 报告文件大小与 mtime，listDir 列出条目" {
@@ -1564,26 +1563,26 @@ test "stat 报告文件大小与 mtime，listDir 列出条目" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "stat");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     const sep = if (builtin.os.tag == .windows) '\\' else '/';
     var f1buf: [600]u8 = undefined;
     var f2buf: [600]u8 = undefined;
     const f1 = try std.fmt.bufPrint(&f1buf, "{s}{c}one.txt", .{ dir, sep });
     const f2 = try std.fmt.bufPrint(&f2buf, "{s}{c}two.txt", .{ dir, sep });
-    try l.writeFileAll(f1, "12345");
-    try l.writeFileAll(f2, "ab");
-    defer l.deleteFile(f1);
-    defer l.deleteFile(f2);
+    try l.io.writeFileAll(f1, "12345");
+    try l.io.writeFileAll(f2, "ab");
+    defer l.io.deleteFile(f1) catch {};
+    defer l.io.deleteFile(f2) catch {};
 
-    const st = try l.statPath(f1);
+    const st = try l.io.statPath(f1);
     try std.testing.expectEqual(@as(u64, 5), st.size);
     // mtime 必须是个合理的近期时间；0 说明平台层没回填。
     try std.testing.expect(st.mtime_ms > 1_600_000_000_000);
 
     var entries: [16]root.DirEntry = undefined;
-    const n = try l.listDir(dir, &entries);
+    const n = try l.io.listDir(dir, &entries);
     try std.testing.expectEqual(@as(usize, 2), n);
 
     var found_one = false;
@@ -1605,21 +1604,21 @@ test "symLink 创建链接，stat 跟随到目标文件" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "symlink");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var tbuf: [600]u8 = undefined;
     var lbuf: [600]u8 = undefined;
     const target = try std.fmt.bufPrint(&tbuf, "{s}/target.txt", .{dir});
     const link = try std.fmt.bufPrint(&lbuf, "{s}/link.txt", .{dir});
-    try l.writeFileAll(target, "hello");
-    defer l.deleteFile(target);
+    try l.io.writeFileAll(target, "hello");
+    defer l.io.deleteFile(target) catch {};
 
-    try l.symLink(target, link);
-    defer l.deleteFile(link);
+    try l.io.symLink(target, link);
+    defer l.io.deleteFile(link) catch {};
 
     // `stat` 跟随链接，看到的是目标文件的属性。
-    const st = try l.statPath(link);
+    const st = try l.io.statPath(link);
     try std.testing.expectEqual(root.FileKind.file, st.kind);
     try std.testing.expectEqual(@as(u64, 5), st.size);
 }
@@ -1632,7 +1631,7 @@ test "Unix socket 在 Windows 上返回 Unsupported" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     var l = try testLoop();
     defer l.deinit();
-    try std.testing.expectError(error.Unsupported, l.createUnixSocket());
+    try std.testing.expectError(error.Unsupported, l.io.createUnixSocket());
 }
 
 test "Unix socket 可 bind、listen、accept、收发数据" {
@@ -1643,19 +1642,19 @@ test "Unix socket 可 bind、listen、accept、收发数据" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "uds");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     // 路径必须短：`Scratch` 只有 64 字节，UDS sockaddr 结构头占 2 字节。
     var spath_buf: [80]u8 = undefined;
     const sock_path = try std.fmt.bufPrint(&spath_buf, "{s}/s.sock", .{dir});
     if (sock_path.len > 60) return error.SkipZigTest; // 临时目录路径太长，跳过
-    defer l.deleteFile(sock_path);
+    defer l.io.deleteFile(sock_path) catch {};
 
-    const listener = try l.createUnixSocket();
-    defer l.close(listener);
-    try l.bindUnix(listener, sock_path);
-    try l.listen(listener, 8);
+    const listener = try l.io.createUnixSocket();
+    defer l.io.close(listener);
+    try l.io.bindUnix(listener, sock_path);
+    try l.io.listen(listener, 8);
 
     const Ctx = struct {
         var total: usize = 0;
@@ -1682,8 +1681,8 @@ test "Unix socket 可 bind、listen、accept、收发数据" {
 
     // `NetAccept` 要求一个与监听同族、尚未绑定的 socket 作为接收容器
     // （与 TCP 的用法一致；io_uring/kqueue 上内核会填它）。
-    const accept_sock = try l.createUnixSocket();
-    defer l.close(accept_sock);
+    const accept_sock = try l.io.createUnixSocket();
+    defer l.io.close(accept_sock);
     var accept = root.NetAccept.init(listener, accept_sock);
     var wd = Timer.init(5000);
     accept.c.callback = &Ctx.onAccept;
@@ -1761,15 +1760,15 @@ test "ReadFileAsync 异步读文件并与阻塞版内容一致" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "afile");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&fbuf, "{s}/a.txt", .{dir});
-    defer l.deleteFile(fpath);
+    defer l.io.deleteFile(fpath) catch {};
 
     const payload = "async-file-io";
-    try l.writeFileAll(fpath, payload);
+    try l.io.writeFileAll(fpath, payload);
 
     // `openat` 的 SQE 直接读这块内存，必须 NUL 结尾。
     var zpath_buf: [700]u8 = undefined;
@@ -1806,12 +1805,12 @@ test "WriteFileAsync 异步写文件后阻塞读回一致" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "awrite");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&fbuf, "{s}/w.txt", .{dir});
-    defer l.deleteFile(fpath);
+    defer l.io.deleteFile(fpath) catch {};
 
     var zpath_buf: [700]u8 = undefined;
     @memcpy(zpath_buf[0..fpath.len], fpath);
@@ -1839,7 +1838,7 @@ test "WriteFileAsync 异步写文件后阻塞读回一致" {
     try std.testing.expectEqual(@as(usize, payload.len), try f.getResult());
 
     // 用阻塞版读回，确认真的落到磁盘。
-    const st = try l.statPath(fpath);
+    const st = try l.io.statPath(fpath);
     try std.testing.expectEqual(@as(u64, payload.len), st.size);
 }
 
@@ -1852,13 +1851,13 @@ test "ReadFileAsync 循环读不泄漏 fd（close 真的执行了）" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "fdleak");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&fbuf, "{s}/f.txt", .{dir});
-    defer l.deleteFile(fpath);
-    try l.writeFileAll(fpath, "abc");
+    defer l.io.deleteFile(fpath) catch {};
+    try l.io.writeFileAll(fpath, "abc");
 
     var zpath_buf: [700]u8 = undefined;
     @memcpy(zpath_buf[0..fpath.len], fpath);
@@ -1965,13 +1964,13 @@ test "大批量提交超过环容量时每个操作都完成（背压不丢回�
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "burst");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&fbuf, "{s}/b.txt", .{dir});
-    defer l.deleteFile(fpath);
-    try l.writeFileAll(fpath, "hello-burst");
+    defer l.io.deleteFile(fpath) catch {};
+    try l.io.writeFileAll(fpath, "hello-burst");
 
     var zpath_buf: [700]u8 = undefined;
     @memcpy(zpath_buf[0..fpath.len], fpath);
@@ -2019,13 +2018,13 @@ test "ReadFileAsync 的 offset 生效（从中间读）" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "aoff");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&fbuf, "{s}/o.txt", .{dir});
-    defer l.deleteFile(fpath);
-    try l.writeFileAll(fpath, "0123456789");
+    defer l.io.deleteFile(fpath) catch {};
+    try l.io.writeFileAll(fpath, "0123456789");
 
     var zpath_buf: [700]u8 = undefined;
     @memcpy(zpath_buf[0..fpath.len], fpath);
@@ -2076,26 +2075,26 @@ test "SendFile 把文件内容经 sendfile 送进 socket" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "sendfile");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&fbuf, "{s}/sf.txt", .{dir});
-    defer l.deleteFile(fpath);
+    defer l.io.deleteFile(fpath) catch {};
     const payload = "sendfile-payload-42";
-    try l.writeFileAll(fpath, payload);
+    try l.io.writeFileAll(fpath, payload);
 
     var spath_buf: [80]u8 = undefined;
     const sock_path = try std.fmt.bufPrint(&spath_buf, "{s}/s.sock", .{dir});
     if (sock_path.len > 60) return error.SkipZigTest;
-    defer l.deleteFile(sock_path);
+    defer l.io.deleteFile(sock_path) catch {};
 
     // 服务端：bind + listen，然后同步 accept（UDS 上客户端 connect 会立即
     // 排队，accept 不会阻塞）。
-    const listener = try l.createUnixSocket();
-    defer l.close(listener);
-    try l.bindUnix(listener, sock_path);
-    try l.listen(listener, 4);
+    const listener = try l.io.createUnixSocket();
+    defer l.io.close(listener);
+    try l.io.bindUnix(listener, sock_path);
+    try l.io.listen(listener, 4);
 
     // 客户端在另一线程 connect 并读数据——不能用 std.c（Linux 不链 libc）。
     const Reader = struct {
@@ -2137,8 +2136,8 @@ test "SendFile 把文件内容经 sendfile 送进 socket" {
             lp.stop();
         }
     };
-    const accept_sock = try l.createUnixSocket();
-    defer l.close(accept_sock);
+    const accept_sock = try l.io.createUnixSocket();
+    defer l.io.close(accept_sock);
     var acc = root.NetAccept.init(listener, accept_sock);
     var wd = Timer.init(5000);
     acc.c.callback = &Conn.cb;
@@ -2153,9 +2152,9 @@ test "SendFile 把文件内容经 sendfile 送进 socket" {
     }
 
     // 对 conn 做 sendfile（同步入口，走 Work 池的节点内部也用这个）。
-    const sent = try l.sendFile(conn, fpath, 0, 0);
+    const sent = try l.io.sendFile(conn, fpath, 0, 0);
     try std.testing.expectEqual(payload.len, sent);
-    l.close(conn);
+    l.io.close(conn);
 
     t.join();
     try std.testing.expectEqualStrings(payload, Reader.buf[0..Reader.n]);
@@ -2170,13 +2169,13 @@ test "io_uring: 一次提交超过 SQ 环容量不损坏环" {
     // 建一个文件，然后一次性提交远超 ENTRIES(256) 的读操作。
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "sqfull");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&fbuf, "{s}/sq.txt", .{dir});
-    defer l.deleteFile(fpath);
-    try l.writeFileAll(fpath, "0123456789");
+    defer l.io.deleteFile(fpath) catch {};
+    try l.io.writeFileAll(fpath, "0123456789");
 
     var zpath_buf: [700]u8 = undefined;
     @memcpy(zpath_buf[0..fpath.len], fpath);
@@ -2241,7 +2240,7 @@ test "io_uring 的 add 只排队不提交，enter 次数攒到 waitBatch" {
     const uring = @import("backends/uring.zig");
     const N = 64;
 
-    var loop = Loop.initWithAllocator(try platform.create(std.testing.allocator), std.testing.allocator);
+    var loop = Loop.init(try platform.create(std.testing.allocator, .{}), std.testing.allocator, .{});
     defer loop.deinit();
 
     const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
@@ -2265,7 +2264,7 @@ test "io_uring 的 add 只排队不提交，enter 次数攒到 waitBatch" {
 
     const accepted = try platform.acceptSocket(listener);
     defer platform.closeSocket(accepted.socket);
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
 
     const before = uring.enterCalls(loop.io.userdata);
 
@@ -2309,12 +2308,12 @@ test "文件句柄：open → 写入 → 随机读 → close 全链路" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "fh");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&fbuf, "{s}/h.txt", .{dir});
-    defer l.deleteFile(fpath);
+    defer l.io.deleteFile(fpath) catch {};
 
     // 1. 打开（读写，不存在则创建）
     var open_node = OpenFile.init(l.io, fpath, .read_write);
@@ -2384,14 +2383,14 @@ test "文件句柄：读超出文件尾短读不报错" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "fheof");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&fbuf, "{s}/e.txt", .{dir});
-    defer l.deleteFile(fpath);
+    defer l.io.deleteFile(fpath) catch {};
 
-    try l.writeFileAll(fpath, "abc"); // 3 字节
+    try l.io.writeFileAll(fpath, "abc"); // 3 字节
 
     var open_node = OpenFile.init(l.io, fpath, .read_only);
     open_node.work.c.callback = stopCb;
@@ -2431,8 +2430,8 @@ test "文件句柄：open 不存在的文件返回 FileNotFound" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "fhnf");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const missing = try std.fmt.bufPrint(&fbuf, "{s}/nope.txt", .{dir});
@@ -2458,14 +2457,14 @@ test "文件句柄：write_only 打开会清空既有内容" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "fhtr");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&fbuf, "{s}/t.txt", .{dir});
-    defer l.deleteFile(fpath);
+    defer l.io.deleteFile(fpath) catch {};
 
-    try l.writeFileAll(fpath, "old-content-here");
+    try l.io.writeFileAll(fpath, "old-content-here");
 
     var open_node = OpenFile.init(l.io, fpath, .write_only);
     open_node.work.c.callback = stopCb;
@@ -2500,12 +2499,12 @@ test "文件句柄：CloseFile 同一实例重复关闭不 panic" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "fhidem");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&fbuf, "{s}/i.txt", .{dir});
-    defer l.deleteFile(fpath);
+    defer l.io.deleteFile(fpath) catch {};
 
     var open_node = OpenFile.init(l.io, fpath, .read_write);
     open_node.work.c.callback = stopCb;
@@ -2538,12 +2537,12 @@ test "句柄元数据：statFile 报告真实大小，且随写入增长" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "sfst");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&fbuf, "{s}/s.txt", .{dir});
-    defer l.deleteFile(fpath);
+    defer l.io.deleteFile(fpath) catch {};
 
     var open_node = OpenFile.init(l.io, fpath, .read_write);
     open_node.work.c.callback = stopCb;
@@ -2590,14 +2589,14 @@ test "句柄元数据：setFileSize 截断后大小与内容都变" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "sfss");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&fbuf, "{s}/z.txt", .{dir});
-    defer l.deleteFile(fpath);
+    defer l.io.deleteFile(fpath) catch {};
 
-    try l.writeFileAll(fpath, "0123456789"); // 10 字节
+    try l.io.writeFileAll(fpath, "0123456789"); // 10 字节
 
     var open_node = OpenFile.init(l.io, fpath, .read_write);
     open_node.work.c.callback = stopCb;
@@ -2655,12 +2654,12 @@ test "句柄元数据：syncFile 在有效句柄上成功" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "sfsy");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&fbuf, "{s}/y.txt", .{dir});
-    defer l.deleteFile(fpath);
+    defer l.io.deleteFile(fpath) catch {};
 
     var open_node = OpenFile.init(l.io, fpath, .read_write);
     open_node.work.c.callback = stopCb;
@@ -2703,8 +2702,8 @@ test "目录流：openDir → 分多次读完 → closeDir，条目不丢不重"
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "dstream");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     // 建 5 个文件。用固定名字，便于断言集合完全相等。
     const names = [_][]const u8{ "a.txt", "b.txt", "c.txt", "d.txt", "e.txt" };
@@ -2712,9 +2711,9 @@ test "目录流：openDir → 分多次读完 → closeDir，条目不丢不重"
     var fpaths: [5][]const u8 = undefined;
     for (names, 0..) |n, i| {
         fpaths[i] = try std.fmt.bufPrint(&fbufs[i], "{s}/{s}", .{ dir, n });
-        try l.writeFileAll(fpaths[i], "x");
+        try l.io.writeFileAll(fpaths[i], "x");
     }
-    defer for (fpaths) |p| l.deleteFile(p);
+    defer for (fpaths) |p| l.io.deleteFile(p) catch {};
 
     var open_node = OpenDir.init(l.io, dir);
     open_node.work.c.callback = stopCb;
@@ -2768,18 +2767,18 @@ test "目录流：一次给足缓冲能读完，is_dir 标志正确" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "dflags");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&fbuf, "{s}/file.txt", .{dir});
-    try l.writeFileAll(fpath, "x");
-    defer l.deleteFile(fpath);
+    try l.io.writeFileAll(fpath, "x");
+    defer l.io.deleteFile(fpath) catch {};
 
     var sbuf: [600]u8 = undefined;
     const subdir = try std.fmt.bufPrint(&sbuf, "{s}/subdir", .{dir});
-    try l.makeDir(subdir, 0o755);
-    defer l.removeDir(subdir) catch {};
+    try l.io.makeDir(subdir, 0o755);
+    defer l.io.removeDir(subdir) catch {};
 
     var open_node = OpenDir.init(l.io, dir);
     open_node.work.c.callback = stopCb;
@@ -2843,22 +2842,22 @@ test "readLink 读回符号链接目标" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "rlink");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var tbuf: [600]u8 = undefined;
     const target = try std.fmt.bufPrint(&tbuf, "{s}/real.txt", .{dir});
-    try l.writeFileAll(target, "hi");
-    defer l.deleteFile(target);
+    try l.io.writeFileAll(target, "hi");
+    defer l.io.deleteFile(target) catch {};
 
     var lbuf: [600]u8 = undefined;
     const link = try std.fmt.bufPrint(&lbuf, "{s}/link.txt", .{dir});
-    l.symLink(target, link) catch |e| switch (e) {
+    l.io.symLink(target, link) catch |e| switch (e) {
         // 非管理员权限下 Windows 无法建符号链接；跳过而不是假装通过。
         error.AccessDenied, error.PrivilegeNotHeld => return error.SkipZigTest,
         else => return e,
     };
-    defer l.deleteFile(link);
+    defer l.io.deleteFile(link) catch {};
 
     var rbuf: [1024]u8 = undefined;
     var rl = ReadLink.init(l.io, link, &rbuf);
@@ -2882,13 +2881,13 @@ test "readLink 对普通文件返回 NotASymLink" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "rlnot");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&fbuf, "{s}/plain.txt", .{dir});
-    try l.writeFileAll(fpath, "x");
-    defer l.deleteFile(fpath);
+    try l.io.writeFileAll(fpath, "x");
+    defer l.io.deleteFile(fpath) catch {};
 
     var rbuf: [1024]u8 = undefined;
     var rl = ReadLink.init(l.io, fpath, &rbuf);
@@ -2906,53 +2905,53 @@ test "Loop 同步 API：access / realPath / truncate / readLink" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "syncapi");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var fbuf: [600]u8 = undefined;
     const fpath = try std.fmt.bufPrint(&fbuf, "{s}/f.txt", .{dir});
-    try l.writeFileAll(fpath, "0123456789");
-    defer l.deleteFile(fpath);
+    try l.io.writeFileAll(fpath, "0123456789");
+    defer l.io.deleteFile(fpath) catch {};
 
     // access：存在且可读可写。
-    try l.access(fpath, 4 | 2);
+    try l.io.access(fpath, 4 | 2);
     // 不存在的路径必须报错。
     var miss: [600]u8 = undefined;
     const missing = try std.fmt.bufPrint(&miss, "{s}/nope.txt", .{dir});
-    try std.testing.expectError(error.FileNotFound, l.access(missing, 4));
+    try std.testing.expectError(error.FileNotFound, l.io.access(missing, 4));
 
     // truncate：截到 4 字节。
-    try l.truncate(fpath, 4);
+    try l.io.truncate(fpath, 4);
     try std.testing.expectEqual(@as(u64, 4), try l.fileSize(fpath));
 
     // realPath：结果包含文件名。
     var rp: [1024]u8 = undefined;
-    const abs = try l.realPath(fpath, &rp);
+    const abs = try l.io.realPath(fpath, &rp);
     try std.testing.expect(std.mem.endsWith(u8, rp[0..abs], "f.txt"));
 
     // readLink：建符号链接再读回（Windows 无权限则跳过）。
     var lbuf: [600]u8 = undefined;
     const link = try std.fmt.bufPrint(&lbuf, "{s}/l.txt", .{dir});
-    l.symLink(fpath, link) catch |e| switch (e) {
+    l.io.symLink(fpath, link) catch |e| switch (e) {
         error.AccessDenied, error.PrivilegeNotHeld => return error.SkipZigTest,
         else => return e,
     };
-    defer l.deleteFile(link);
+    defer l.io.deleteFile(link) catch {};
     var tbuf: [1024]u8 = undefined;
-    const n = try l.readLink(link, &tbuf);
+    const n = try l.io.readLink(link, &tbuf);
     try std.testing.expect(std.mem.endsWith(u8, tbuf[0..n], "f.txt"));
 
     // hardLink：两个路径指向同一 inode（Windows 不支持硬链接，跳过）。
     var hbuf: [600]u8 = undefined;
     const hard = try std.fmt.bufPrint(&hbuf, "{s}/f-hard.txt", .{dir});
-    l.hardLink(fpath, hard) catch |e| switch (e) {
+    l.io.hardLink(fpath, hard) catch |e| switch (e) {
         error.AccessDenied, error.PrivilegeNotHeld, error.Unsupported => {},
         else => return e,
     };
-    if (l.access(hard, 4)) |_| {
+    if (l.io.access(hard, 4)) |_| {
         // 硬链接存在时，它与原文件共享同一个 inode → 大小相同。
         try std.testing.expectEqual(@as(u64, 4), try l.fileSize(hard));
-        l.deleteFile(hard);
+        l.io.deleteFile(hard) catch {};
     } else |_| {}
 }
 
@@ -2968,8 +2967,8 @@ test "CloseDir 同一实例重复关闭不 panic" {
 
     var pbuf: [512]u8 = undefined;
     const dir = try tmpDir(&pbuf, "didem");
-    try l.makeDir(dir, 0o755);
-    defer l.removeDir(dir) catch {};
+    try l.io.makeDir(dir, 0o755);
+    defer l.io.removeDir(dir) catch {};
 
     var open_node = OpenDir.init(l.io, dir);
     open_node.work.c.callback = stopCb;
@@ -3262,17 +3261,17 @@ test "Async：循环已阻塞在 waitBatch 时，notify 立刻唤醒（不等 20
 /// 测试收尾要 `loop.close` 两个。
 fn tcpPair(loop: *Loop) !struct { a: root.Handle, b: root.Handle } {
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1:0", 0);
-    const listen = try loop.createSocket(addr);
-    try loop.setReuseAddress(listen, true);
-    try loop.bind(listen, addr);
-    try loop.listen(listen, 8);
+    const listen = try loop.io.createSocket(addr);
+    try loop.io.setReuseAddress(listen, true);
+    try loop.io.bind(listen, addr);
+    try loop.io.listen(listen, 8);
 
     // 拿实际端口
     const bound = loop.io.vtable.statSocketAddr(loop.io.userdata, listen) catch
         try std.Io.net.IpAddress.parse("127.0.0.1:0", 0);
     _ = bound;
 
-    const client = try loop.createSocket(addr);
+    const client = try loop.io.createSocket(addr);
     return .{ .a = client, .b = listen };
 }
 
@@ -3332,8 +3331,8 @@ test "NetShutdown：关写方向后对端读到 0 字节（EOF）" {
 
     const pair = try makeTcpPair();
     defer pair.close();
-    try l.associate(pair.server, 1);
-    try l.associate(pair.client, 2);
+    try l.io.associate(pair.server, 1);
+    try l.io.associate(pair.client, 2);
 
     var sd = root.NetShutdown.init(pair.server, .write);
     sd.c.callback = stopCb;
@@ -3388,7 +3387,7 @@ test "NetSendMsg：两个缓冲一次发出，对端按序收到拼接结果" {
 
     const pair = try makeTcpPair();
     defer pair.close();
-    try l.associate(pair.server, 1);
+    try l.io.associate(pair.server, 1);
 
     // **关键**：两个分开的缓冲，必须按顺序拼成 "hello world"。
     // 分成两次 send 也能得到同样字节，但那样测不出 iovec 的顺序。
@@ -3422,7 +3421,7 @@ test "NetRecvMsg：一个数据包摊到两个缓冲，顺序与长度正确" {
 
     const pair = try makeTcpPair();
     defer pair.close();
-    try l.associate(pair.server, 1);
+    try l.io.associate(pair.server, 1);
 
     // 客户端先发 "HEADpayload"（4 + 7 = 11 字节）
     _ = try platform.sendBlocking(pair.client, "HEADpayload");
@@ -3457,7 +3456,7 @@ test "NetPoll：socket 可读时立即完成" {
 
     const pair = try makeTcpPair();
     defer pair.close();
-    try l.associate(pair.server, 1);
+    try l.io.associate(pair.server, 1);
 
     // 先发点数据，让 server 端确定可读
     _ = try platform.sendBlocking(pair.client, "ping!");
@@ -3476,7 +3475,7 @@ test "NetPoll 真的会等：无数据时不完成，来了数据才完成" {
 
     const pair = try makeTcpPair();
     defer pair.close();
-    try l.associate(pair.server, 1);
+    try l.io.associate(pair.server, 1);
 
     // **关键**：此刻 socket 上没有任何数据。NetPoll 必须「挂着」而不是
     // 立即完成——否则它就是个永远返回就绪的假实现。用 300ms 定时器证明
@@ -3531,9 +3530,9 @@ test "SetTimestamps：设 mtime 后 statFile 能读回来" {
     var fbuf: [512]u8 = undefined;
     const path = try tmpDir(&path_buf, "setts");
     const file_path = try std.fmt.bufPrint(&fbuf, "{s}/f.txt", .{path});
-    try l.makeDir(path, 0o755);
-    defer l.removeDir(path) catch {};
-    defer l.deleteFile(file_path);
+    try l.io.makeDir(path, 0o755);
+    defer l.io.removeDir(path) catch {};
+    defer l.io.deleteFile(file_path) catch {};
 
     // 创建文件
     var content = "hello".*;
@@ -3584,9 +3583,9 @@ test "Access：存在的文件通过，不存在的报 FileNotFound" {
     var fbuf: [512]u8 = undefined;
     const path = try tmpDir(&path_buf, "access");
     const file_path = try std.fmt.bufPrint(&fbuf, "{s}/a.txt", .{path});
-    try l.makeDir(path, 0o755);
-    defer l.removeDir(path) catch {};
-    defer l.deleteFile(file_path);
+    try l.io.makeDir(path, 0o755);
+    defer l.io.removeDir(path) catch {};
+    defer l.io.deleteFile(file_path) catch {};
 
     // 创建文件
     var content = "x".*;
@@ -3629,9 +3628,9 @@ test "RealPath：解析出的路径与输入一致（无符号链接时）" {
     var fbuf: [512]u8 = undefined;
     const path = try tmpDir(&path_buf, "realpath");
     const file_path = try std.fmt.bufPrint(&fbuf, "{s}/r.txt", .{path});
-    try l.makeDir(path, 0o755);
-    defer l.removeDir(path) catch {};
-    defer l.deleteFile(file_path);
+    try l.io.makeDir(path, 0o755);
+    defer l.io.removeDir(path) catch {};
+    defer l.io.deleteFile(file_path) catch {};
 
     var content = "y".*;
     var wf = root.WriteFile.init(l.io, file_path, &content);
@@ -3670,10 +3669,10 @@ test "HardLink：创建链接后两个路径指向同一文件" {
     const path = try tmpDir(&path_buf, "hardlink");
     const orig = try std.fmt.bufPrint(&fbuf, "{s}/orig.txt", .{path});
     const link = try std.fmt.bufPrint(&fbuf2, "{s}/link.txt", .{path});
-    try l.makeDir(path, 0o755);
-    defer l.removeDir(path) catch {};
-    defer l.deleteFile(orig);
-    defer l.deleteFile(link);
+    try l.io.makeDir(path, 0o755);
+    defer l.io.removeDir(path) catch {};
+    defer l.io.deleteFile(orig) catch {};
+    defer l.io.deleteFile(link) catch {};
 
     var content = "shared".*;
     var wf = root.WriteFile.init(l.io, orig, &content);
@@ -3710,9 +3709,9 @@ test "SetPermissions + Access：chmod 0o000 后读被拒绝，恢复后通过" {
     var fbuf: [512]u8 = undefined;
     const path = try tmpDir(&path_buf, "chmod");
     const file_path = try std.fmt.bufPrint(&fbuf, "{s}/c.txt", .{path});
-    try l.makeDir(path, 0o755);
-    defer l.removeDir(path) catch {};
-    defer l.deleteFile(file_path);
+    try l.io.makeDir(path, 0o755);
+    defer l.io.removeDir(path) catch {};
+    defer l.io.deleteFile(file_path) catch {};
 
     var content = "secret".*;
     var wf = root.WriteFile.init(l.io, file_path, &content);
@@ -3770,7 +3769,7 @@ test "跨后端：同一 socket 全双工 recv+send 各自完成" {
 
     const pair = try makeTcpPair();
     defer pair.close();
-    try l.associate(pair.server, 1);
+    try l.io.associate(pair.server, 1);
 
     const Ctx = struct {
         var recv_done = false;
@@ -3848,7 +3847,7 @@ test "跨后端：同一 socket 同方向多个 recv 按 FIFO 依次完成" {
 
     const pair = try makeTcpPair();
     defer pair.close();
-    try l.associate(pair.server, 1);
+    try l.io.associate(pair.server, 1);
 
     // 先写 4 个字节，再提交 4 个 1 字节 recv：每个 recv 恰好拿到 1 字节，
     // 于是四个 recv 必须**依次**各完成一次，而不是一个大 recv 吃掉全部。

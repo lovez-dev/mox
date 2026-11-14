@@ -382,10 +382,17 @@ bench/concurrent.zig 多连接并发吞吐尺子
 
 ## 代码边界
 
+构造入口统一为 `mox_io.open(allocator, options)`，例如 `mox_io.open(gpa, .{})`。
+自定义后端使用 `Loop.init(io, allocator, options)`。后端构造统一为
+`create(allocator, options)`，不再提供 `openWith`、`createWith` 或旧的单参数包装。
+同步操作从 `loop.xxx(...)` 迁到 `loop.io.xxx(...)`；删除清理写作
+`defer loop.io.deleteFile(path) catch {};`，需要处理失败时使用 `try` 或 `catch`。
+`Loop.mountMemory` / `fileSize` 保留内存 VFS 行为，它们不属于系统操作转发。
+
 - `Io` 提供同步系统操作；`Tcp` / `Listener` 和文件 `Work` 节点通过传入的
   `Io` 调用后端，支持自定义实现。同步方法会阻塞调用线程。
-- `Loop` 负责提交、完成回调、定时器、取消及停机。旧同步方法保留为兼容转发；
-  新代码使用 `loop.io`。内存 VFS 和失败计数仍由 `Loop` 管理。
+- `Loop` 负责提交、完成回调、定时器、取消及停机；同步系统操作统一使用
+  `loop.io`。内存 VFS 仍由 `Loop` 管理；删除与关闭失败直接由 `Io` 返回。
 - Linux 的 io_uring 与 epoll 共同依赖 `linux_sys.zig`，epoll 不依赖 uring。
   共用系统层不包含事件循环状态。
 - Web 的协议模块处理协议行为，统一调用 `runtime` 的发送、关闭和回收入口。
@@ -442,7 +449,7 @@ benchmark，API 也不兼容；在建立 zio 适配器与共同负载之前，�
 
 ## Linux 后端：io_uring 与 epoll
 
-`platform.create()`（Linux 上由 `backends/linux.zig` 充当门面）默认建
+`platform.create(, .{})`（Linux 上由 `backends/linux.zig` 充当门面）默认建
 `io_uring`。`io_uring_setup` 失败（内核不支持、`seccomp` 拦截、
 `/proc/sys/kernel/io_uring_disabled=1`、资源不足）时自动回落到 `epoll`，
 上层 `Loop` 完全无感——两个后端返回的是同一个 `VTable` 契约。
@@ -463,7 +470,7 @@ Work 唤醒、异步 connect、ONESHOT 重挂、后端选择），因此无论 C
 
 回落路径已在真实禁用的内核上端到端验证过：在 WSL 里把
 `/proc/sys/kernel/io_uring_disabled` 写成 `1` 后重跑，`io_uring_setup` 返回
-`SetupFailed`，`platform.create()` 改选 `epoll`，全量测试在纯 epoll 路径下
+`SetupFailed`，`platform.create(, .{})` 改选 `epoll`，全量测试在纯 epoll 路径下
 **46/46 全绿**。`backends/uring.zig` 里那几条后端专属测试在此时会读取
 `create` 的失败原因，遇到 `SetupFailed` 就**跳过而不是失败**——这类失败由
 环境造成，不该记在 mox 头上；其它错误仍旧照常抛出。把 sysctl 改回 `0`
@@ -471,7 +478,7 @@ Work 唤醒、异步 connect、ONESHOT 重挂、后端选择），因此无论 C
 
 ## 新增一个后端
 
-写一个导出 `create(allocator) !Io` 的文件，填满 `mox_io.VTable` 的全部字段，
+写一个导出 `create(allocator, options) !Io` 的文件，填满 `mox_io.VTable` 的全部字段，
 再在 `src/mox_io/mox_io.zig` 的 `platform` 选择器里加一个分支即可。`VTable` 覆盖：
 生命周期、时钟、socket 建立/绑定/监听、文件查询与阻塞读、关联、
 收发/接受/连接及其收尾、取消、关闭、批量等待（`waitBatch`）、唤醒。
@@ -863,7 +870,7 @@ CI（`.github/workflows/test.yml`）分两块：
 ### 本轮重构验证（2026-11-14）
 
 本轮进一步抽出 Linux 共用系统层，将同步操作归到 `Io`，统一 TCP/文件节点的
-调用路径，并按协议拆分服务层。保留公共 API 与兼容入口；新增自定义 `Io` 的
+调用路径，并按协议拆分服务层。旧兼容入口已删除；新增自定义 `Io` 的
 TCP 调用及短写续发回归。epoll 双向监听取消与批量关闭回归继续通过。
 
 | 环境 / 检查 | 本轮结果 |
@@ -1212,7 +1219,7 @@ var hl = mox_io.HardLink.init(io, "original.txt", "hardlink.txt");
 不再 open/read/close 真实磁盘（池线程只做一次 memcpy，不做阻塞 I/O）：
 
 ```zig
-var loop = try mox_io.open(gpa);
+var loop = try mox_io.open(gpa, .{});
 defer loop.deinit();
 try loop.mountMemory("/assets/app.css", @embedFile("assets/app.css"));
 ```
@@ -1251,7 +1258,7 @@ exe.root_module.addImport("mox_vfs", embed.module);
 const embed = @import("mox_vfs");
 
 // 直接用 Loop：泛型 mount 可以自动推导。
-var loop = try mox_io.open(gpa);
+var loop = try mox_io.open(gpa, .{});
 defer loop.deinit();
 try embed.mount(&loop);
 
@@ -1290,22 +1297,21 @@ try mox.serveWith(.{ .gpa = gpa, .address = addr, .routes = routes }, mountAll);
     偏移超出文件长度时短读为 0 字节而不报错。
   - `WriteFile`：默认整文件覆盖写；`initAppend(...)` 追加到末尾并保留既有内容。
   - `TruncateFile`：把文件截断到指定长度。
-  - `DeleteFile`：删除文件。平台层实现返回 `void`，所有失败都被吞掉
-    （含文件不存在与权限不足），因此它不会报错——需要可靠删除请自行先 `fileSize` 探测。
+  - `DeleteFile`：删除文件，`getResult()` 返回删除失败；文件不存在视为成功。
   `VTable` 上对应的 `readFileInto`/`readFileAt`/`writeFileAll`/`appendFile`/
   `truncateFile`/`deleteFile` 是所有后端共用的兜底，没有可移植的原生异步接口。
 
 ### 目录与元数据操作
 
-`Loop` 暴露 6 个**同步**方法（阻塞调用，在 `Work` 池线程里跑才不卡循环）：
+`Io` 暴露以下**同步**方法（阻塞调用，在 `Work` 池线程里跑才不卡循环）：
 
 ```zig
-pub fn makeDir(self: *Loop, path: []const u8, mode: u32) !void
-pub fn removeDir(self: *Loop, path: []const u8) !void
-pub fn rename(self: *Loop, old_path: []const u8, new_path: []const u8) !void
-pub fn symLink(self: *Loop, target: []const u8, link_path: []const u8) !void
-pub fn statPath(self: *Loop, path: []const u8) !Stat
-pub fn listDir(self: *Loop, path: []const u8, buf: []DirEntry) !usize
+pub fn makeDir(self: Io, path: []const u8, mode: u32) !void
+pub fn removeDir(self: Io, path: []const u8) !void
+pub fn rename(self: Io, old_path: []const u8, new_path: []const u8) !void
+pub fn symLink(self: Io, target: []const u8, link_path: []const u8) !void
+pub fn statPath(self: Io, path: []const u8) !Stat
+pub fn listDir(self: Io, path: []const u8, buf: []DirEntry) !usize
 ```
 
 对应的异步节点（`MakeDir`、`RemoveDir`、`Rename`、`SymLink`、`StatPath`、`ListDir`）
@@ -1320,13 +1326,14 @@ pub fn listDir(self: *Loop, path: []const u8, buf: []DirEntry) !usize
 三个新方法支持 `AF_UNIX` + `SOCK_STREAM`（Windows 返回 `error.Unsupported`）：
 
 ```zig
-pub fn createUnixSocket(self: *Loop) !Handle
-pub fn bindUnix(self: *Loop, socket: Handle, path: []const u8) !void
-pub fn connectUnix(self: *Loop, socket: Handle, path: []const u8, scratch: *Scratch) !void
+pub fn createUnixSocket(self: Io) !Handle
+pub fn bindUnix(self: Io, socket: Handle, path: []const u8) !void
+pub fn connectUnix(self: Io, socket: Handle, path: []const u8, scratch: *Scratch) !?void
 ```
 
 `bindUnix` 在文件系统创建 socket 文件；路径已存在时返回 `error.PathAlreadyExists`。
-`connectUnix` 是同步阻塞调用，不返回节点；需要异步连接请用 `Work` 包装。
+`connectUnix` 是底层提交接口：返回 `null` 表示在飞，后续由后端完成队列报告结果；
+`scratch` 必须保持有效直到完成，不能当作同步连接完成使用。
 `NetRecv`/`NetSend`/`NetClose` 对 UDS 和 TCP 一视同仁。
 
 ### io_uring 原生异步文件 I/O
@@ -1376,7 +1383,7 @@ if (loop.io.vtable.readFileAsync == null) {
 
 ```zig
 // 同步版本（立即返回已发送字节数或错误）
-pub fn sendFile(self: *Loop, socket: Handle, path: []const u8, offset: u64, count: usize) !usize
+pub fn sendFile(self: Io, socket: Handle, path: []const u8, offset: u64, count: usize) !usize
 
 // 异步版本（内嵌 Work，通过 loop.add 提交）
 pub const SendFile = struct {

@@ -22,7 +22,7 @@
 //!     exe.root_module.addImport("mox_vfs", embed.module);
 //!
 //! 运行时：
-//!     var loop = try mox_io.open(gpa);
+//!     var loop = try mox_io.open(gpa, .{});
 //!     defer loop.deinit();
 //!     try @import("mox_vfs").mount(&loop);
 

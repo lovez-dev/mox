@@ -11,10 +11,6 @@ pub const TimerQueue = struct {
     items: std.ArrayListUnmanaged(*Completion) = .empty,
     allocator: std.mem.Allocator = std.heap.page_allocator,
 
-    pub fn initWithAllocator(self: *TimerQueue, allocator: std.mem.Allocator) void {
-        self.* = .{ .allocator = allocator };
-    }
-
     /// 启动时按在飞窗口预分配堆容量：稳态 submit 永不 malloc。
     pub fn initWithCapacity(self: *TimerQueue, allocator: std.mem.Allocator, capacity: usize) void {
         self.* = .{ .allocator = allocator };

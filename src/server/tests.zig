@@ -113,7 +113,7 @@ test "响应发生部分写入时续发剩余字节，不静默丢弃" {
     const accepted = try mox_io.platform.acceptSocket(listener);
     defer mox_io.platform.closeSocket(accepted.socket);
 
-    var loop = try mox_io.open(alloc);
+    var loop = try mox_io.open(alloc, .{});
     defer loop.deinit();
 
     var router = try Router.init(alloc, &.{});
@@ -121,7 +121,7 @@ test "响应发生部分写入时续发剩余字节，不静默丢弃" {
 
     const conn = try alloc.create(Connection);
     conn.* = .{ .alloc = alloc, .loop = &loop, .router = &router, .socket = accepted.socket };
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
 
     // 载荷远超每连接内联缓冲区，走动态缓冲区路径（发完由 releaseWire 释放）。
     const wire = try alloc.alloc(u8, payload);
@@ -205,9 +205,9 @@ test "静态路由命中内存文件时不触碰磁盘" {
     const accepted = try mox_io.platform.acceptSocket(listener);
     defer mox_io.platform.closeSocket(accepted.socket);
 
-    var loop = try mox_io.open(alloc);
+    var loop = try mox_io.open(alloc, .{});
     defer loop.deinit();
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
     try loop.mountMemory(vfs_path, vfs_body);
 
     var router = try Router.init(alloc, &.{
@@ -287,7 +287,7 @@ test "连接数达上限时停止 accept（内核 backlog 背压）" {
     const bound = l[1];
     defer mox_io.platform.closeSocket(listener);
 
-    var loop = try mox_io.open(alloc);
+    var loop = try mox_io.open(alloc, .{});
     defer loop.deinit();
     var router = try Router.init(alloc, &.{});
     defer router.deinit();
@@ -314,7 +314,7 @@ test "连接数达上限时停止 accept（内核 backlog 背压）" {
     loop.cancel(&srv.accept.c, @ptrCast(&srv), noopDispose);
     srv.accepting = false;
     loop.drainRetired(500);
-    if (srv.accept_socket != INVALID_HANDLE) loop.close(srv.accept_socket);
+    if (srv.accept_socket != INVALID_HANDLE) loop.io.close(srv.accept_socket);
 }
 
 test "空闲超时关闭静默连接" {
@@ -351,9 +351,9 @@ test "空闲超时关闭静默连接" {
     const accepted = try mox_io.platform.acceptSocket(listener);
     // accepted.socket 交给 Connection 持有，由它负责关闭，勿在此重复关。
 
-    var loop = try mox_io.open(alloc);
+    var loop = try mox_io.open(alloc, .{});
     defer loop.deinit();
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
     var router = try Router.init(alloc, &.{});
     defer router.deinit();
 
@@ -384,7 +384,7 @@ test "空闲超时关闭静默连接" {
         srv.accepting = false;
     }
     loop.drainRetired(500);
-    if (srv.accept_socket != INVALID_HANDLE) loop.close(srv.accept_socket);
+    if (srv.accept_socket != INVALID_HANDLE) loop.io.close(srv.accept_socket);
 
     // 关键断言：静默连接已被空闲超时释放（若 idle 失效则仍挂在这里）。
     try std.testing.expectEqual(@as(usize, 0), srv.active_conns);
@@ -410,9 +410,9 @@ test "drainOpen 停机后关闭在飞连接并回收内存" {
     const cli = try std.Thread.spawn(.{}, H.client, .{bound});
     const accepted = try mox_io.platform.acceptSocket(listener);
 
-    var loop = try mox_io.open(alloc);
+    var loop = try mox_io.open(alloc, .{});
     defer loop.deinit();
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
     var router = try Router.init(alloc, &.{});
     defer router.deinit();
 
@@ -517,9 +517,9 @@ test "WS 完整握手：客户端发 Upgrade 请求，服务端回 101 + 正确 
     const accepted = try mox_io.platform.acceptSocket(listener);
     defer mox_io.platform.closeSocket(accepted.socket);
 
-    var loop = try mox_io.open(alloc);
+    var loop = try mox_io.open(alloc, .{});
     defer loop.deinit();
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
 
     var router = try Router.init(alloc, &.{
         .{ .method = .GET, .path = "/ws", .handler = S.handler },
@@ -600,9 +600,9 @@ test "SSE 响应头包含 text/event-stream 且推送首条事件" {
     const accepted = try mox_io.platform.acceptSocket(listener);
     defer mox_io.platform.closeSocket(accepted.socket);
 
-    var loop = try mox_io.open(alloc);
+    var loop = try mox_io.open(alloc, .{});
     defer loop.deinit();
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
 
     var router = try Router.init(alloc, &.{
         .{ .method = .GET, .path = "/events", .handler = S.handler },
@@ -691,9 +691,9 @@ test "SSE setTick 在无 send 时自动重新 pump" {
     const accepted = try mox_io.platform.acceptSocket(listener);
     defer mox_io.platform.closeSocket(accepted.socket);
 
-    var loop = try mox_io.open(alloc);
+    var loop = try mox_io.open(alloc, .{});
     defer loop.deinit();
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
 
     var router = try Router.init(alloc, &.{
         .{ .method = .GET, .path = "/events", .handler = S.handler },
@@ -783,9 +783,9 @@ test "SSE setTick(0) 关闭自动 pump 且不泄漏定时器" {
 
     const accepted = try mox_io.platform.acceptSocket(listener);
 
-    var loop = try mox_io.open(alloc);
+    var loop = try mox_io.open(alloc, .{});
     defer loop.deinit();
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
 
     var router = try Router.init(alloc, &.{
         .{ .method = .GET, .path = "/events", .handler = S.handler },
@@ -881,9 +881,9 @@ test "SSE tick 在飞时中止连接不 UAF、不泄漏" {
 
     const accepted = try mox_io.platform.acceptSocket(listener);
 
-    var loop = try mox_io.open(alloc);
+    var loop = try mox_io.open(alloc, .{});
     defer loop.deinit();
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
 
     var router = try Router.init(alloc, &.{
         .{ .method = .GET, .path = "/events", .handler = S.handler },
@@ -965,9 +965,9 @@ test "metrics 计数器在每次请求后递增" {
     const accepted = try mox_io.platform.acceptSocket(listener);
     defer mox_io.platform.closeSocket(accepted.socket);
 
-    var loop = try mox_io.open(alloc);
+    var loop = try mox_io.open(alloc, .{});
     defer loop.deinit();
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
 
     var router = try Router.init(alloc, &.{
         .{ .method = .GET, .path = "/ping", .handler = S.handler },
@@ -1040,9 +1040,9 @@ test "每请求 arena 回收 ctx.gpa 分配，无泄漏" {
 
     const accepted = try mox_io.platform.acceptSocket(listener);
 
-    var loop = try mox_io.open(alloc);
+    var loop = try mox_io.open(alloc, .{});
     defer loop.deinit();
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
 
     var router = try Router.init(alloc, &.{
         .{ .method = .GET, .path = "/leak", .handler = S.handler },
@@ -1131,9 +1131,9 @@ test "CRLF 注入端到端被拒绝，不写出伪造响应" {
     const accepted = try mox_io.platform.acceptSocket(listener);
     defer mox_io.platform.closeSocket(accepted.socket);
 
-    var loop = try mox_io.open(alloc);
+    var loop = try mox_io.open(alloc, .{});
     defer loop.deinit();
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
 
     var router = try Router.init(alloc, &.{
         .{ .method = .GET, .path = "/inject", .handler = S.handler },
@@ -1228,9 +1228,9 @@ test "HTTP pipelining：一次写入两个请求都得到响应" {
     const accepted = try mox_io.platform.acceptSocket(listener);
     defer mox_io.platform.closeSocket(accepted.socket);
 
-    var loop = try mox_io.open(alloc);
+    var loop = try mox_io.open(alloc, .{});
     defer loop.deinit();
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
 
     var router = try Router.init(alloc, &.{
         .{ .method = .GET, .path = "/a", .handler = S.first },
@@ -1314,9 +1314,9 @@ test "HEAD 回退 GET 路由且不发送 body" {
     const accepted = try mox_io.platform.acceptSocket(listener);
     defer mox_io.platform.closeSocket(accepted.socket);
 
-    var loop = try mox_io.open(alloc);
+    var loop = try mox_io.open(alloc, .{});
     defer loop.deinit();
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
 
     // 只注册 GET，故意不注册 HEAD：验证路由器回退。
     var router = try Router.init(alloc, &.{
@@ -1410,9 +1410,9 @@ test "chunked 请求体端到端解码" {
     const accepted = try mox_io.platform.acceptSocket(listener);
     defer mox_io.platform.closeSocket(accepted.socket);
 
-    var loop = try mox_io.open(alloc);
+    var loop = try mox_io.open(alloc, .{});
     defer loop.deinit();
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
 
     var router = try Router.init(alloc, &.{
         .{ .method = .POST, .path = "/echo", .handler = S.echo },
@@ -1522,9 +1522,9 @@ test "chunked 大请求体跨多次 recv 累积解码" {
     const accepted = try mox_io.platform.acceptSocket(listener);
     defer mox_io.platform.closeSocket(accepted.socket);
 
-    var loop = try mox_io.open(alloc);
+    var loop = try mox_io.open(alloc, .{});
     defer loop.deinit();
-    try loop.associate(accepted.socket, 1);
+    try loop.io.associate(accepted.socket, 1);
 
     var router = try Router.init(alloc, &.{
         .{ .method = .POST, .path = "/big", .handler = S.echo },
