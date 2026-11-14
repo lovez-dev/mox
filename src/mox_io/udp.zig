@@ -10,12 +10,13 @@
 //! 主 `VTable` 与 `Loop.add` 的热路径完全不动。
 
 const std = @import("std");
-const root = @import("mox_io.zig");
+const types = @import("types.zig");
+const io_mod = @import("io.zig");
 const Loop = @import("loop.zig").Loop;
 const Work = @import("completion.zig").Work;
 
-const Handle = root.Handle;
-const INVALID_HANDLE = root.INVALID_HANDLE;
+const Handle = types.Handle;
+const INVALID_HANDLE = types.INVALID_HANDLE;
 
 /// 后端私有存储。`usize` 元素已保证 8 字节对齐，因此不需要额外的对齐声明；
 /// `Io.VTable` 的 udp 入口以普通 `[]usize` 接收它。
@@ -23,7 +24,7 @@ const HdrStore = [32]usize;
 const IpAddress = std.Io.net.IpAddress;
 
 /// 能力 ID。调用方与实现各自在编译期用 `cap` 算出同一个值。
-pub const id = root.cap("mox.io.udp.v1");
+pub const id = types.cap("mox.io.udp.v1");
 
 /// 后端（或通用实现）提供的 UDP 函数表。`userdata` 由 `Udp` 透传。
 pub const VTable = struct {
@@ -37,11 +38,11 @@ pub const VTable = struct {
 
 /// 调用方缓存的能力句柄。构造一次，之后所有 UDP 操作都走它。
 pub const Udp = struct {
-    io: root.Io,
+    io: io_mod.Io,
     vt: *const VTable,
 
     /// 取能力；后端不支持时返回 `null`。
-    pub fn get(io: root.Io) ?Udp {
+    pub fn get(io: io_mod.Io) ?Udp {
         return .{ .io = io, .vt = io.capability(*const VTable, id) orelse return null };
     }
 
@@ -191,6 +192,6 @@ pub const Send = struct {
 };
 
 test "能力 ID 稳定且不同名字不冲突" {
-    try std.testing.expect(id != root.cap("mox.io.dns.v1"));
-    try std.testing.expectEqual(id, root.cap("mox.io.udp.v1"));
+    try std.testing.expect(id != types.cap("mox.io.dns.v1"));
+    try std.testing.expectEqual(id, types.cap("mox.io.udp.v1"));
 }

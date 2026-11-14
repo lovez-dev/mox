@@ -9,16 +9,17 @@
 //! 应答里名字字段用压缩指针，这里只跳过固定 12 字节头部后逐条解析）。
 
 const std = @import("std");
-const root = @import("mox_io.zig");
+const types = @import("types.zig");
+const io_mod = @import("io.zig");
 const Loop = @import("loop.zig").Loop;
 const Completion = @import("completion.zig").Completion;
 const udp = @import("udp.zig");
 
 const IpAddress = std.Io.net.IpAddress;
-const Handle = root.Handle;
+const Handle = types.Handle;
 
 /// 能力 ID：与 UDP 完全不同的名字，验证稀疏表能容纳多个能力。
-pub const id = root.cap("mox.io.dns.v1");
+pub const id = types.cap("mox.io.dns.v1");
 
 /// 注册描述符。DNS 本身建立在 UDP 能力上，这里只用一个静态标记证明
 /// 能力表能同时容纳多个 ID、且查询路径对第二个能力同样有效。
@@ -45,10 +46,10 @@ pub const Answer = struct {
 
 /// 能力句柄。内部持有 UDP 能力，因此 DNS 天然复用了第一个能力。
 pub const Resolver = struct {
-    io: root.Io,
+    io: io_mod.Io,
     udp_cap: udp.Udp,
 
-    pub fn get(io: root.Io) ?Resolver {
+    pub fn get(io: io_mod.Io) ?Resolver {
         if (io.capability(*const Descriptor, id) == null) return null;
         return .{ .io = io, .udp_cap = udp.Udp.get(io) orelse return null };
     }
@@ -156,13 +157,12 @@ pub const Query = struct {
     }
 };
 
-
-    /// 构造 AAAA 查询（IPv6）。
-    pub fn initAAAA(socket: Handle, server: IpAddress, name: []const u8) Query {
-        var q: Query = .{ .socket = socket, .server = server, .name = name };
-        q.request_len = buildQueryAAAA(&q.request, name);
-        return q;
-    }
+/// 构造 AAAA 查询（IPv6）。
+pub fn initAAAA(socket: Handle, server: IpAddress, name: []const u8) Query {
+    var q: Query = .{ .socket = socket, .server = server, .name = name };
+    q.request_len = buildQueryAAAA(&q.request, name);
+    return q;
+}
 
 /// 从任意偏移读大端 u16；切片长度运行时才知道，用位运算避开类型要求。
 fn readU16(msg: []const u8, off: usize) u16 {
@@ -206,7 +206,6 @@ fn buildQuery(buf: []u8, name: []const u8) usize {
     std.mem.writeInt(u16, buf[off + 2 ..][0..2], 1, .big); // IN
     return off + 4;
 }
-
 
 /// 构造标准 AAAA 查询（IPv6）：与 buildQuery 类似，QTYPE=28。
 fn buildQueryAAAA(buf: []u8, name: []const u8) usize {
@@ -298,16 +297,21 @@ test "AAAA 应答可解析成 IPv6 IpAddress" {
     @memcpy(msg[13..16], "foo");
     msg[16] = 0;
     std.mem.writeInt(u16, msg[17..19], 28, .big); // AAAA
-    std.mem.writeInt(u16, msg[19..21], 1, .big);  // IN
+    std.mem.writeInt(u16, msg[19..21], 1, .big); // IN
     // 回答节：NAME 压缩指针、TYPE=28、CLASS=IN、TTL(4字节)、RDLEN=16
     var off: usize = 21;
-    msg[off] = 0xc0; msg[off + 1] = 0x0c; off += 2;
-    std.mem.writeInt(u16, msg[off..][0..2], 28, .big); off += 2; // TYPE AAAA
-    std.mem.writeInt(u16, msg[off..][0..2], 1,  .big); off += 2; // CLASS IN
+    msg[off] = 0xc0;
+    msg[off + 1] = 0x0c;
+    off += 2;
+    std.mem.writeInt(u16, msg[off..][0..2], 28, .big);
+    off += 2; // TYPE AAAA
+    std.mem.writeInt(u16, msg[off..][0..2], 1, .big);
+    off += 2; // CLASS IN
     off += 4; // TTL
-    std.mem.writeInt(u16, msg[off..][0..2], 16, .big); off += 2; // RDLEN
+    std.mem.writeInt(u16, msg[off..][0..2], 16, .big);
+    off += 2; // RDLEN
     // IPv6 地址：2001:db8::1
-    const ipv6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0,0,0,0, 0,0,0,0, 0,0,0,1 };
+    const ipv6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
     @memcpy(msg[off..][0..16], &ipv6);
     off += 16;
 
@@ -329,9 +333,8 @@ test "AAAA 查询报文 QTYPE=28" {
     try std.testing.expectEqual(@as(u16, 28), qtype);
 }
 
-
 test "能力表同时提供 UDP 与 DNS 两个 ID" {
     try std.testing.expect(udp.id != id);
-    try std.testing.expectEqual(id, root.cap("mox.io.dns.v1"));
-    try std.testing.expect(root.cap("mox.io.udp.v1") != root.cap("mox.io.signal.v1"));
+    try std.testing.expectEqual(id, types.cap("mox.io.dns.v1"));
+    try std.testing.expect(types.cap("mox.io.udp.v1") != types.cap("mox.io.signal.v1"));
 }

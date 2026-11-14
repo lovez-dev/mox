@@ -9,14 +9,17 @@
 //! 阻塞 I/O，回调照旧在循环线程触发，因此 `server.zig` 的静态路由形状不变。
 
 const std = @import("std");
-const root = @import("mox_io.zig");
+const errors = @import("errors.zig");
+const types = @import("types.zig");
+const io_mod = @import("io.zig");
+const completion = @import("completion.zig");
 
-const Io = root.Io;
-const Work = root.Work;
-const Handle = root.Handle;
-const INVALID_HANDLE = root.INVALID_HANDLE;
-const Stat = root.Stat;
-const DirEntry = root.DirEntry;
+const Io = io_mod.Io;
+const Work = completion.Work;
+const Handle = types.Handle;
+const INVALID_HANDLE = types.INVALID_HANDLE;
+const Stat = types.Stat;
+const DirEntry = types.DirEntry;
 
 /// 进程内内存文件表。条目由调用方在启动时 `mount`，生命周期必须长于
 /// 任何 `ReadFile`；通常挂在 `Loop` 上，随循环一起销毁。
@@ -78,7 +81,7 @@ pub const ReadFile = struct {
     /// （随机访问），是分段读大文件的基础。
     offset: u64 = 0,
     len: usize = 0,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     /// `memory` 传 `Loop.memory_fs.lookup(path)` 的结果即可；`null` 则回落
     /// 到后端 `readFileInto`（真实文件，Work 池线程阻塞读）。
@@ -104,12 +107,12 @@ pub const ReadFile = struct {
         }
         self.len = if (self.offset == 0)
             self.io.vtable.readFileInto(self.io.userdata, self.path, self.buf) catch |e| {
-                self.err = e;
+                self.err = errors.normalize(e);
                 return;
             }
         else
             self.io.vtable.readFileAt(self.io.userdata, self.path, self.offset, self.buf) catch |e| {
-                self.err = e;
+                self.err = errors.normalize(e);
                 return;
             };
     }
@@ -135,7 +138,7 @@ pub const SendFile = struct {
     /// 最多发多少字节。0 表示整文件。
     count: usize = 0,
     sent: usize = 0,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, socket: Handle, path: []const u8) SendFile {
         return .{ .work = Work.init(run), .io = io, .socket = socket, .path = path };
@@ -152,7 +155,7 @@ pub const SendFile = struct {
             return;
         };
         self.sent = f(self.io.userdata, self.socket, self.path, self.offset, self.count) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -176,7 +179,7 @@ pub const WriteFile = struct {
     bytes: []const u8,
     mode: Mode = .overwrite,
     written: usize = 0,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     /// `bytes` 由调用方持有，必须活到回调触发为止（本结构不复制内容）。
     pub fn init(io: Io, path: []const u8, bytes: []const u8) WriteFile {
@@ -192,11 +195,11 @@ pub const WriteFile = struct {
         const self: *WriteFile = @fieldParentPtr("work", w);
         switch (self.mode) {
             .overwrite => self.io.vtable.writeFileAll(self.io.userdata, self.path, self.bytes) catch |e| {
-                self.err = e;
+                self.err = errors.normalize(e);
                 return;
             },
             .append => self.io.vtable.appendFile(self.io.userdata, self.path, self.bytes) catch |e| {
-                self.err = e;
+                self.err = errors.normalize(e);
                 return;
             },
         }
@@ -216,7 +219,7 @@ pub const TruncateFile = struct {
     io: Io,
     path: []const u8,
     size: u64,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, path: []const u8, size: u64) TruncateFile {
         return .{ .work = Work.init(run), .io = io, .path = path, .size = size };
@@ -225,7 +228,7 @@ pub const TruncateFile = struct {
     fn run(w: *Work) void {
         const self: *TruncateFile = @fieldParentPtr("work", w);
         self.io.vtable.truncateFile(self.io.userdata, self.path, self.size) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
         };
     }
 
@@ -241,7 +244,7 @@ pub const DeleteFile = struct {
     work: Work,
     io: Io,
     path: []const u8,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, path: []const u8) DeleteFile {
         return .{ .work = Work.init(run), .io = io, .path = path };
@@ -250,7 +253,7 @@ pub const DeleteFile = struct {
     fn run(w: *Work) void {
         const self: *DeleteFile = @fieldParentPtr("work", w);
         self.io.vtable.deleteFile(self.io.userdata, self.path) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
         };
     }
 
@@ -274,11 +277,11 @@ pub const OpenFile = struct {
     work: Work,
     io: Io,
     path: []const u8,
-    mode: root.FileMode = .read_only,
+    mode: types.FileMode = .read_only,
     file: Handle = INVALID_HANDLE,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
-    pub fn init(io: Io, path: []const u8, mode: root.FileMode) OpenFile {
+    pub fn init(io: Io, path: []const u8, mode: types.FileMode) OpenFile {
         return .{ .work = Work.init(run), .io = io, .path = path, .mode = mode };
     }
 
@@ -289,7 +292,7 @@ pub const OpenFile = struct {
             return;
         };
         self.file = vt(self.io.userdata, self.path, self.mode) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -309,7 +312,7 @@ pub const ReadFileHandle = struct {
     offset: u64 = 0,
     buf: []u8,
     len: usize = 0,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, file: Handle, offset: u64, buf: []u8) ReadFileHandle {
         return .{ .work = Work.init(run), .io = io, .file = file, .offset = offset, .buf = buf };
@@ -322,7 +325,7 @@ pub const ReadFileHandle = struct {
             return;
         };
         self.len = vt(self.io.userdata, self.file, self.offset, self.buf) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -342,7 +345,7 @@ pub const WriteFileHandle = struct {
     offset: u64 = 0,
     bytes: []const u8,
     written: usize = 0,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     /// `bytes` 由调用方持有，必须活到回调触发为止（不复制内容）。
     pub fn init(io: Io, file: Handle, offset: u64, bytes: []const u8) WriteFileHandle {
@@ -356,7 +359,7 @@ pub const WriteFileHandle = struct {
             return;
         };
         self.written = vt(self.io.userdata, self.file, self.offset, self.bytes) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -402,7 +405,7 @@ pub const StatFile = struct {
     io: Io,
     file: Handle,
     stat: Stat = .{ .kind = .other, .size = 0, .mtime_ms = 0 },
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, file: Handle) StatFile {
         return .{ .work = Work.init(run), .io = io, .file = file };
@@ -415,7 +418,7 @@ pub const StatFile = struct {
             return;
         };
         self.stat = vt(self.io.userdata, self.file) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -432,7 +435,7 @@ pub const SetFileSize = struct {
     io: Io,
     file: Handle,
     size: u64,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, file: Handle, size: u64) SetFileSize {
         return .{ .work = Work.init(run), .io = io, .file = file, .size = size };
@@ -445,7 +448,7 @@ pub const SetFileSize = struct {
             return;
         };
         vt(self.io.userdata, self.file, self.size) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -460,7 +463,7 @@ pub const SyncFile = struct {
     work: Work,
     io: Io,
     file: Handle,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, file: Handle) SyncFile {
         return .{ .work = Work.init(run), .io = io, .file = file };
@@ -473,7 +476,7 @@ pub const SyncFile = struct {
             return;
         };
         vt(self.io.userdata, self.file) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -494,7 +497,7 @@ pub const ReadLink = struct {
     link_path: []const u8,
     buf: []u8,
     len: usize = 0,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, link_path: []const u8, buf: []u8) ReadLink {
         return .{ .work = Work.init(run), .io = io, .link_path = link_path, .buf = buf };
@@ -507,7 +510,7 @@ pub const ReadLink = struct {
             return;
         };
         self.len = vt(self.io.userdata, self.link_path, self.buf) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -525,7 +528,7 @@ pub const OpenDir = struct {
     io: Io,
     path: []const u8,
     dir: Handle = INVALID_HANDLE,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, path: []const u8) OpenDir {
         return .{ .work = Work.init(run), .io = io, .path = path };
@@ -538,7 +541,7 @@ pub const OpenDir = struct {
             return;
         };
         self.dir = vt(self.io.userdata, self.path) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -557,7 +560,7 @@ pub const ReadDirHandle = struct {
     dir: Handle,
     buf: []DirEntry,
     count: usize = 0,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, dir: Handle, buf: []DirEntry) ReadDirHandle {
         return .{ .work = Work.init(run), .io = io, .dir = dir, .buf = buf };
@@ -570,7 +573,7 @@ pub const ReadDirHandle = struct {
             return;
         };
         self.count = vt(self.io.userdata, self.dir, self.buf) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -612,7 +615,7 @@ pub const SetFilePermissions = struct {
     io: Io,
     file: Handle,
     mode: u32,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, file: Handle, mode: u32) SetFilePermissions {
         return .{ .work = Work.init(run), .io = io, .file = file, .mode = mode };
@@ -625,7 +628,7 @@ pub const SetFilePermissions = struct {
             return;
         };
         vt(self.io.userdata, self.file, self.mode) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -642,7 +645,7 @@ pub const SetFileOwner = struct {
     file: Handle,
     uid: u32,
     gid: u32,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, file: Handle, uid: u32, gid: u32) SetFileOwner {
         return .{ .work = Work.init(run), .io = io, .file = file, .uid = uid, .gid = gid };
@@ -655,7 +658,7 @@ pub const SetFileOwner = struct {
             return;
         };
         vt(self.io.userdata, self.file, self.uid, self.gid) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -672,7 +675,7 @@ pub const SetFileTimestamps = struct {
     file: Handle,
     atime_ns: i64,
     mtime_ns: i64,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, file: Handle, atime_ns: i64, mtime_ns: i64) SetFileTimestamps {
         return .{ .work = Work.init(run), .io = io, .file = file, .atime_ns = atime_ns, .mtime_ns = mtime_ns };
@@ -685,7 +688,7 @@ pub const SetFileTimestamps = struct {
             return;
         };
         vt(self.io.userdata, self.file, self.atime_ns, self.mtime_ns) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -701,7 +704,7 @@ pub const SetPermissions = struct {
     io: Io,
     path: []const u8,
     mode: u32,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, path: []const u8, mode: u32) SetPermissions {
         return .{ .work = Work.init(run), .io = io, .path = path, .mode = mode };
@@ -714,7 +717,7 @@ pub const SetPermissions = struct {
             return;
         };
         vt(self.io.userdata, self.path, self.mode) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -731,7 +734,7 @@ pub const SetOwner = struct {
     path: []const u8,
     uid: u32,
     gid: u32,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, path: []const u8, uid: u32, gid: u32) SetOwner {
         return .{ .work = Work.init(run), .io = io, .path = path, .uid = uid, .gid = gid };
@@ -744,7 +747,7 @@ pub const SetOwner = struct {
             return;
         };
         vt(self.io.userdata, self.path, self.uid, self.gid) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -761,7 +764,7 @@ pub const SetTimestamps = struct {
     path: []const u8,
     atime_ns: i64,
     mtime_ns: i64,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, path: []const u8, atime_ns: i64, mtime_ns: i64) SetTimestamps {
         return .{ .work = Work.init(run), .io = io, .path = path, .atime_ns = atime_ns, .mtime_ns = mtime_ns };
@@ -774,7 +777,7 @@ pub const SetTimestamps = struct {
             return;
         };
         vt(self.io.userdata, self.path, self.atime_ns, self.mtime_ns) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -790,7 +793,7 @@ pub const Access = struct {
     io: Io,
     path: []const u8,
     mode: u32,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, path: []const u8, mode: u32) Access {
         return .{ .work = Work.init(run), .io = io, .path = path, .mode = mode };
@@ -803,7 +806,7 @@ pub const Access = struct {
             return;
         };
         vt(self.io.userdata, self.path, self.mode) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -820,7 +823,7 @@ pub const RealPath = struct {
     path: []const u8,
     buf: []u8,
     len: usize = 0,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, path: []const u8, buf: []u8) RealPath {
         return .{ .work = Work.init(run), .io = io, .path = path, .buf = buf };
@@ -833,7 +836,7 @@ pub const RealPath = struct {
             return;
         };
         self.len = vt(self.io.userdata, self.path, self.buf) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -850,7 +853,7 @@ pub const HardLink = struct {
     io: Io,
     old_path: []const u8,
     new_path: []const u8,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(io: Io, old_path: []const u8, new_path: []const u8) HardLink {
         return .{ .work = Work.init(run), .io = io, .old_path = old_path, .new_path = new_path };
@@ -863,7 +866,7 @@ pub const HardLink = struct {
             return;
         };
         vt(self.io.userdata, self.old_path, self.new_path) catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }

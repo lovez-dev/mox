@@ -8,7 +8,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const root = @import("mox_io.zig");
 
 const is_windows = builtin.os.tag == .windows;
 const is_posix = !is_windows;
@@ -343,8 +342,8 @@ pub fn setMode(handle: Handle, mode: Mode) !void {
                 termios.iflag.INPCK = false;
                 termios.iflag.ISTRIP = false;
                 termios.oflag.OPOST = false;
-                termios.cc[@intFromEnum(std.posix.V.MIN)] = 1;
-                termios.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+                termios.cc[@backingInt(std.posix.V.MIN)] = 1;
+                termios.cc[@backingInt(std.posix.V.TIME)] = 0;
             },
             .cbreak => {
                 termios.lflag.ICANON = false;
@@ -370,7 +369,6 @@ pub fn isTty(handle: Handle) bool {
         return posix.isatty(handle);
     }
 }
-
 
 /// 造一对管道句柄，两端都保证不是控制台。
 /// Windows 用 CreatePipe，POSIX 用 pipe2；失败时返回 null 让测试跳过。

@@ -33,6 +33,8 @@ const is_linux = builtin.os.tag == .linux;
 // EINVAL 拒绝（std 把它映射成 `unreachable` → 进程直接 panic）。
 // 只把 Linux 的 syscall 绑定拿来用，就能既拿到 fork/execve 又不把 libc 拖进来。
 const sysc = if (is_windows) struct {} else std.c;
+const errors = @import("errors.zig");
+const sys = @import("sys.zig");
 const lx = if (is_linux) std.os.linux else struct {};
 
 pub const pid_t = if (is_windows) u32 else std.posix.pid_t;
@@ -162,7 +164,7 @@ pub const Wait = struct {
     work: Work,
     process: *Process,
     exit: ?Exit = null,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     pub fn init(process: *Process) Wait {
         return .{ .work = Work.init(run), .process = process };
@@ -171,7 +173,7 @@ pub const Wait = struct {
     fn run(w: *Work) void {
         const self: *Wait = @fieldParentPtr("work", w);
         self.exit = self.process.waitSync() catch |e| {
-            self.err = e;
+            self.err = errors.normalize(e);
             return;
         };
     }
@@ -600,26 +602,9 @@ fn resolveExe(alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
     return error.FileNotFound;
 }
 
-fn errnoToError(e: sysc.E) anyerror {
-    return switch (e) {
-        .ACCES => error.AccessDenied,
-        .AGAIN => error.WouldBlock,
-        .BADF => error.BadFileDescriptor,
-        .FAULT => error.BadAddress,
-        .INTR => error.Interrupted,
-        .INVAL => error.InvalidArgument,
-        .IO => error.InputOutput,
-        .MFILE => error.ProcessFdQuotaExceeded,
-        .NFILE => error.SystemFdQuotaExceeded,
-        .NOENT => error.FileNotFound,
-        .NOMEM => error.SystemResources,
-        .NOSYS => error.Unsupported,
-        .PERM => error.PermissionDenied,
-        .PIPE => error.BrokenPipe,
-        .CHILD => error.NoChildProcess,
-        .NAMETOOLONG => error.NameTooLong,
-        else => error.Unexpected,
-    };
+/// errno → 语义错误。转发到 `sys.zig`（全仓唯一的 errno 映射收口）。
+fn errnoToError(e: sysc.E) errors.Error {
+    return sys.fromErrno(e);
 }
 
 // ============================================================================

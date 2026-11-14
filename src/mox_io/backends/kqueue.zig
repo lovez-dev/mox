@@ -14,11 +14,15 @@
 const std = @import("std");
 const c = std.c;
 const builtin = @import("builtin");
-const root = @import("../mox_io.zig");
+const types = @import("../types.zig");
+const io_mod = @import("../io.zig");
+const completion = @import("../completion.zig");
+const loop_mod = @import("../loop.zig");
+const sys = @import("../sys.zig");
 const net = std.Io.net;
 
-const Handle = root.Handle;
-const INVALID_HANDLE = root.INVALID_HANDLE;
+const Handle = types.Handle;
+const INVALID_HANDLE = types.INVALID_HANDLE;
 
 const Kind = enum { recv, send, accept, connect, udp_recv, udp_send, watch, recvmsg, sendmsg };
 
@@ -30,7 +34,7 @@ const Pending = struct {
     ident: usize,
     filter: i16,
     kind: Kind,
-    scratch: *root.Scratch,
+    scratch: *types.Scratch,
     buf: []u8 = &.{},
     /// `udp_recv` 的源地址缓冲：指向调用方节点，随节点一起存活。
     from: []u8 = &.{},
@@ -40,16 +44,38 @@ const Pending = struct {
     /// `recvmsg`/`sendmsg` 的 iovec 来源：指向调用方节点的 bufs 切片。
     /// 只用 `?[]const []const u8` 一种形态，recvmsg 时由后端 `@constCast`。
     msg_bufs: ?[]const []const u8 = null,
+    /// 池内同方向 FIFO 链的下一个下标。
+    next: u32 = NO_PENDING,
+};
+
+const NO_PENDING: u32 = std.math.maxInt(u32);
+const MIN_SLOTS: usize = 64;
+
+/// 一个 fd 上的读 / 写两条过滤器链。fd 直接当数组下标，定位 O(1)——
+/// 与 epoll 后端一致，也对齐 libev `anfds[]`。
+const FdSlot = struct {
+    read: u32 = NO_PENDING,
+    write: u32 = NO_PENDING,
+    /// 过滤器当前是否已注册进 kqueue。`EV_ONESHOT` 事件到达即自动注销，
+    /// 此时置 false，同步重挂剩余方向。
+    read_armed: bool = false,
+    write_armed: bool = false,
 };
 
 const State = struct {
     alloc: std.mem.Allocator,
     kq: i32,
-    pending: std.ArrayListUnmanaged(Pending) = .empty,
+    /// fd → 两条链，O(1) 定位。
+    slots: []FdSlot = &.{},
+    /// 预分配 `Pending` 池 + 空闲链：submit 热路径零分配。
+    pool: []Pending = &.{},
+    free_head: u32 = NO_PENDING,
     events: std.ArrayListUnmanaged(c.Kevent) = .empty,
     /// 被取消的操作：立即合成一个完成包，让循环能回收节点。
-    cancelled: std.ArrayListUnmanaged(root.Ref) = .empty,
-    ref: root.Ref = undefined,
+    /// 用 head 游标消费，避免 `orderedRemove(0)` 的 O(n) 搬移。
+    cancelled: std.ArrayListUnmanaged(types.Ref) = .empty,
+    cancelled_head: usize = 0,
+    ref: types.Ref = undefined,
 };
 
 fn stateOf(userdata: ?*anyopaque) *State {
@@ -58,6 +84,128 @@ fn stateOf(userdata: ?*anyopaque) *State {
 
 fn fdOf(h: Handle) c.fd_t {
     return @intCast(h);
+}
+
+// ---- 池 / 链辅助 -----------------------------------------------------------
+
+fn slotFor(state: *State, fd: i32) ?*FdSlot {
+    if (fd < 0) return null;
+    const i: usize = @intCast(fd);
+    if (i >= state.slots.len) return null;
+    return &state.slots[i];
+}
+
+/// submit 路径用：按需扩容 slot 表（fd 号可能很大，如 accept 分配的 fd）。
+fn slotOf(state: *State, fd: i32) !*FdSlot {
+    const idx: usize = @intCast(fd);
+    if (idx >= state.slots.len) {
+        const old_len = state.slots.len;
+        var len = @max(old_len, MIN_SLOTS);
+        while (len <= idx) len *= 2;
+        const grown = if (old_len == 0)
+            try state.alloc.alloc(FdSlot, len)
+        else
+            try state.alloc.realloc(state.slots, len);
+        @memset(grown[old_len..], .{});
+        state.slots = grown;
+    }
+    return &state.slots[idx];
+}
+
+fn chainOf(slot: *FdSlot, filter: i16) *u32 {
+    return if (filter == c.EVFILT.READ) &slot.read else &slot.write;
+}
+
+fn armedOf(slot: *FdSlot, filter: i16) *bool {
+    return if (filter == c.EVFILT.READ) &slot.read_armed else &slot.write_armed;
+}
+
+fn allocPending(state: *State) !u32 {
+    if (state.free_head != NO_PENDING) {
+        const idx = state.free_head;
+        state.free_head = state.pool[idx].next;
+        return idx;
+    }
+    const old_len = state.pool.len;
+    const new_len = @max(old_len * 2, 64);
+    const grown = if (old_len == 0)
+        try state.alloc.alloc(Pending, new_len)
+    else
+        try state.alloc.realloc(state.pool, new_len);
+    state.pool = grown;
+    var i = old_len;
+    while (i < new_len - 1) : (i += 1) {
+        grown[i] = .{ .ident = 0, .filter = 0, .kind = .watch, .scratch = undefined, .next = @intCast(i + 1) };
+    }
+    grown[new_len - 1] = .{ .ident = 0, .filter = 0, .kind = .watch, .scratch = undefined, .next = NO_PENDING };
+    const first: u32 = @intCast(old_len);
+    state.free_head = if (old_len + 1 < new_len) first + 1 else NO_PENDING;
+    return first;
+}
+
+fn freePending(state: *State, idx: u32) void {
+    state.pool[idx].next = state.free_head;
+    state.free_head = idx;
+}
+
+/// 从链上摘掉指定 scratch 的节点；返回其池下标。
+fn removeFrom(state: *State, head: *u32, scratch: *types.Scratch) ?u32 {
+    var prev: u32 = NO_PENDING;
+    var cur = head.*;
+    while (cur != NO_PENDING) {
+        const nxt = state.pool[cur].next;
+        if (state.pool[cur].scratch == scratch) {
+            if (prev == NO_PENDING) head.* = nxt else state.pool[prev].next = nxt;
+            return cur;
+        }
+        prev = cur;
+        cur = nxt;
+    }
+    return null;
+}
+
+/// 按 fd 上剩余方向同步 kqueue 注册（一次 syscall 封顶）。
+fn syncArm(state: *State, fd: i32) void {
+    const slot = slotFor(state, fd) orelse return;
+    inline for (.{ c.EVFILT.READ, c.EVFILT.WRITE }) |filter| {
+        const chain = chainOf(slot, filter).*;
+        const armed = armedOf(slot, filter);
+        const want = chain != NO_PENDING;
+        if (want and !armed.*) {
+            evAdd(state, @intCast(fd), filter, c.EV.ONESHOT) catch return;
+            armed.* = true;
+        } else if (!want and armed.*) {
+            evDelete(state, @intCast(fd), filter);
+            armed.* = false;
+        }
+    }
+}
+
+/// 摘一个待办：放入池、并入对应方向链、按需注册过滤器。
+/// 失败（池满或 kevent 失败）时把刚入链的节点摘掉并归还，保持一致性。
+fn putPending(state: *State, p: Pending) !u32 {
+    const slot = try slotOf(state, @intCast(p.ident));
+    const idx = try allocPending(state);
+    state.pool[idx] = p;
+    state.pool[idx].next = NO_PENDING;
+    const head = chainOf(slot, p.filter);
+    // 追加到链尾，保证 FIFO。
+    if (head.* == NO_PENDING) {
+        head.* = idx;
+    } else {
+        var cur = head.*;
+        while (state.pool[cur].next != NO_PENDING) cur = state.pool[cur].next;
+        state.pool[cur].next = idx;
+    }
+    if (!armedOf(slot, p.filter).*) {
+        evAdd(state, p.ident, p.filter, c.EV.ONESHOT) catch |e| {
+            _ = removeFrom(state, head, p.scratch);
+            freePending(state, idx);
+            return e;
+        };
+        armedOf(slot, p.filter).* = true;
+    }
+    return idx;
 }
 
 // ---- kevent 辅助函数 -------------------------------------------------------
@@ -99,7 +247,8 @@ fn evDelete(state: *State, ident: usize, filter: i16) void {
 fn vtDeinit(userdata: ?*anyopaque) void {
     const state = stateOf(userdata);
     const alloc = state.alloc;
-    state.pending.deinit(alloc);
+    alloc.free(state.slots);
+    alloc.free(state.pool);
     state.events.deinit(alloc);
     state.cancelled.deinit(alloc);
     _ = c.close(state.kq);
@@ -119,7 +268,7 @@ fn vtAssociate(userdata: ?*anyopaque, socket: Handle, key: usize) anyerror!void 
     _ = key;
 }
 
-fn vtWatchFd(userdata: ?*anyopaque, fd: Handle, want: root.Ready, scratch: *root.Scratch) anyerror!?void {
+fn vtWatchFd(userdata: ?*anyopaque, fd: Handle, want: types.Ready, scratch: *types.Scratch) anyerror!?void {
     const state = stateOf(userdata);
     const ident: usize = @intCast(fdOf(fd));
     if (!want.read and !want.write) return error.NothingToWatch;
@@ -127,80 +276,172 @@ fn vtWatchFd(userdata: ?*anyopaque, fd: Handle, want: root.Ready, scratch: *root
     // 这里只挂第一条，完成时 `complete` 会按 filter 匹配；同时要两个方向的
     // 调用方应当用两个 `WatchFd` 节点。
     const filter: i16 = if (want.read) c.EVFILT.READ else c.EVFILT.WRITE;
-    try state.pending.append(state.alloc, .{
+    _ = try putPending(state, .{
         .ident = ident,
         .filter = filter,
         .kind = .watch,
         .scratch = scratch,
     });
-    try evAdd(state, ident, filter, c.EV.ONESHOT);
     return null;
 }
 
-fn vtRecv(userdata: ?*anyopaque, socket: Handle, buffer: []u8, scratch: *root.Scratch) anyerror!?usize {
+fn vtRecv(userdata: ?*anyopaque, socket: Handle, buffer: []u8, scratch: *types.Scratch) anyerror!?usize {
     const state = stateOf(userdata);
-    try state.pending.append(state.alloc, .{
+    _ = try putPending(state, .{
         .ident = socket,
         .filter = c.EVFILT.READ,
         .kind = .recv,
         .scratch = scratch,
         .buf = buffer,
     });
-    try evAdd(state, socket, c.EVFILT.READ, c.EV.ONESHOT);
     return null;
 }
 
-fn vtSend(userdata: ?*anyopaque, socket: Handle, bytes: []const u8, scratch: *root.Scratch) anyerror!?usize {
+fn vtSend(userdata: ?*anyopaque, socket: Handle, bytes: []const u8, scratch: *types.Scratch) anyerror!?usize {
     const state = stateOf(userdata);
     // send() 需要非 const 缓冲区；循环保证这些字节在操作期间存活。
-    try state.pending.append(state.alloc, .{
+    _ = try putPending(state, .{
         .ident = socket,
         .filter = c.EVFILT.WRITE,
         .kind = .send,
         .scratch = scratch,
         .buf = @constCast(bytes),
     });
-    try evAdd(state, socket, c.EVFILT.WRITE, c.EV.ONESHOT);
     return null;
 }
 
 fn vtClose(userdata: ?*anyopaque, socket: Handle) void {
-    _ = userdata;
-    _ = c.close(fdOf(socket));
+    closeImpl(userdata, socket) catch {};
+}
+
+/// 与 `vtClose` 相同的动作（摘掉 fd 上的在飞节点、注销 EVFILT 兴趣、
+/// 关闭 fd），但把 `close(2)` 的 errno 映射成具体错误。
+/// `EBADF` 说明句柄已失效（重复关闭 / 被别人关掉），其余归 `CloseFailed`。
+fn vtCloseChecked(userdata: ?*anyopaque, socket: Handle) anyerror!void {
+    return closeImpl(userdata, socket);
+}
+
+fn closeImpl(userdata: ?*anyopaque, socket: Handle) anyerror!void {
+    const state = stateOf(userdata);
+    const fd: i32 = @intCast(fdOf(socket));
+    // 该 fd 上所有在飞操作合成取消完成包，保证 Loop 能回收节点。
+    if (slotFor(state, fd)) |slot| {
+        var emitted: [64]*types.Scratch = undefined;
+        var emitted_len: usize = 0;
+        drainChain(state, &slot.read, &emitted, &emitted_len);
+        drainChain(state, &slot.write, &emitted, &emitted_len);
+        if (slot.read_armed) {
+            evDelete(state, @intCast(fd), c.EVFILT.READ);
+            slot.read_armed = false;
+        }
+        if (slot.write_armed) {
+            evDelete(state, @intCast(fd), c.EVFILT.WRITE);
+            slot.write_armed = false;
+        }
+    }
+    const rc = c.close(fd);
+    if (rc < 0) return switch (-rc) {
+        @as(isize, @intCast(@backingInt(c.E.BADF))) => error.NotOpen,
+        else => error.CloseFailed,
+    };
+}
+
+/// 把一条链上的节点逐个归还池，并为每个（去重的）scratch 投递一个取消
+/// 完成包。`emitted` 防止同一个 scratch 在两条链上重复投递。
+fn drainChain(state: *State, head: *u32, emitted: *[64]*types.Scratch, emitted_len: *usize) void {
+    var cur = head.*;
+    head.* = NO_PENDING;
+    while (cur != NO_PENDING) {
+        const nxt = state.pool[cur].next;
+        const scratch = state.pool[cur].scratch;
+        freePending(state, cur);
+        var dup = false;
+        for (emitted[0..emitted_len.*]) |e| {
+            if (e == scratch) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            if (emitted_len.* < emitted.len) {
+                emitted[emitted_len.*] = scratch;
+                emitted_len.* += 1;
+            }
+            queueCancel(state, scratch);
+        }
+        cur = nxt;
+    }
 }
 
 /// 取消：按 `scratch` 找到待办，撤销已注册的 oneshot 事件，
 /// 并合成一个失败完成包，保证循环一定能回收该节点。
-fn vtCancel(userdata: ?*anyopaque, socket: root.Handle, scratch: *root.Scratch) void {
-    _ = socket;
+fn vtCancel(userdata: ?*anyopaque, socket: types.Handle, scratch: *types.Scratch) void {
     const state = stateOf(userdata);
-    var i: usize = 0;
-    while (i < state.pending.items.len) : (i += 1) {
-        const p = state.pending.items[i];
-        if (p.scratch != scratch) continue;
-        _ = state.pending.orderedRemove(i);
-        evDelete(state, p.ident, p.filter);
-        state.cancelled.append(state.alloc, .{
-            .scratch = scratch,
-            .bytes = 0,
-            .failed = true,
-            .new_handle = root.INVALID_HANDLE,
-        }) catch {};
+    if (socket == INVALID_HANDLE) {
+        cancelAnywhere(state, scratch);
         return;
+    }
+    const fd: i32 = @intCast(fdOf(socket));
+    const slot = slotFor(state, fd) orelse {
+        cancelAnywhere(state, scratch);
+        return;
+    };
+    var found = false;
+    if (removeFrom(state, &slot.read, scratch)) |idx| {
+        freePending(state, idx);
+        found = true;
+    }
+    if (removeFrom(state, &slot.write, scratch)) |idx| {
+        freePending(state, idx);
+        found = true;
+    }
+    if (!found) {
+        cancelAnywhere(state, scratch);
+        return;
+    }
+    syncArm(state, fd);
+    queueCancel(state, scratch);
+}
+
+fn cancelAnywhere(state: *State, scratch: *types.Scratch) void {
+    for (state.slots, 0..) |*slot, idx| {
+        var found = false;
+        if (removeFrom(state, &slot.read, scratch)) |i| {
+            freePending(state, i);
+            found = true;
+        }
+        if (removeFrom(state, &slot.write, scratch)) |i| {
+            freePending(state, i);
+            found = true;
+        }
+        if (found) {
+            syncArm(state, @intCast(idx));
+            queueCancel(state, scratch);
+            return;
+        }
     }
 }
 
-fn vtAccept(userdata: ?*anyopaque, listen: Handle, accept_socket: Handle, addr_buf: []u8, scratch: *root.Scratch) anyerror!?usize {
+/// 完成包绝不静默丢弃：OOM 时 fail-fast，否则被取消的节点永远不回收。
+fn queueCancel(state: *State, scratch: *types.Scratch) void {
+    state.cancelled.append(state.alloc, .{
+        .scratch = scratch,
+        .bytes = 0,
+        .failed = true,
+        .new_handle = types.INVALID_HANDLE,
+    }) catch @panic("mox_io: OOM queueing cancelled completion (node would leak)");
+}
+
+fn vtAccept(userdata: ?*anyopaque, listen: Handle, accept_socket: Handle, addr_buf: []u8, scratch: *types.Scratch) anyerror!?usize {
     const state = stateOf(userdata);
     _ = c.close(fdOf(accept_socket)); // kernel allocates the fd for us
-    try state.pending.append(state.alloc, .{
+    _ = try putPending(state, .{
         .ident = listen,
         .filter = c.EVFILT.READ,
         .kind = .accept,
         .scratch = scratch,
         .buf = addr_buf,
     });
-    try evAdd(state, listen, c.EVFILT.READ, c.EV.ONESHOT);
     return null;
 }
 
@@ -210,18 +451,17 @@ fn vtUpdateAccept(userdata: ?*anyopaque, listen: Handle, accept_socket: Handle) 
     _ = accept_socket;
 }
 
-fn vtConnect(userdata: ?*anyopaque, socket: Handle, address: net.IpAddress, scratch: *root.Scratch) anyerror!void {
+fn vtConnect(userdata: ?*anyopaque, socket: Handle, address: net.IpAddress, scratch: *types.Scratch) anyerror!void {
     const state = stateOf(userdata);
     var storage: [128]u8 = undefined;
     const len = buildSockaddr(address, &storage);
     _ = c.connect(fdOf(socket), @ptrCast(@alignCast(&storage)), len); // EINPROGRESS expected
-    try state.pending.append(state.alloc, .{
+    _ = try putPending(state, .{
         .ident = socket,
         .filter = c.EVFILT.WRITE,
         .kind = .connect,
         .scratch = scratch,
     });
-    try evAdd(state, socket, c.EVFILT.WRITE, c.EV.ONESHOT);
 }
 
 fn vtUpdateConnect(userdata: ?*anyopaque, socket: Handle) void {
@@ -239,11 +479,11 @@ fn vtUdpRecv(
     buf: []u8,
     from: []u8,
     hdr: []usize,
-    scratch: *root.Scratch,
+    scratch: *types.Scratch,
 ) anyerror!void {
     _ = hdr;
     const state = stateOf(userdata);
-    try state.pending.append(state.alloc, .{
+    _ = try putPending(state, .{
         .ident = socket,
         .filter = c.EVFILT.READ,
         .kind = .udp_recv,
@@ -251,7 +491,6 @@ fn vtUdpRecv(
         .buf = buf,
         .from = from,
     });
-    try evAdd(state, socket, c.EVFILT.READ, c.EV.ONESHOT);
 }
 
 /// UDP 数据报发送：`sendto` 的 sockaddr 必须活到事件被处理，所以编进调用方
@@ -262,13 +501,13 @@ fn vtUdpSend(
     buf: []const u8,
     to: net.IpAddress,
     hdr: []usize,
-    scratch: *root.Scratch,
+    scratch: *types.Scratch,
 ) anyerror!void {
     const state = stateOf(userdata);
     if (hdr.len * @sizeOf(usize) < 128) return error.BufferTooSmall;
     const store: *[128]u8 = @ptrCast(@alignCast(hdr.ptr));
     const len = buildSockaddr(to, store);
-    try state.pending.append(state.alloc, .{
+    _ = try putPending(state, .{
         .ident = socket,
         .filter = c.EVFILT.WRITE,
         .kind = .udp_send,
@@ -277,18 +516,22 @@ fn vtUdpSend(
         .hdr = hdr,
         .hdr_len = len,
     });
-    try evAdd(state, socket, c.EVFILT.WRITE, c.EV.ONESHOT);
 }
 
 /// 一次 `kevent` 收集最多 64 个事件，逐个转成完成包后批量返回。
-fn vtWaitBatch(userdata: ?*anyopaque, timeout_ms: u32, refs: []root.Ref) anyerror!usize {
+fn vtWaitBatch(userdata: ?*anyopaque, timeout_ms: u32, refs: []types.Ref) anyerror!usize {
     const state = stateOf(userdata);
     var n: usize = 0;
 
     // 取消产生的合成完成包优先返回。
-    while (n < refs.len and state.cancelled.items.len != 0) {
-        refs[n] = state.cancelled.orderedRemove(0);
+    while (n < refs.len and state.cancelled_head < state.cancelled.items.len) {
+        refs[n] = state.cancelled.items[state.cancelled_head];
+        state.cancelled_head += 1;
         n += 1;
+    }
+    if (state.cancelled_head == state.cancelled.items.len) {
+        state.cancelled.clearRetainingCapacity();
+        state.cancelled_head = 0;
     }
     if (n != 0) return n;
 
@@ -315,18 +558,23 @@ fn vtWaitBatch(userdata: ?*anyopaque, timeout_ms: u32, refs: []root.Ref) anyerro
     return n;
 }
 
-fn complete(state: *State, ev: c.Kevent) ?root.Ref {
-    var i: usize = 0;
-    while (i < state.pending.items.len) : (i += 1) {
-        const p = state.pending.items[i];
-        if (p.ident != ev.ident or p.filter != ev.filter) continue;
-        _ = state.pending.orderedRemove(i);
-        return finishOne(state, p, ev.flags);
-    }
-    return null;
+fn complete(state: *State, ev: c.Kevent) ?types.Ref {
+    const slot = slotFor(state, @intCast(ev.ident)) orelse return null;
+    const head = chainOf(slot, ev.filter);
+    const idx = head.*;
+    if (idx == NO_PENDING) return null;
+    const p = state.pool[idx];
+    head.* = p.next;
+    // EV_ONESHOT 事件到达会注销该过滤器。
+    armedOf(slot, ev.filter).* = false;
+    const r = finishOne(state, p, ev.flags);
+    freePending(state, idx);
+    // 还有同方向待办就重挂；没有则保持注销。
+    syncArm(state, @intCast(ev.ident));
+    return r;
 }
 
-fn finishOne(state: *State, p: Pending, ev_flags: u16) root.Ref {
+fn finishOne(state: *State, p: Pending, ev_flags: u16) types.Ref {
     var res: isize = 0;
     switch (p.kind) {
         .recv => res = c.recv(fdOf(p.ident), p.buf.ptr, p.buf.len, 0),
@@ -373,7 +621,7 @@ fn finishOne(state: *State, p: Pending, ev_flags: u16) root.Ref {
         .watch => {
             // 不代收数据，只回填方向。`EVFILT.READ` 就绪 = 可读，
             // `EV_EOF` 表示对端关闭（此时读会拿到 0 字节）。
-            var r: root.Ready = .{};
+            var r: types.Ready = .{};
             if (p.filter == c.EVFILT.READ) r.read = true;
             if (p.filter == c.EVFILT.WRITE) r.write = true;
             if (ev_flags & c.EV.EOF != 0) r.hangup = true;
@@ -408,7 +656,7 @@ fn finishOne(state: *State, p: Pending, ev_flags: u16) root.Ref {
         .scratch = p.scratch,
         .bytes = if (res >= 0) @intCast(res) else 0,
         .failed = res < 0,
-        .new_handle = if (p.kind == .accept and res >= 0) @intCast(res) else root.INVALID_HANDLE,
+        .new_handle = if (p.kind == .accept and res >= 0) @intCast(res) else types.INVALID_HANDLE,
     };
     return state.ref;
 }
@@ -427,29 +675,26 @@ fn buildUnixSockaddr(path: []const u8, storage: *c.sockaddr.un) !c.socklen_t {
     return @intCast(@offsetOf(c.sockaddr.un, "path") + path.len + 1);
 }
 
-fn vtCreateUnix(userdata: ?*anyopaque) anyerror!root.Handle {
+fn vtCreateUnix(userdata: ?*anyopaque) anyerror!types.Handle {
     _ = userdata;
     return createSocket(@intCast(c.AF.UNIX), @intCast(c.SOCK.STREAM), 0);
 }
 
-fn vtBindUnix(userdata: ?*anyopaque, socket: root.Handle, path: []const u8) anyerror!void {
+fn vtBindUnix(userdata: ?*anyopaque, socket: types.Handle, path: []const u8) anyerror!void {
     _ = userdata;
     var sa: c.sockaddr.un = undefined;
     const len = try buildUnixSockaddr(path, &sa);
     if (c.bind(fdOf(socket), @ptrCast(&sa), len) != 0) {
-        return switch (std.c._errno().*) {
-            @backingInt(c.E.ADDRINUSE) => error.PathAlreadyExists,
-            else => error.BindFailed,
-        };
+        return sys.lastErrno();
     }
 }
 
-fn vtConnectUnix(userdata: ?*anyopaque, socket: root.Handle, path: []const u8, scratch: *root.Scratch) anyerror!?void {
+fn vtConnectUnix(userdata: ?*anyopaque, socket: types.Handle, path: []const u8, scratch: *types.Scratch) anyerror!?void {
     _ = userdata;
     var sa: c.sockaddr.un = undefined;
     const len = try buildUnixSockaddr(path, &sa);
     // 与 uring 一致：`sockaddr_un` 必须活到内核读完，塞进 `Scratch`。
-    if (len > @sizeOf(root.Scratch)) return error.NameTooLong;
+    if (len > @sizeOf(types.Scratch)) return error.NameTooLong;
     @memcpy(std.mem.asBytes(scratch)[0..len], std.mem.asBytes(&sa)[0..len]);
     // kqueue 后端没有异步 connect 的 SQE 可用，直接调阻塞 connect 后由
     // `evAdd` 注册写就绪；非阻塞 socket 上 connect 会返回 EINPROGRESS，
@@ -470,7 +715,7 @@ fn vtConnectUnix(userdata: ?*anyopaque, socket: root.Handle, path: []const u8, s
 
 fn vtSendFileTo(
     userdata: ?*anyopaque,
-    socket: root.Handle,
+    socket: types.Handle,
     path: []const u8,
     offset: u64,
     count: usize,
@@ -535,27 +780,27 @@ fn vtNotify(userdata: ?*anyopaque) void {
 
 // ---- 套接字 / 文件辅助操作（经 VTable 暴露给上层） ------------------------
 
-fn vtCreateSocket(userdata: ?*anyopaque, address: net.IpAddress) anyerror!root.Handle {
+fn vtCreateSocket(userdata: ?*anyopaque, address: net.IpAddress) anyerror!types.Handle {
     _ = userdata;
     return try createTcpSocket(address);
 }
 
-fn vtSetReuseAddress(userdata: ?*anyopaque, socket: root.Handle, on: bool) anyerror!void {
+fn vtSetReuseAddress(userdata: ?*anyopaque, socket: types.Handle, on: bool) anyerror!void {
     _ = userdata;
     try setReuseAddress(socket, on);
 }
 
-fn vtSetSockOpt(userdata: ?*anyopaque, socket: root.Handle, opt: root.SockOpt, value: u32) anyerror!void {
+fn vtSetSockOpt(userdata: ?*anyopaque, socket: types.Handle, opt: types.SockOpt, value: u32) anyerror!void {
     _ = userdata;
     try setSockOpt(socket, opt, value);
 }
 
-fn vtShutdownSend(userdata: ?*anyopaque, socket: root.Handle) anyerror!void {
+fn vtShutdownSend(userdata: ?*anyopaque, socket: types.Handle) anyerror!void {
     _ = userdata;
     try shutdownSend(socket);
 }
 
-fn vtShutdown(userdata: ?*anyopaque, socket: root.Handle, how: root.ShutdownHow) anyerror!void {
+fn vtShutdown(userdata: ?*anyopaque, socket: types.Handle, how: types.ShutdownHow) anyerror!void {
     _ = userdata;
     const flag: c_int = switch (how) {
         .read => c.SHUT.RD,
@@ -567,10 +812,10 @@ fn vtShutdown(userdata: ?*anyopaque, socket: root.Handle, how: root.ShutdownHow)
 
 fn vtSendMsg(
     userdata: ?*anyopaque,
-    socket: root.Handle,
+    socket: types.Handle,
     bufs: []const []const u8,
     hdr: []usize,
-    scratch: *root.Scratch,
+    scratch: *types.Scratch,
 ) anyerror!void {
     _ = hdr;
     // **不能同步 sendmsg**：socket 可能暂时写不进去，同步调用会把整个
@@ -578,42 +823,40 @@ fn vtSendMsg(
     // 正确做法与 `vtSend` 一致：注册 EVFILT.WRITE，就绪后在 reap 里
     // 同步执行那一次系统调用。
     const state = stateOf(userdata);
-    try state.pending.append(state.alloc, .{
+    _ = try putPending(state, .{
         .ident = socket,
         .filter = c.EVFILT.WRITE,
         .kind = .sendmsg,
         .scratch = scratch,
         .msg_bufs = bufs,
     });
-    try evAdd(state, socket, c.EVFILT.WRITE, c.EV.ONESHOT);
 }
 
 fn vtRecvMsg(
     userdata: ?*anyopaque,
-    socket: root.Handle,
+    socket: types.Handle,
     bufs: []const []u8,
     hdr: []usize,
-    scratch: *root.Scratch,
+    scratch: *types.Scratch,
 ) anyerror!void {
     _ = hdr;
     // 理由同 `vtSendMsg`：绝不能同步 recvmsg。
     const state = stateOf(userdata);
-    try state.pending.append(state.alloc, .{
+    _ = try putPending(state, .{
         .ident = socket,
         .filter = c.EVFILT.READ,
         .kind = .recvmsg,
         .scratch = scratch,
         .msg_bufs = @ptrCast(bufs),
     });
-    try evAdd(state, socket, c.EVFILT.READ, c.EV.ONESHOT);
 }
 
-fn vtBind(userdata: ?*anyopaque, socket: root.Handle, address: net.IpAddress) anyerror!void {
+fn vtBind(userdata: ?*anyopaque, socket: types.Handle, address: net.IpAddress) anyerror!void {
     _ = userdata;
     try bindSocket(socket, address);
 }
 
-fn vtListen(userdata: ?*anyopaque, socket: root.Handle, backlog: c_int) anyerror!void {
+fn vtListen(userdata: ?*anyopaque, socket: types.Handle, backlog: c_int) anyerror!void {
     _ = userdata;
     try listenSocket(socket, backlog);
 }
@@ -649,53 +892,53 @@ fn vtTruncateFile(userdata: ?*anyopaque, path: []const u8, size: u64) anyerror!v
     return truncateFile(path, size);
 }
 
-fn vtOpenFile(userdata: ?*anyopaque, path: []const u8, mode: root.FileMode) anyerror!root.Handle {
+fn vtOpenFile(userdata: ?*anyopaque, path: []const u8, mode: types.FileMode) anyerror!types.Handle {
     _ = userdata;
     return openFile(path, mode);
 }
 
-fn vtReadFileHandle(userdata: ?*anyopaque, file: root.Handle, offset: u64, buf: []u8) anyerror!usize {
+fn vtReadFileHandle(userdata: ?*anyopaque, file: types.Handle, offset: u64, buf: []u8) anyerror!usize {
     _ = userdata;
     return readFileHandle(file, offset, buf);
 }
 
-fn vtWriteFileHandle(userdata: ?*anyopaque, file: root.Handle, offset: u64, bytes: []const u8) anyerror!usize {
+fn vtWriteFileHandle(userdata: ?*anyopaque, file: types.Handle, offset: u64, bytes: []const u8) anyerror!usize {
     _ = userdata;
     return writeFileHandle(file, offset, bytes);
 }
 
-fn vtCloseFile(userdata: ?*anyopaque, file: root.Handle) void {
+fn vtCloseFile(userdata: ?*anyopaque, file: types.Handle) void {
     _ = userdata;
     closeFile(file);
 }
 
-fn vtStatFile(userdata: ?*anyopaque, file: root.Handle) anyerror!root.Stat {
+fn vtStatFile(userdata: ?*anyopaque, file: types.Handle) anyerror!types.Stat {
     _ = userdata;
     const st = try statFile(file);
     return .{ .kind = @fromBackingInt(@intCast(@backingInt(st.kind))), .size = st.size, .mtime_ms = st.mtime_ms };
 }
 
-fn vtSetFileSize(userdata: ?*anyopaque, file: root.Handle, size: u64) anyerror!void {
+fn vtSetFileSize(userdata: ?*anyopaque, file: types.Handle, size: u64) anyerror!void {
     _ = userdata;
     return setFileSize(file, size);
 }
 
-fn vtSyncFile(userdata: ?*anyopaque, file: root.Handle) anyerror!void {
+fn vtSyncFile(userdata: ?*anyopaque, file: types.Handle) anyerror!void {
     _ = userdata;
     return syncFile(file);
 }
 
-fn vtSetFilePermissions(userdata: ?*anyopaque, file: root.Handle, mode: u32) anyerror!void {
+fn vtSetFilePermissions(userdata: ?*anyopaque, file: types.Handle, mode: u32) anyerror!void {
     _ = userdata;
     return setFilePermissions(file, mode);
 }
 
-fn vtSetFileOwner(userdata: ?*anyopaque, file: root.Handle, uid: u32, gid: u32) anyerror!void {
+fn vtSetFileOwner(userdata: ?*anyopaque, file: types.Handle, uid: u32, gid: u32) anyerror!void {
     _ = userdata;
     return setFileOwner(file, uid, gid);
 }
 
-fn vtSetFileTimestamps(userdata: ?*anyopaque, file: root.Handle, atime_ns: i64, mtime_ns: i64) anyerror!void {
+fn vtSetFileTimestamps(userdata: ?*anyopaque, file: types.Handle, atime_ns: i64, mtime_ns: i64) anyerror!void {
     _ = userdata;
     return setFileTimestamps(file, atime_ns, mtime_ns);
 }
@@ -735,17 +978,17 @@ fn vtReadLink(userdata: ?*anyopaque, link_path: []const u8, buf: []u8) anyerror!
     return readLink(link_path, buf);
 }
 
-fn vtOpenDir(userdata: ?*anyopaque, path: []const u8) anyerror!root.Handle {
+fn vtOpenDir(userdata: ?*anyopaque, path: []const u8) anyerror!types.Handle {
     _ = userdata;
     return openDir(path);
 }
 
-fn vtReadDirHandle(userdata: ?*anyopaque, dir: root.Handle, buf: []root.DirEntry) anyerror!usize {
+fn vtReadDirHandle(userdata: ?*anyopaque, dir: types.Handle, buf: []types.DirEntry) anyerror!usize {
     _ = userdata;
     return readDirHandle(dir, buf);
 }
 
-fn vtCloseDir(userdata: ?*anyopaque, dir: root.Handle) void {
+fn vtCloseDir(userdata: ?*anyopaque, dir: types.Handle) void {
     _ = userdata;
     closeDir(dir);
 }
@@ -770,23 +1013,23 @@ fn vtSymLink(userdata: ?*anyopaque, target: []const u8, link_path: []const u8) a
     return symLink(target, link_path);
 }
 
-fn vtStatPath(userdata: ?*anyopaque, path: []const u8) anyerror!root.Stat {
+fn vtStatPath(userdata: ?*anyopaque, path: []const u8) anyerror!types.Stat {
     _ = userdata;
     const st = try stat(path);
     return .{ .kind = @fromBackingInt(@intCast(@backingInt(st.kind))), .size = st.size, .mtime_ms = st.mtime_ms };
 }
 
-fn vtListDir(userdata: ?*anyopaque, path: []const u8, buf: []root.DirEntry) anyerror!usize {
+fn vtListDir(userdata: ?*anyopaque, path: []const u8, buf: []types.DirEntry) anyerror!usize {
     _ = userdata;
     return listDir(path, @ptrCast(buf));
 }
 
 fn vtDeleteFile(userdata: ?*anyopaque, path: []const u8) anyerror!void {
     _ = userdata;
-    deleteFile(path);
+    try deleteFileChecked(path);
 }
 
-const vtable_storage: root.VTable = .{
+const vtable_storage: io_mod.VTable = .{
     .deinit = vtDeinit,
     .now = vtNow,
     .createSocket = vtCreateSocket,
@@ -849,30 +1092,46 @@ const vtable_storage: root.VTable = .{
     .connectUnix = vtConnectUnix,
     .sendFileTo = vtSendFileTo,
     .close = vtClose,
+    .closeChecked = vtCloseChecked,
     .waitBatch = vtWaitBatch,
     .notify = vtNotify,
 };
 
 /// 无配置入口，保留给旧调用点。
-pub fn create(alloc: std.mem.Allocator) !root.Io {
+pub fn create(alloc: std.mem.Allocator) !io_mod.Io {
     return createWith(alloc, .{});
 }
 
-/// 带配置的入口。当前这些后端不按 `queue_size` 缩放内部批量数组
-/// （epoll / kqueue 的就绪数组和 IOCP 的 OVERLAPPED_ENTRY 数组仍是编译期
-/// 定长），所以这里只接住参数、不改动行为。`Options` 的其余字段由 Loop
-/// 层消费。将来要缩放时在这个函数里改即可，上层不用动。
-pub fn createWith(alloc: std.mem.Allocator, opts: root.Options) !root.Io {
-    _ = opts;
-    return createBody(alloc);
+/// 带配置的入口：`queue_size` 决定 `pending` / `cancelled` 容器的**预分配**
+/// 容量（`events` 固定 64，对应 kevent 批量）。容器启动时一次备齐，
+/// 稳态 submit / reap / cancel 不再 malloc。
+pub fn createWith(alloc: std.mem.Allocator, opts: io_mod.Options) !io_mod.Io {
+    return createBody(alloc, opts.queue_size);
 }
 
-fn createBody(alloc: std.mem.Allocator) !root.Io {
+fn createBody(alloc: std.mem.Allocator, queue_size: u16) !io_mod.Io {
     const state = try alloc.create(State);
     errdefer alloc.destroy(state);
     const kq = c.kqueue();
     if (kq < 0) return error.KqueueFailed;
     state.* = .{ .alloc = alloc, .kq = kq };
+    // 按在飞窗口预分配容器：稳态 submit / reap / cancel 只写已分配内存。
+    const cap: usize = @max(@as(usize, queue_size) * 4, MIN_SLOTS);
+    state.slots = try alloc.alloc(FdSlot, cap);
+    @memset(state.slots, .{});
+    state.pool = try alloc.alloc(Pending, cap);
+    var pi: usize = 0;
+    while (pi < cap - 1) : (pi += 1) state.pool[pi] = .{ .ident = 0, .filter = 0, .kind = .watch, .scratch = undefined, .next = @intCast(pi + 1) };
+    state.pool[cap - 1] = .{ .ident = 0, .filter = 0, .kind = .watch, .scratch = undefined, .next = NO_PENDING };
+    state.free_head = 0;
+    errdefer {
+        state.events.deinit(alloc);
+        state.cancelled.deinit(alloc);
+        alloc.free(state.slots);
+        alloc.free(state.pool);
+    }
+    state.events.ensureTotalCapacity(alloc, 64) catch return error.SetupFailed;
+    state.cancelled.ensureTotalCapacity(alloc, cap) catch return error.SetupFailed;
     // 必须先在这个 kq 上注册 `EVFILT_USER`，`vtNotify` 才能用它唤醒
     // `waitBatch`。没有这一步，notify 会以 ENOENT 失败且被丢弃 —— 跨线程
     // `submit` 与 `Work` 完成就再也叫不醒循环，表现为整个进程挂死。
@@ -884,7 +1143,10 @@ fn createBody(alloc: std.mem.Allocator) !root.Io {
         .data = 0,
         .udata = 0,
     }};
-    if (c.kevent(kq, &reg, 1, undefined, 0, null) < 0) return error.KqueueFailed;
+    if (c.kevent(kq, &reg, 1, undefined, 0, null) < 0) {
+        _ = c.close(kq);
+        return error.KqueueFailed; // errdefer 回收 slots/pool/state
+    }
     return .{ .userdata = state, .vtable = &vtable_storage };
 }
 
@@ -961,7 +1223,7 @@ pub fn createTcpSocket(address: net.IpAddress) !Handle {
 /// 语义选项 → BSD `setsockopt`。`TCP_NODELAY` 在 `c.TCP` 下；
 /// 保活空闲秒数在 Darwin/FreeBSD 上叫 `TCP_KEEPIDLE`，`SO_KEEPALIVE`
 /// 需先打开才有意义，这里一并置位。
-pub fn setSockOpt(h: Handle, opt: root.SockOpt, value: u32) !void {
+pub fn setSockOpt(h: Handle, opt: types.SockOpt, value: u32) !void {
     var v: c_int = @intCast(value);
     const fd = fdOf(h);
     switch (opt) {
@@ -1198,11 +1460,7 @@ pub fn removeDir(path: []const u8) !void {
     var buf: [1024]u8 = undefined;
     const z = try zpath(path, &buf);
     if (c.rmdir(z.ptr) == 0) return;
-    return switch (std.c._errno().*) {
-        @backingInt(std.c.E.NOTEMPTY) => error.DirNotEmpty,
-        @backingInt(std.c.E.NOENT) => error.FileNotFound,
-        else => error.RemoveDirFailed,
-    };
+    return sys.lastErrno();
 }
 
 pub fn rename(old_path: []const u8, new_path: []const u8) !void {
@@ -1211,11 +1469,7 @@ pub fn rename(old_path: []const u8, new_path: []const u8) !void {
     const o = try zpath(old_path, &obuf);
     const n = try zpath(new_path, &nbuf);
     if (c.rename(o.ptr, n.ptr) == 0) return;
-    return switch (std.c._errno().*) {
-        @backingInt(std.c.E.XDEV) => error.CrossDevice,
-        @backingInt(std.c.E.NOENT) => error.FileNotFound,
-        else => error.RenameFailed,
-    };
+    return sys.lastErrno();
 }
 
 pub fn symLink(target: []const u8, link_path: []const u8) !void {
@@ -1224,10 +1478,7 @@ pub fn symLink(target: []const u8, link_path: []const u8) !void {
     const t = try zpath(target, &tbuf);
     const l = try zpath(link_path, &lbuf);
     if (c.symlink(t.ptr, l.ptr) == 0) return;
-    return switch (std.c._errno().*) {
-        @backingInt(std.c.E.EXIST) => error.PathAlreadyExists,
-        else => error.SymLinkFailed,
-    };
+    return sys.lastErrno();
 }
 
 /// 取路径元数据。`c.stat` 跟随符号链接（与 `stat(1)` 一致）。
@@ -1236,10 +1487,7 @@ pub fn stat(path: []const u8) !Stat {
     const z = try zpath(path, &buf);
     var st: c.Stat = undefined;
     if (c.stat(z.ptr, &st) != 0) {
-        return switch (std.c._errno().*) {
-            @backingInt(std.c.E.NOENT) => error.FileNotFound,
-            else => error.StatFailed,
-        };
+        return sys.lastErrno();
     }
     const fmt: u32 = @intCast(st.mode & c.S.IFMT);
     const kind: FileKind = if (fmt == c.S.IFREG)
@@ -1291,10 +1539,19 @@ pub fn listDir(path: []const u8, buf: []DirEntry) !usize {
     return count;
 }
 
+/// 清理用 void 版本，专为 `defer`。
 pub fn deleteFile(path: []const u8) void {
+    deleteFileChecked(path) catch {};
+}
+
+pub fn deleteFileChecked(path: []const u8) !void {
     var zbuf: [1024]u8 = undefined;
-    const z = zpath(path, &zbuf) catch return;
-    _ = c.unlink(z.ptr);
+    const z = try zpath(path, &zbuf);
+    if (c.unlink(z.ptr) < 0) {
+        const e = sys.lastErrnoValue();
+        if (e == .NOENT) return; // 幂等：文件已不存在视为成功
+        return sys.fromErrno(e);
+    }
 }
 
 /// 从 `offset` 处读入 `buf`，返回实际读到的字节数（文件尾会短读）。
@@ -1345,7 +1602,7 @@ pub fn truncateFile(path: []const u8, size: u64) !void {
 // BSD/Darwin 的 pread/pwrite 不移动文件偏移，多读者可共用同一 fd。
 
 /// 打开文件并返回句柄（fd）。
-pub fn openFile(path: []const u8, mode: root.FileMode) !root.Handle {
+pub fn openFile(path: []const u8, mode: types.FileMode) !types.Handle {
     var zbuf: [1024]u8 = undefined;
     const z = try zpath(path, &zbuf);
     const flags: c.O = switch (mode) {
@@ -1360,7 +1617,7 @@ pub fn openFile(path: []const u8, mode: root.FileMode) !root.Handle {
         return switch (std.posix.errno(@as(isize, fd))) {
             .NOENT => error.FileNotFound,
             .ACCES => error.AccessDenied,
-            .ISDIR => error.IsDir,
+            .ISDIR => error.IsDirectory,
             .NAMETOOLONG => error.NameTooLong,
             else => error.OpenFailed,
         };
@@ -1369,7 +1626,7 @@ pub fn openFile(path: []const u8, mode: root.FileMode) !root.Handle {
 }
 
 /// 从 `offset` 读入 `buf`。返回实际读到的字节数；文件尾短读不报错。
-pub fn readFileHandle(file: root.Handle, offset: u64, buf: []u8) !usize {
+pub fn readFileHandle(file: types.Handle, offset: u64, buf: []u8) !usize {
     const fd: c.fd_t = @intCast(file);
     var total: usize = 0;
     while (total < buf.len) {
@@ -1382,7 +1639,7 @@ pub fn readFileHandle(file: root.Handle, offset: u64, buf: []u8) !usize {
 }
 
 /// 从 `offset` 写入全部 `bytes`。返回写入的字节数。
-pub fn writeFileHandle(file: root.Handle, offset: u64, bytes: []const u8) !usize {
+pub fn writeFileHandle(file: types.Handle, offset: u64, bytes: []const u8) !usize {
     const fd: c.fd_t = @intCast(file);
     var total: usize = 0;
     while (total < bytes.len) {
@@ -1395,7 +1652,7 @@ pub fn writeFileHandle(file: root.Handle, offset: u64, bytes: []const u8) !usize
 }
 
 /// 关闭句柄。重复关闭或无效句柄不报错（幂等）。
-pub fn closeFile(file: root.Handle) void {
+pub fn closeFile(file: types.Handle) void {
     const fd: c.fd_t = @intCast(file);
     if (fd >= 0) _ = c.close(fd);
 }
@@ -1403,7 +1660,7 @@ pub fn closeFile(file: root.Handle) void {
 // ---- 句柄级元数据与同步（阶段 B）------------------------------------------
 
 /// 取句柄元数据。`fstat` 直接作用于 fd，不重新解析路径。
-pub fn statFile(file: root.Handle) !Stat {
+pub fn statFile(file: types.Handle) !Stat {
     const fd: c.fd_t = @intCast(file);
     var st: c.Stat = undefined;
     if (c.fstat(fd, &st) != 0) {
@@ -1431,13 +1688,13 @@ pub fn statFile(file: root.Handle) !Stat {
 }
 
 /// 把句柄对应文件截断到 `size` 字节。
-pub fn setFileSize(file: root.Handle, size: u64) !void {
+pub fn setFileSize(file: types.Handle, size: u64) !void {
     const fd: c.fd_t = @intCast(file);
     if (c.ftruncate(fd, @intCast(size)) < 0) return error.TruncateFailed;
 }
 
 /// 把缓冲内容刷到磁盘。`fsync` 在 BSD/Darwin 上同时保证数据与元数据。
-pub fn syncFile(file: root.Handle) !void {
+pub fn syncFile(file: types.Handle) !void {
     const fd: c.fd_t = @intCast(file);
     if (c.fsync(fd) != 0) return error.SyncFailed;
 }
@@ -1445,19 +1702,19 @@ pub fn syncFile(file: root.Handle) !void {
 // ---- 元数据写入、路径解析与硬链接（阶段 F）--------------------------------
 
 /// 改权限位（`fchmod`）。`mode` 是 POSIX 权限位。
-pub fn setFilePermissions(file: root.Handle, mode: u32) !void {
+pub fn setFilePermissions(file: types.Handle, mode: u32) !void {
     const fd: c.fd_t = @intCast(file);
     if (c.fchmod(fd, @intCast(mode)) != 0) return error.SetPermissionsFailed;
 }
 
 /// 改属主（`fchown`）。
-pub fn setFileOwner(file: root.Handle, uid: u32, gid: u32) !void {
+pub fn setFileOwner(file: types.Handle, uid: u32, gid: u32) !void {
     const fd: c.fd_t = @intCast(file);
     if (c.fchown(fd, uid, gid) != 0) return error.SetOwnerFailed;
 }
 
 /// 改时间戳（`futimens`）。时间是 Unix 纪元纳秒。
-pub fn setFileTimestamps(file: root.Handle, atime_ns: i64, mtime_ns: i64) !void {
+pub fn setFileTimestamps(file: types.Handle, atime_ns: i64, mtime_ns: i64) !void {
     const fd: c.fd_t = @intCast(file);
     const times = [_]c.timespec{
         .{ .sec = @divFloor(atime_ns, 1_000_000_000), .nsec = @mod(atime_ns, 1_000_000_000) },
@@ -1553,7 +1810,7 @@ pub fn readLink(link_path: []const u8, buf: []u8) !usize {
 }
 
 /// 打开目录拿 fd。
-pub fn openDir(path: []const u8) !root.Handle {
+pub fn openDir(path: []const u8) !types.Handle {
     var zbuf: [1024]u8 = undefined;
     const z = try zpath(path, &zbuf);
     // 直接 `opendir` 并把 `DIR*` 本身当句柄：`readdir` 是逐条推进的
@@ -1564,7 +1821,7 @@ pub fn openDir(path: []const u8) !root.Handle {
         return switch (std.posix.errno(@as(isize, -1))) {
             .NOENT => error.FileNotFound,
             .ACCES => error.AccessDenied,
-            .NOTDIR => error.NotDir,
+            .NOTDIR => error.NotDirectory,
             else => error.OpenFailed,
         };
     };
@@ -1577,7 +1834,7 @@ pub fn openDir(path: []const u8) !root.Handle {
 /// 维护在堆上，跨 `readDirHandle` 调用持续有效。因此不存在 Linux
 /// `getdents64` 那种「整批前移、缓冲装不下就丢」的问题，也不需要任何
 /// 偏移回退技巧。
-pub fn readDirHandle(dir: root.Handle, buf: []root.DirEntry) !usize {
+pub fn readDirHandle(dir: types.Handle, buf: []types.DirEntry) !usize {
     if (buf.len == 0) return 0;
     const d: *c.DIR = @ptrFromInt(dir);
 
@@ -1597,11 +1854,10 @@ pub fn readDirHandle(dir: root.Handle, buf: []root.DirEntry) !usize {
 }
 
 /// 关闭目录句柄。幂等（同一实例重复调用由节点层保证）。
-pub fn closeDir(dir: root.Handle) void {
+pub fn closeDir(dir: types.Handle) void {
     const d: *c.DIR = @ptrFromInt(dir);
     _ = c.closedir(d);
 }
-
 
 test "kqueue backend type-checks end to end" {
     // 强制分析整个后端（根测试文件若无 test 块则什么也不分析）。
@@ -1623,4 +1879,125 @@ test "kqueue backend type-checks end to end" {
     _ = writeFileAll;
     _ = deleteFile;
     _ = &vtable_storage;
+}
+
+// ---- 真机回归：fd-slot 表的全双工 / 同方向多 pending ----------------------
+// 只在 macOS / FreeBSD 真机上跑（CI 的 macos-latest）；其它平台只做编译校验。
+// 这两个用例验证新的 slots[] + FIFO 链 + ONESHOT 重挂逻辑，旧实现的
+// "同 filter 只留一个 pending" 会直接丢节点。
+
+const can_run_runtime = builtin.os.tag == .macos or builtin.os.tag == .freebsd;
+
+fn kqPair() ![2]i32 {
+    var fds: [2]i32 = undefined;
+    if (c.socketpair(@intCast(c.AF.UNIX), @intCast(c.SOCK.STREAM), 0, &fds) < 0)
+        return error.SocketPairFailed;
+    return fds;
+}
+
+test "kqueue: 同一 fd 全双工 recv+send 不丢方向" {
+    if (!can_run_runtime) return error.SkipZigTest;
+    var l = loop_mod.Loop.init(try create(std.testing.allocator));
+    defer l.deinit();
+
+    const pair = try kqPair();
+    defer _ = c.close(pair[0]);
+    defer _ = c.close(pair[1]);
+
+    const Ctx = struct {
+        var recv_done = false;
+        var send_done = false;
+        var recv_buf: [8]u8 = undefined;
+        var recv_node: completion.NetRecv = undefined;
+        var send_node: completion.NetSend = undefined;
+        var peer: i32 = 0;
+
+        fn onRecv(lp: *loop_mod.Loop, cc: *completion.Completion) void {
+            const r: *completion.NetRecv = @fieldParentPtr("c", cc);
+            recv_done = r.c.err == null and r.c.bytes == 3;
+            if (recv_done) tryStop(lp);
+        }
+        fn onSend(lp: *loop_mod.Loop, cc: *completion.Completion) void {
+            const s: *completion.NetSend = @fieldParentPtr("c", cc);
+            send_done = s.c.err == null and s.c.bytes == 3;
+            if (send_done) tryStop(lp);
+        }
+        fn tryStop(lp: *loop_mod.Loop) void {
+            if (recv_done and send_done) lp.stop();
+        }
+    };
+    Ctx.recv_done = false;
+    Ctx.send_done = false;
+    Ctx.peer = pair[1];
+
+    Ctx.recv_node = completion.NetRecv.init(@intCast(pair[0]), &Ctx.recv_buf);
+    Ctx.recv_node.c.callback = &Ctx.onRecv;
+    Ctx.send_node = completion.NetSend.init(@intCast(pair[0]), "abc");
+    Ctx.send_node.c.callback = &Ctx.onSend;
+    l.add(&Ctx.recv_node.c);
+    l.add(&Ctx.send_node.c);
+
+    const Writer = struct {
+        fn run(fd: i32) void {
+            const ts: c.timespec = .{ .sec = 0, .nsec = 20 * 1_000_000 };
+            _ = c.nanosleep(&ts, null);
+            _ = c.write(fd, "xyz", 3);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Writer.run, .{Ctx.peer});
+    defer t.join();
+
+    var guard = completion.Timer.init(2000);
+    guard.c.callback = struct {
+        fn cb(lp: *loop_mod.Loop, cc: *completion.Completion) void {
+            _ = cc;
+            lp.stop();
+        }
+    }.cb;
+    l.add(&guard.c);
+    try l.run();
+    try std.testing.expect(Ctx.send_done);
+    try std.testing.expect(Ctx.recv_done);
+    try std.testing.expectEqualStrings("xyz", Ctx.recv_buf[0..3]);
+}
+
+test "kqueue: 同一 fd 同方向多个 recv 依次完成" {
+    if (!can_run_runtime) return error.SkipZigTest;
+    const n: usize = 4;
+    var l = loop_mod.Loop.init(try create(std.testing.allocator));
+    defer l.deinit();
+
+    const pair = try kqPair();
+    defer _ = c.close(pair[0]);
+    defer _ = c.close(pair[1]);
+    _ = c.write(pair[1], "abcd", n);
+
+    const Ctx = struct {
+        var done: usize = 0;
+        var bufs: [n][1]u8 = undefined;
+        var nodes: [n]completion.NetRecv = undefined;
+
+        fn onRecv(lp: *loop_mod.Loop, cc: *completion.Completion) void {
+            const r: *completion.NetRecv = @fieldParentPtr("c", cc);
+            if (r.c.err == null and r.c.bytes == 1) done += 1;
+            if (done == n) lp.stop();
+        }
+    };
+    Ctx.done = 0;
+    for (&Ctx.nodes, 0..) |*node, i| {
+        node.* = completion.NetRecv.init(@intCast(pair[0]), &Ctx.bufs[i]);
+        node.c.callback = &Ctx.onRecv;
+        l.add(&node.c);
+    }
+
+    var guard = completion.Timer.init(2000);
+    guard.c.callback = struct {
+        fn cb(lp: *loop_mod.Loop, cc: *completion.Completion) void {
+            _ = cc;
+            lp.stop();
+        }
+    }.cb;
+    l.add(&guard.c);
+    try l.run();
+    try std.testing.expectEqual(@as(usize, n), Ctx.done);
 }

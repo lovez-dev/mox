@@ -15,6 +15,13 @@ pub const TimerQueue = struct {
         self.* = .{ .allocator = allocator };
     }
 
+    /// 启动时按在飞窗口预分配堆容量：稳态 submit 永不 malloc。
+    pub fn initWithCapacity(self: *TimerQueue, allocator: std.mem.Allocator, capacity: usize) void {
+        self.* = .{ .allocator = allocator };
+        self.items.ensureTotalCapacity(allocator, capacity) catch
+            @panic("mox_io: OOM pre-allocating timer heap");
+    }
+
     pub fn deinit(self: *TimerQueue) void {
         self.items.deinit(self.allocator);
         self.* = .{ .allocator = self.allocator };
@@ -34,7 +41,10 @@ pub const TimerQueue = struct {
 
     /// 插入一个定时器。
     pub fn add(self: *TimerQueue, c: *Completion) void {
-        self.items.append(self.allocator, c) catch return;
+        // 定时器丢一个就是「回调永不触发 / 超时永远不生效」：不能像旧实现
+        // 那样 catch return 静默吞掉 OOM。预分配后正常路径不会走到扩容。
+        self.items.append(self.allocator, c) catch
+            @panic("mox_io: OOM adding timer (fire-exactly-once violated)");
         var i = self.items.items.len - 1;
         c.heap_index = i;
         while (i > 0) {

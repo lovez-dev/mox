@@ -9,7 +9,9 @@
 //! 真正的后端差异只在 `create()` 返回的 `Io.vtable` 里。
 
 const std = @import("std");
-const root = @import("../mox_io.zig");
+const types = @import("../types.zig");
+const io_mod = @import("../io.zig");
+const completion = @import("../completion.zig");
 const uring = @import("uring.zig");
 const epoll = @import("epoll.zig");
 
@@ -34,6 +36,7 @@ pub const fileSize = uring.fileSize;
 pub const readFileInto = uring.readFileInto;
 pub const writeFileAll = uring.writeFileAll;
 pub const deleteFile = uring.deleteFile;
+pub const deleteFileChecked = uring.deleteFileChecked;
 pub const readFileAt = uring.readFileAt;
 pub const appendFile = uring.appendFile;
 pub const truncateFile = uring.truncateFile;
@@ -46,13 +49,13 @@ pub var chosen: Choice = .uring;
 /// 正常用户不用管；这是进程级变量，只在 `open()` 时读一次，不在热路径。
 pub var forced: ?Choice = null;
 
-pub fn create(alloc: std.mem.Allocator) !root.Io {
+pub fn create(alloc: std.mem.Allocator) !io_mod.Io {
     return createWith(alloc, .{});
 }
 
 /// 带配置的入口。`Options.backend` 覆盖进程级 `forced`；两者都没设时
 /// 优先 io_uring，setup 失败自动回落 epoll。
-pub fn createWith(alloc: std.mem.Allocator, opts: root.Options) !root.Io {
+pub fn createWith(alloc: std.mem.Allocator, opts: io_mod.Options) !io_mod.Io {
     const force_epoll = if (opts.backend) |b| switch (b) {
         .epoll => true,
         .uring => false,

@@ -2,14 +2,16 @@
 //!
 //! `Callback` 的签名带 `*Loop`，因此本文件与 `loop.zig` 互相 import；
 //! 两边都只持有指针，Zig 的惰性分析下完全合法。
-
 const std = @import("std");
-const root = @import("mox_io.zig");
+const types = @import("types.zig");
+const errors = @import("errors.zig");
 const Loop = @import("loop.zig").Loop;
 
-const Handle = root.Handle;
-const INVALID_HANDLE = root.INVALID_HANDLE;
-const Scratch = root.Scratch;
+const Handle = types.Handle;
+const INVALID_HANDLE = types.INVALID_HANDLE;
+const Scratch = types.Scratch;
+const ShutdownHow = types.ShutdownHow;
+const Ready = types.Ready;
 
 pub const Callback = *const fn (loop: *Loop, c: *Completion) void;
 
@@ -50,7 +52,7 @@ pub const Completion = struct {
     callback: ?Callback = null,
 
     /// 操作完成时回填。
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
     bytes: usize = 0,
 
     /// 关联的套接字。`timer` / `work` 为 `INVALID_HANDLE`。
@@ -86,29 +88,6 @@ pub const Completion = struct {
 ///
 /// 用位标志而不是枚举，是因为同一个 fd 可能同时可读可写；调用方一次就能
 /// 拿到全部信息，不必猜。
-pub const Ready = packed struct(u8) {
-    read: bool = false,
-    write: bool = false,
-    /// 对端已关闭 / 出错。多数平台会与 read 同时置位，调用方读一次拿到 EOF。
-    /// 不叫 `error`：那是 Zig 关键字，字段名不能用它。
-    failed: bool = false,
-    hangup: bool = false,
-    _pad: u4 = 0,
-
-    pub fn bits(self: Ready) u8 {
-        return @bitCast(self);
-    }
-
-    pub fn fromBits(v: u8) Ready {
-        return @bitCast(v);
-    }
-
-    /// 任意方向就绪（`error` / `hangup` 也算，否则调用方会永远等下去）。
-    pub fn any(self: Ready) bool {
-        return self.read or self.write or self.failed or self.hangup;
-    }
-};
-
 /// 把任意 fd（管道、串口、stdin）挂进事件循环等就绪。
 ///
 /// 与 `NetRecv` / `NetSend` 的区别：那两个**替你收发**并回填字节数，本节点
@@ -127,7 +106,7 @@ pub const WatchFd = struct {
     ready: Ready = .{},
 
     pub fn init(fd: Handle, want: Ready) WatchFd {
-        return .{ .fd = fd, .want = want };
+        return .{ .c = .{ .op = .watch_fd, .socket = fd }, .fd = fd, .want = want };
     }
 };
 
@@ -151,6 +130,7 @@ pub const NetPoll = struct {
 
     pub fn init(socket: Handle, event: Event) NetPoll {
         return .{
+            .c = .{ .op = .net_poll, .socket = socket },
             .socket = socket,
             .want = switch (event) {
                 .recv => .{ .read = true },
@@ -427,7 +407,7 @@ pub const NetSendMsg = struct {
     sent: usize = 0,
 
     pub fn init(socket: Handle, bufs: []const []const u8) NetSendMsg {
-        return .{ .socket = socket, .bufs = bufs };
+        return .{ .c = .{ .op = .net_sendmsg, .socket = socket }, .socket = socket, .bufs = bufs };
     }
 
     pub fn getResult(self: *const NetSendMsg) !usize {
@@ -451,7 +431,7 @@ pub const NetRecvMsg = struct {
     received: usize = 0,
 
     pub fn init(socket: Handle, bufs: []const []u8) NetRecvMsg {
-        return .{ .socket = socket, .bufs = bufs };
+        return .{ .c = .{ .op = .net_recvmsg, .socket = socket }, .socket = socket, .bufs = bufs };
     }
 
     pub fn getResult(self: *const NetRecvMsg) !usize {
@@ -467,10 +447,10 @@ pub const NetRecvMsg = struct {
 pub const NetShutdown = struct {
     c: Completion = .{ .op = .net_shutdown },
     socket: Handle = INVALID_HANDLE,
-    how: root.ShutdownHow,
+    how: ShutdownHow,
 
-    pub fn init(socket: Handle, how: root.ShutdownHow) NetShutdown {
-        return .{ .socket = socket, .how = how };
+    pub fn init(socket: Handle, how: ShutdownHow) NetShutdown {
+        return .{ .c = .{ .op = .net_shutdown, .socket = socket }, .socket = socket, .how = how };
     }
 
     pub fn getResult(self: *const NetShutdown) !void {

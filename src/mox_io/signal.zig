@@ -25,6 +25,7 @@
 //! - Windows 返回 `error.Unsupported`。
 
 const std = @import("std");
+const errors = @import("errors.zig");
 const builtin = @import("builtin");
 const Work = @import("completion.zig").Work;
 
@@ -92,7 +93,7 @@ pub const Signal = struct {
     read_fd: i32 = -1,
     /// 捕获到的信号编号；`null` 表示还没收到或出错。
     received: ?u8 = null,
-    err: ?anyerror = null,
+    err: ?errors.Error = null,
 
     /// 订阅 `sig`。成功后该信号由本模块接管，进程不会再因它默认终止。
     pub fn init(sig: u8) anyerror!Signal {
@@ -186,7 +187,10 @@ pub const Signal = struct {
             return;
         }
         // 哨兵字节（0 由 deinit 写入）：主动中止，非真实信号到达。
-        if (byte[0] == 0) { self.err = error.Aborted; return; }
+        if (byte[0] == 0) {
+            self.err = error.Aborted;
+            return;
+        }
         self.received = self.sig;
     }
 

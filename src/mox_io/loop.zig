@@ -4,17 +4,19 @@
 //! 分别委托给 `timer.zig` / `queue.zig` / `pool.zig`。
 const std = @import("std");
 const net = std.Io.net;
-const root = @import("mox_io.zig");
+const types = @import("types.zig");
+const io_mod = @import("io.zig");
 const completion = @import("completion.zig");
 const queue_mod = @import("queue.zig");
 const timer_mod = @import("timer.zig");
 const pool_mod = @import("pool.zig");
+const errors = @import("errors.zig");
 
-const Io = root.Io;
-const Scratch = root.Scratch;
-const Ref = root.Ref;
-const Handle = root.Handle;
-const INVALID_HANDLE = root.INVALID_HANDLE;
+const Io = io_mod.Io;
+const Scratch = types.Scratch;
+const Ref = types.Ref;
+const Handle = types.Handle;
+const INVALID_HANDLE = types.INVALID_HANDLE;
 
 /// 全局忽略 `SIGPIPE`。
 ///
@@ -51,8 +53,7 @@ fn ignoreSigpipeOnce() void {
     };
     _ = c.sigaction(c.SIG.PIPE, &act, null);
 }
-const SockOpt = root.SockOpt;
-const platform = root.platform;
+const SockOpt = types.SockOpt;
 const Queue = queue_mod.Queue;
 const TimerQueue = timer_mod.TimerQueue;
 const Pool = pool_mod.Pool;
@@ -108,6 +109,12 @@ pub const Loop = struct {
     /// `drainRetired` 因超时提前返回的次数。正常关停应当为 0；
     /// 非零说明有完成包没能在预算内回来，context 归属已转交调用方。
     retired_timeouts: usize = 0,
+    /// `Loop.deleteFile` 是 void（大量 `defer` 清理依赖这个签名），失败不能
+    /// 静默吞掉：累加到这个诊断计数，生产环境可观测、测试可断言。
+    delete_failures: usize = 0,
+    /// `Loop.closeChecked` 的失败次数。`Loop.close` 本身是 void（吞错），
+    /// 这里的计数让「关 socket 失败」在生产环境里可观测。
+    close_failures: usize = 0,
     /// 进程内内存文件表，供静态路由挂载编译期资源 / 测试替身。
     /// 数组在堆上，`Loop` 按值拷贝不会让它悬空。
     memory_fs: @import("file.zig").MemoryFs = undefined,
@@ -131,7 +138,7 @@ pub const Loop = struct {
     /// 是 `queue_size × 8`，窗口取它的一半（即 `queue_size × 4`），保证大批量
     /// 提交时完成包一定有地方放。用户显式给的值会被钳制到这个上限——
     /// 放开它只会让内核丢完成包、回调永不触发。
-    pub fn initWithOptions(io: Io, allocator: std.mem.Allocator, opts: root.Options) Loop {
+    pub fn initWithOptions(io: Io, allocator: std.mem.Allocator, opts: io_mod.Options) Loop {
         ignoreSigpipeOnce();
         const workers = if (opts.max_workers == 0) pool_mod.default_max_workers else opts.max_workers;
         const cq_capacity: usize = @as(usize, opts.queue_size) * 8;
@@ -145,7 +152,11 @@ pub const Loop = struct {
             .memory_fs = @import("file.zig").MemoryFs.init(allocator),
             .inflight_max = inflight_cap,
         };
-        self.timers.initWithAllocator(self.allocator);
+        // 定时器堆按在飞窗口预分配：稳态 armIdle / watchdog 不再 malloc。
+        self.timers.initWithCapacity(self.allocator, inflight_cap);
+        // 取消登记表也一次性备足：一次关停最多有 inflight_cap 个在飞项。
+        self.retired.ensureTotalCapacity(self.allocator, @intCast(inflight_cap)) catch
+            @panic("mox_io: OOM pre-allocating retired table");
         return self;
     }
 
@@ -254,7 +265,7 @@ pub const Loop = struct {
             .net_recv => {
                 const t: *NetRecv = @fieldParentPtr("c", c);
                 const r = self.io.vtable.recv(self.io.userdata, t.socket, t.buffer, &c.ov) catch |e| {
-                    c.err = e;
+                    c.err = errors.normalize(e);
                     self.pushReadySync(c);
                     return;
                 };
@@ -267,7 +278,7 @@ pub const Loop = struct {
             .net_send => {
                 const t: *NetSend = @fieldParentPtr("c", c);
                 const r = self.io.vtable.send(self.io.userdata, t.socket, t.bytes_buffer, &c.ov) catch |e| {
-                    c.err = e;
+                    c.err = errors.normalize(e);
                     self.pushReadySync(c);
                     return;
                 };
@@ -280,7 +291,7 @@ pub const Loop = struct {
             .net_accept => {
                 const t: *NetAccept = @fieldParentPtr("c", c);
                 const r = self.io.vtable.accept(self.io.userdata, t.listen, t.accept_socket, &t.addr_buf, &c.ov) catch |e| {
-                    c.err = e;
+                    c.err = errors.normalize(e);
                     self.pushReadySync(c);
                     return;
                 };
@@ -290,7 +301,7 @@ pub const Loop = struct {
             .net_connect => {
                 const t: *NetConnect = @fieldParentPtr("c", c);
                 self.io.vtable.connect(self.io.userdata, t.socket, t.address, &c.ov) catch |e| {
-                    c.err = e;
+                    c.err = errors.normalize(e);
                     self.pushReadySync(c);
                     return;
                 };
@@ -304,7 +315,7 @@ pub const Loop = struct {
             },
 
             .net_shutdown => {
-                const t: *root.NetShutdown = @fieldParentPtr("c", c);
+                const t: *completion.NetShutdown = @fieldParentPtr("c", c);
                 // `shutdown` 是同步的（只改连接状态，不排队数据），
                 // 与 `.net_close` 同构：调完直接进就绪队列。
                 const vt = self.io.vtable.shutdown orelse {
@@ -313,27 +324,27 @@ pub const Loop = struct {
                     return;
                 };
                 vt(self.io.userdata, t.socket, t.how) catch |e| {
-                    c.err = e;
+                    c.err = errors.normalize(e);
                 };
                 self.pushReadySync(c);
             },
 
             .net_poll => {
-                const p: *root.NetPoll = @fieldParentPtr("c", c);
+                const p: *completion.NetPoll = @fieldParentPtr("c", c);
                 const vt = self.io.vtable.netPoll orelse {
                     c.err = error.Unsupported;
                     self.pushReadySync(c);
                     return;
                 };
                 const r = vt(self.io.userdata, p.socket, p.want, &c.ov) catch |e| {
-                    c.err = e;
+                    c.err = errors.normalize(e);
                     self.pushReadySync(c);
                     return;
                 };
                 if (r) |_| self.pushReadySync(c);
             },
             .net_sendmsg => {
-                const t: *root.NetSendMsg = @fieldParentPtr("c", c);
+                const t: *completion.NetSendMsg = @fieldParentPtr("c", c);
                 const vt = self.io.vtable.sendMsg orelse {
                     // 后端没有原生 sendmsg：回落成依次 send。语义等价，
                     // 只是失去「一次系统调用」的原子性（多路复用时可能
@@ -341,7 +352,7 @@ pub const Loop = struct {
                     var total: usize = 0;
                     for (t.bufs) |b| {
                         const r = self.io.vtable.send(self.io.userdata, t.socket, b, &c.ov) catch |e| {
-                            c.err = e;
+                            c.err = errors.normalize(e);
                             self.pushReadySync(c);
                             return;
                         };
@@ -358,35 +369,35 @@ pub const Loop = struct {
                     return;
                 };
                 vt(self.io.userdata, t.socket, t.bufs, &t.hdr, &c.ov) catch |e| {
-                    c.err = e;
+                    c.err = errors.normalize(e);
                     self.pushReadySync(c);
                     return;
                 };
             },
 
             .net_recvmsg => {
-                const t: *root.NetRecvMsg = @fieldParentPtr("c", c);
+                const t: *completion.NetRecvMsg = @fieldParentPtr("c", c);
                 const vt = self.io.vtable.recvMsg orelse {
                     c.err = error.Unsupported;
                     self.pushReadySync(c);
                     return;
                 };
                 vt(self.io.userdata, t.socket, t.bufs, &t.hdr, &c.ov) catch |e| {
-                    c.err = e;
+                    c.err = errors.normalize(e);
                     self.pushReadySync(c);
                     return;
                 };
             },
 
             .file_read => {
-                const f: *root.ReadFileAsync = @fieldParentPtr("c", c);
+                const f: *completion.ReadFileAsync = @fieldParentPtr("c", c);
                 const vf = self.io.vtable.readFileAsync orelse {
                     c.err = error.Unsupported;
                     self.pushReadySync(c);
                     return;
                 };
                 const r = vf(self.io.userdata, @ptrCast(f.path.ptr), f.offset, f.buf, &c.ov) catch |e| {
-                    c.err = e;
+                    c.err = errors.normalize(e);
                     self.pushReadySync(c);
                     return;
                 };
@@ -394,14 +405,14 @@ pub const Loop = struct {
             },
 
             .file_write => {
-                const f: *root.WriteFileAsync = @fieldParentPtr("c", c);
+                const f: *completion.WriteFileAsync = @fieldParentPtr("c", c);
                 const vf = self.io.vtable.writeFileAsync orelse {
                     c.err = error.Unsupported;
                     self.pushReadySync(c);
                     return;
                 };
                 const r = vf(self.io.userdata, @ptrCast(f.path.ptr), f.offset, f.bytes, &c.ov) catch |e| {
-                    c.err = e;
+                    c.err = errors.normalize(e);
                     self.pushReadySync(c);
                     return;
                 };
@@ -409,14 +420,14 @@ pub const Loop = struct {
             },
 
             .watch_fd => {
-                const w: *root.WatchFd = @fieldParentPtr("c", c);
+                const w: *completion.WatchFd = @fieldParentPtr("c", c);
                 const vtable_fn = self.io.vtable.watchFd orelse {
                     c.err = error.Unsupported;
                     self.pushReadySync(c);
                     return;
                 };
                 const r = vtable_fn(self.io.userdata, w.fd, w.want, &c.ov) catch |e| {
-                    c.err = e;
+                    c.err = errors.normalize(e);
                     self.pushReadySync(c);
                     return;
                 };
@@ -491,20 +502,20 @@ pub const Loop = struct {
             self.io.vtable.updateAccept(self.io.userdata, a.listen, a.accept_socket);
         }
         if (c.op == .file_read and c.err == null) {
-            const f: *root.ReadFileAsync = @fieldParentPtr("c", c);
+            const f: *completion.ReadFileAsync = @fieldParentPtr("c", c);
             f.len = ref.bytes;
         }
         if (c.op == .file_write and c.err == null) {
-            const f: *root.WriteFileAsync = @fieldParentPtr("c", c);
+            const f: *completion.WriteFileAsync = @fieldParentPtr("c", c);
             f.written = ref.bytes;
         }
         if (c.op == .watch_fd and c.err == null) {
-            const w: *root.WatchFd = @fieldParentPtr("c", c);
-            w.ready = root.Ready.fromBits(@truncate(ref.bytes));
+            const w: *completion.WatchFd = @fieldParentPtr("c", c);
+            w.ready = types.Ready.fromBits(@truncate(ref.bytes));
         }
         if (c.op == .net_poll and c.err == null) {
-            const p: *root.NetPoll = @fieldParentPtr("c", c);
-            var got = root.Ready.fromBits(@truncate(ref.bytes));
+            const p: *completion.NetPoll = @fieldParentPtr("c", c);
+            var got = types.Ready.fromBits(@truncate(ref.bytes));
             // Windows 的零字节重叠读完成时 `bytes` 是 0（没搬数据），
             // 不带就绪位。但「完成」本身就说明等到的方向就绪了，
             // 所以把 `want` 并进去。Linux/BSD 的 `bytes` 已带真实位，
@@ -514,11 +525,11 @@ pub const Loop = struct {
             p.readiness = got;
         }
         if (c.op == .net_sendmsg and c.err == null) {
-            const m: *root.NetSendMsg = @fieldParentPtr("c", c);
+            const m: *completion.NetSendMsg = @fieldParentPtr("c", c);
             m.sent = ref.bytes;
         }
         if (c.op == .net_recvmsg and c.err == null) {
-            const m: *root.NetRecvMsg = @fieldParentPtr("c", c);
+            const m: *completion.NetRecvMsg = @fieldParentPtr("c", c);
             m.received = ref.bytes;
         }
         if (c.op == .net_connect and c.err == null) {
@@ -540,9 +551,7 @@ pub const Loop = struct {
             .scratch = &c.ov,
             .context = ctx,
             .dispose = dispose,
-        }) catch {
-            // 登记表分配失败：完成包到达时按普通取消丢弃，不回调。
-        };
+        }) catch @panic("mox_io: OOM registering a cancelled completion (object would leak)");
         // 定时器还在堆里：摘掉后没有别的东西会再引用它，立即回收。
         if (c.op == .timer and self.timers.remove(c)) {
             _ = self.reclaim(&c.ov);
@@ -709,9 +718,26 @@ pub const Loop = struct {
         try self.io.vtable.listen(self.io.userdata, socket, backlog);
     }
 
-    /// 关闭套接字（与 `NetClose` 走同一个后端入口）。
+    /// 关闭套接字（与 `NetClose` 走同一个后端入口）。**吞掉错误**：
+    /// 关 fd 失败通常是「重复关闭」，按惯例不该让调用方 panic。
     pub fn close(self: *Loop, socket: Handle) void {
         self.io.vtable.close(self.io.userdata, socket);
+    }
+
+    /// 关闭套接字并回报失败。与 `close` 的唯一区别是错误不被吞掉：
+    /// 句柄已失效报 `error.NotOpen`，其余报 `error.CloseFailed`。
+    ///
+    /// 后端未实现该槽位时按成功处理（等价于 `close`）。
+    /// 失败会累加 `close_failures`，便于生产环境观测。
+    pub fn closeChecked(self: *Loop, socket: Handle) !void {
+        const f = self.io.vtable.closeChecked orelse {
+            self.io.vtable.close(self.io.userdata, socket);
+            return;
+        };
+        f(self.io.userdata, socket) catch |e| {
+            self.close_failures += 1;
+            return e;
+        };
     }
 
     /// 挂载一个内存文件（通常是编译期常量或测试替身）。路径按字节精确匹配；
@@ -726,7 +752,6 @@ pub const Loop = struct {
         if (self.memory_fs.size(path)) |n| return n;
         return self.io.vtable.fileSize(self.io.userdata, path);
     }
-
 
     // ---- 可观测接口 ---------------------------------------------------------
 
@@ -766,11 +791,17 @@ pub const Loop = struct {
         return self.io.vtable.symLink(self.io.userdata, target, link_path);
     }
 
-    pub fn statPath(self: *Loop, path: []const u8) !root.Stat {
+    /// 创建硬链接（`link(2)`）。两个路径指向同一 inode。
+    /// 后端未提供该原语时返回 `error.Unsupported`。
+    pub fn hardLink(self: *Loop, old_path: []const u8, new_path: []const u8) !void {
+        const f = self.io.vtable.hardLink orelse return error.Unsupported;
+        return f(self.io.userdata, old_path, new_path);
+    }
+    pub fn statPath(self: *Loop, path: []const u8) !types.Stat {
         return self.io.vtable.statPath(self.io.userdata, path);
     }
 
-    pub fn listDir(self: *Loop, path: []const u8, buf: []root.DirEntry) !usize {
+    pub fn listDir(self: *Loop, path: []const u8, buf: []types.DirEntry) !usize {
         return self.io.vtable.listDir(self.io.userdata, path, buf);
     }
 
@@ -779,9 +810,36 @@ pub const Loop = struct {
         return self.io.vtable.writeFileAll(self.io.userdata, path, bytes);
     }
 
-    /// 同步删除文件（阻塞）。平台层吞掉所有失败，因此这里不会报错。
+    /// 同步删除文件（阻塞）。保留 void 签名以兼容 `defer` 清理；
+    /// 真实错误由后端报出并累加到 `delete_failures`，不再静默丢弃。
     pub fn deleteFile(self: *Loop, path: []const u8) void {
-        self.io.vtable.deleteFile(self.io.userdata, path) catch {};
+        self.io.vtable.deleteFile(self.io.userdata, path) catch {
+            self.delete_failures += 1;
+        };
+    }
+
+    /// 同步把文件截断/扩展到 `size` 字节（阻塞）。
+    pub fn truncate(self: *Loop, path: []const u8, size: u64) !void {
+        return self.io.vtable.truncateFile(self.io.userdata, path, size);
+    }
+
+    /// 读符号链接目标路径，返回写入 `buf` 的长度（超出缓冲报 `NameTooLong`）。
+    /// 后端未提供该原语时返回 `error.Unsupported`。
+    pub fn readLink(self: *Loop, link_path: []const u8, buf: []u8) !usize {
+        const f = self.io.vtable.readLink orelse return error.Unsupported;
+        return f(self.io.userdata, link_path, buf);
+    }
+
+    /// 检查路径可达性（`access(2)`）。`mode` 为 POSIX 检查位（R_OK=4/W_OK=2/X_OK=1）。
+    pub fn access(self: *Loop, path: []const u8, mode: u32) !void {
+        const f = self.io.vtable.access orelse return error.Unsupported;
+        return f(self.io.userdata, path, mode);
+    }
+
+    /// 解析路径为绝对路径（`realpath`），结果写入 `buf`，返回长度。
+    pub fn realPath(self: *Loop, path: []const u8, buf: []u8) !usize {
+        const f = self.io.vtable.realPath orelse return error.Unsupported;
+        return f(self.io.userdata, path, buf);
     }
 
     // ---- 内部实现 ---------------------------------------------------------
@@ -898,7 +956,7 @@ pub const Loop = struct {
                     target.timeout = null;
                     if (!target.cancelled) {
                         self.io.vtable.cancel(self.io.userdata, target.socket, &target.ov);
-                        target.err = error.DeadlineExceeded;
+                        target.err = errors.normalize(error.DeadlineExceeded);
                         const cb = target.callback;
                         target.callback = null;
                         if (cb) |f| f(self, target);

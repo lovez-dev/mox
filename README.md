@@ -337,18 +337,21 @@ src/
   router.zig        段前缀树路由
   middleware.zig    编译期中间件折叠
   server.zig        完成式 HTTP 服务状态机
-  io/
-    io.zig          契约 + VTable + 门面 + 后端选择器
+  mox_io/
+    mox_io.zig      公共门面与构造入口
+    types.zig       跨层共享数据类型
+    io.zig          Io / VTable 契约与 Options
+    errors.zig      统一的公开错误集合
+    sys.zig         POSIX errno 映射
+    platform.zig    编译期平台后端选择
+    net.zig         同步 TCP / Listener 便捷封装
     completion.zig  完成节点类型族
     loop.zig        事件循环引擎
     queue.zig       侵入式 FIFO 就绪队列
-    timer.zig       定时器有序链表
+    timer.zig       定时器最小堆
     pool.zig        Work 线程池
     file.zig        阻塞文件读兜底
     tests.zig       事件循环测试
-    queue.zig       就绪 FIFO
-    timer.zig       定时器有序表
-    pool.zig        `Work` 线程池
     udp.zig         UDP 可选能力
     dns.zig         DNS 可选能力（建立在 UDP 之上）
     process.zig     子进程：spawn / 异步等退出 / 进程组
@@ -829,6 +832,23 @@ CI（`.github/workflows/test.yml`）分两块：
   一条卡住吞掉其余结果；另做示例构建、真包依赖验证与 x86_64 交叉编译校验。
 
 
+
+### 本轮重构验证（2026-11-14）
+
+本轮拆分了公共门面、共享类型、后端契约、平台选择和错误映射，新增同步 TCP
+便捷封装，并重构 epoll/kqueue 的 fd 方向队列。epoll 的双向监听各自使用独立
+池节点；取消或关闭只投递一次完成包，回归覆盖超过 64 个双向监听的批量关闭。
+
+| 环境 / 检查 | 本轮结果 |
+|---|---|
+| Windows x86_64 / IOCP | `zig build test`：174 通过、17 跳过、0 失败 |
+| Linux x86_64 / WSL2 默认 io_uring | Web 67 通过；I/O 132 通过、7 跳过、0 失败（含 epoll 专属回归） |
+| Linux x86_64 / 强制 epoll | 测试入口先设 `platform.forced = .epoll`：Web 67 通过；I/O 124 通过、15 跳过；另各有 1 个入口配置测试通过 |
+| macOS arm64 | Web 与 I/O 测试交叉编译成功；本轮运行时结果待真实 macOS CI 验证 |
+| Linux arm64 / Windows arm64 / FreeBSD x86_64 | I/O 测试交叉类型检查成功（`--test-no-exec -fno-emit-bin`），未在这些目标上实跑 |
+| 示例与外部包依赖 | `zig build`、`zig build test-package` 通过 |
+
+以上是本地工作区验证结果；远端已有提交的 CI 结果不能替代本轮未推送改动的验证。
 
 ## 文件句柄层
 

@@ -18,6 +18,7 @@
 const std = @import("std");
 const windows = std.os.windows;
 const net = std.Io.net;
+const errors = @import("../errors.zig");
 
 pub const HANDLE = windows.HANDLE;
 
@@ -28,6 +29,28 @@ pub const INVALID_SOCKET: SOCKET = std.math.maxInt(SOCKET);
 
 /// `WSAGetLastError` 的值，含义是「操作正在进行中」。
 pub const WSA_IO_PENDING = 997;
+
+// Winsock 错误码（winsock2.h）。与 Win32 错误码同一数字空间（WSA* 从10000 起）。
+const WSAEINTR: u32 = 10004;
+const WSAEACCES: u32 = 10013;
+const WSAEMFILE: u32 = 10024;
+const WSAEWOULDBLOCK: u32 = 10035;
+const WSAENOTSOCK: u32 = 10038;
+const WSAEADDRINUSE: u32 = 10048;
+const WSAENETUNREACH: u32 = 10051;
+const WSAECONNRESET: u32 = 10054;
+const WSAENOBUFS: u32 = 10055;
+const WSAEISCONN: u32 = 10056;
+const WSAENOTCONN: u32 = 10057;
+const WSAESHUTDOWN: u32 = 10058;
+const WSAETIMEDOUT: u32 = 10060;
+const WSAECONNREFUSED: u32 = 10061;
+
+/// `closesocket` 传入的句柄不是套接字（含已关闭的句柄）。
+const WSA_ENOTSOCK = 10038;
+
+/// 参数非法 —— `closesocket` 对已关闭的句柄也报这个。
+const WSA_EINVAL = 10022;
 
 /// 超时时 `GetQueuedCompletionStatus` 返回的 `GetLastError` 值。
 const WAIT_TIMEOUT = 258;
@@ -243,8 +266,61 @@ pub const SocketError = error{
     ShutdownFailed,
     RequestFailed,
     Unexpected,
+    // —— 语义名（ 产出；同时都是  成员，归一化不丢）——
+    Interrupted,
+    AccessDenied,
+    AddressInUse,
+    WouldBlock,
+    AlreadyConnected,
+    NotConnected,
+    NotSocket,
+    ConnectionRefused,
+    ConnectionReset,
+    TimedOut,
+    NetworkUnreachable,
+    NoBuffers,
+    SystemFdQuotaExceeded,
 };
 
+/// 最近一次 Winsock 错误 → 。
+///
+/// WSA 层失败不再一律折叠成 ：常见码给语义名（调用方跨后端
+/// 可以按  等统一分支），未知码才落到 。
+/// Winsock 与 Win32 错误码同一数字空间， 与 /// 读同一线程槽，所以统一走 。
+pub fn wsaError() SocketError {
+    return switch (c.GetLastError()) {
+        WSAEINTR => error.Interrupted,
+        WSAEACCES => error.AccessDenied,
+        WSAEADDRINUSE => error.AddressInUse,
+        WSAEWOULDBLOCK => error.WouldBlock,
+        WSAEISCONN => error.AlreadyConnected,
+        WSAENOTCONN => error.NotConnected,
+        WSAENOTSOCK => error.NotSocket,
+        WSAESHUTDOWN => error.ShutdownFailed,
+        WSAECONNREFUSED => error.ConnectionRefused,
+        WSAECONNRESET => error.ConnectionReset,
+        WSAETIMEDOUT => error.TimedOut,
+        WSAENETUNREACH => error.NetworkUnreachable,
+        WSAENOBUFS => error.NoBuffers,
+        WSAEMFILE => error.SystemFdQuotaExceeded,
+        else => error.RequestFailed,
+    };
+}
+
+/// 最近一次 Win32 错误 → 封闭错误集（文件 / 端口 / 等待路径用）。
+pub fn winError() errors.Error {
+    return switch (c.GetLastError()) {
+        ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND => error.FileNotFound,
+        ERROR_ACCESS_DENIED => error.AccessDenied,
+        ERROR_DIR_NOT_EMPTY => error.DirNotEmpty,
+        ERROR_ALREADY_EXISTS => error.PathAlreadyExists,
+        ERROR_INVALID_HANDLE => error.NotOpen,
+        ERROR_DISK_FULL => error.NoSpaceLeft,
+        ERROR_TOO_MANY_OPEN_FILES => error.SystemFdQuotaExceeded,
+        WAIT_TIMEOUT => error.TimedOut,
+        else => error.RequestFailed,
+    };
+}
 pub fn createSocket(family: c_int, kind: c_int, protocol: c_int) SocketError!SOCKET {
     const s = c.WSASocketW(family, kind, protocol, null, 0, WSA_FLAG_OVERLAPPED);
     if (s == INVALID_SOCKET) return error.SocketCreationFailed;
@@ -272,14 +348,14 @@ pub fn createUdpSocket(address: net.IpAddress) SocketError!SOCKET {
 pub fn recvFromBlocking(s: SOCKET, buf: []u8, from: []u8) SocketError!usize {
     var len: c_int = @intCast(from.len);
     const rc = c.recvfrom(s, buf.ptr, @intCast(buf.len), 0, @ptrCast(from.ptr), &len);
-    if (rc < 0) return error.RequestFailed;
+    if (rc < 0) return wsaError();
     return @intCast(rc);
 }
 
 pub fn sendToBlocking(s: SOCKET, buf: []const u8, address: net.IpAddress) SocketError!usize {
     const addr = toSockAddr(address);
     const rc = c.sendto(s, buf.ptr, @intCast(buf.len), 0, &addr, addr.len());
-    if (rc < 0) return error.RequestFailed;
+    if (rc < 0) return wsaError();
     return @intCast(rc);
 }
 
@@ -295,7 +371,7 @@ pub fn listenSocket(s: SOCKET, backlog: c_int) SocketError!void {
 pub fn localAddress(s: SOCKET) SocketError!net.IpAddress {
     var addr: SockAddr = .{};
     var len: c_int = @sizeOf(SockAddr);
-    if (c.getsockname(s, &addr, &len) != ERROR_SUCCESS) return error.RequestFailed;
+    if (c.getsockname(s, &addr, &len) != ERROR_SUCCESS) return wsaError();
     return fromSockAddr(&addr);
 }
 
@@ -327,7 +403,7 @@ pub fn shutdownSocket(s: SOCKET, how: c_int) void {
 
 /// 语义选项 → Winsock `setsockopt`。数值用 Windows SDK 的常量，不借用
 /// Linux 的编号 —— 两边名字像，取值并不通用。
-pub fn setSockOpt(s: SOCKET, opt: root.SockOpt, value: u32) SocketError!void {
+pub fn setSockOpt(s: SOCKET, opt: types.SockOpt, value: u32) SocketError!void {
     const v: c_int = @intCast(value);
     const len: c_int = @sizeOf(c_int);
     const level: c_int, const name: c_int = switch (opt) {
@@ -434,7 +510,7 @@ pub fn recv(port: CompletionPort, s: SOCKET, buffer: []u8) SocketError!usize {
 
     const rc = c.WSARecv(s, &wsabuf, 1, &bytes, &flags, &overlapped, null);
     if (rc == 0) return @intCast(bytes);
-    if (lastError() != WSA_IO_PENDING) return error.RequestFailed;
+    if (lastError() != WSA_IO_PENDING) return wsaError();
     return @intCast(try port.waitFor(&overlapped));
 }
 
@@ -446,7 +522,7 @@ pub fn send(port: CompletionPort, s: SOCKET, bytes_to_send: []const u8) SocketEr
 
     const rc = c.WSASend(s, &wsabuf, 1, &bytes, 0, &overlapped, null);
     if (rc == 0) return @intCast(bytes);
-    if (lastError() != WSA_IO_PENDING) return error.RequestFailed;
+    if (lastError() != WSA_IO_PENDING) return wsaError();
     return @intCast(try port.waitFor(&overlapped));
 }
 
@@ -522,7 +598,7 @@ const k32 = struct {
 /// 阻塞接收，仅用于测试 / benchmark 的客户端线程。
 pub fn recvBlocking(s: SOCKET, buf: []u8) SocketError!usize {
     const rc = c.recv(s, buf.ptr, @intCast(buf.len), 0);
-    if (rc < 0) return error.RequestFailed;
+    if (rc < 0) return wsaError();
     return @intCast(rc);
 }
 
@@ -541,7 +617,7 @@ pub fn recvInto(s: SOCKET, wsabuf: [*]WSABUF, overlapped: *OVERLAPPED) SocketErr
     // 即便此处返回 0，完成端口仍会为重叠操作排队一个包，
     // 所以「成功」是「已提交」而非「已完成」——一律按未完成上报。
     if (rc == 0) return null;
-    if (lastError() != WSA_IO_PENDING) return error.RequestFailed;
+    if (lastError() != WSA_IO_PENDING) return wsaError();
     return null;
 }
 
@@ -550,7 +626,7 @@ pub fn sendFrom(s: SOCKET, wsabuf: [*]WSABUF, overlapped: *OVERLAPPED) SocketErr
     var bytes: u32 = 0;
     const rc = c.WSASend(s, wsabuf, 1, &bytes, 0, overlapped, null);
     if (rc == 0) return null; // completion packet is still queued
-    if (lastError() != WSA_IO_PENDING) return error.RequestFailed;
+    if (lastError() != WSA_IO_PENDING) return wsaError();
     return null;
 }
 
@@ -558,7 +634,7 @@ pub fn sendFrom(s: SOCKET, wsabuf: [*]WSABUF, overlapped: *OVERLAPPED) SocketErr
 /// （没有 OVERLAPPED 可投递）。
 pub fn sendBlocking(s: SOCKET, bytes_to_send: []const u8) SocketError!usize {
     const rc = c.send(s, bytes_to_send.ptr, @intCast(bytes_to_send.len), 0);
-    if (rc < 0) return error.RequestFailed;
+    if (rc < 0) return wsaError();
     return @intCast(rc);
 }
 
@@ -628,7 +704,7 @@ fn acceptExFn(listen: SOCKET) SocketError!AcceptExFn {
         null,
         null,
     );
-    if (rc != 0) return error.RequestFailed;
+    if (rc != 0) return wsaError();
     return fn_ptr;
 }
 
@@ -641,7 +717,7 @@ pub fn acceptEx(listen: SOCKET, accept: SOCKET, buf: []u8, overlapped: *OVERLAPP
     var bytes: u32 = 0;
     const rc = f(listen, accept, buf.ptr, 0, addr_len, addr_len, &bytes, overlapped);
     if (rc != 0) return null; // completion packet is still queued
-    if (lastError() != WSA_IO_PENDING) return error.RequestFailed;
+    if (lastError() != WSA_IO_PENDING) return wsaError();
     return null;
 }
 
@@ -686,7 +762,7 @@ fn connectExFn(s: SOCKET) SocketError!ConnectExFn {
         null,
         null,
     );
-    if (rc != 0) return error.RequestFailed;
+    if (rc != 0) return wsaError();
     return fn_ptr;
 }
 
@@ -703,7 +779,7 @@ pub fn connectEx(s: SOCKET, address: net.IpAddress, overlapped: *OVERLAPPED) Soc
     var bytes: u32 = 0;
     const rc = f(s, &addr, addr.len(), null, 0, &bytes, overlapped);
     if (rc != 0) return null; // success; completion packet is still queued
-    if (lastError() != WSA_IO_PENDING) return error.RequestFailed;
+    if (lastError() != WSA_IO_PENDING) return wsaError();
     return null;
 }
 
@@ -714,9 +790,10 @@ pub fn updateConnectContext(s: SOCKET) void {
 
 // ---- Io 接口接线 -----------------------------------------------------------
 //
-// 上面是裸 Win32/IOCP 接口，下面把它映射到与平台无关的 `root.Io`，
-// 使 `root.zig`（进而整个框架）永远看不到 Windows 类型。本文件即完整的 Windows 后端。
-const root = @import("../mox_io.zig");
+// 上面是裸 Win32/IOCP 接口，下面把它映射到与平台无关的 `io_mod.Io`，
+// 使门面（进而整个框架）永远看不到 Windows 类型。本文件即完整的 Windows 后端。
+const types = @import("../types.zig");
+const io_mod = @import("../io.zig");
 
 /// `Io.userdata` 背后的后端状态：完成端口 + 持有它的分配器。
 const State = struct {
@@ -739,29 +816,29 @@ fn vtNow(userdata: ?*anyopaque) u64 {
     return tickCount();
 }
 
-fn vtAssociate(userdata: ?*anyopaque, socket: root.Handle, key: usize) anyerror!void {
+fn vtAssociate(userdata: ?*anyopaque, socket: types.Handle, key: usize) anyerror!void {
     try stateOf(userdata).port.associate(socket, key);
 }
 
-/// 64 字节的 `root.Scratch` 里先放 `OVERLAPPED`(32 字节)，
+/// 64 字节的 `types.Scratch` 里先放 `OVERLAPPED`(32 字节)，
 /// 再放 `WSABUF`(16)。两者都放在调用方节点内，内核就绝不会
 /// 在操作未完成时读到已失效的描述符。
-fn scratchOverlapped(scratch: *root.Scratch) *OVERLAPPED {
+fn scratchOverlapped(scratch: *types.Scratch) *OVERLAPPED {
     return @ptrCast(@alignCast(scratch));
 }
 
-fn scratchBuf(scratch: *root.Scratch) [*]WSABUF {
+fn scratchBuf(scratch: *types.Scratch) [*]WSABUF {
     return @ptrCast(@alignCast(&scratch.bytes[32]));
 }
 
-fn vtRecv(userdata: ?*anyopaque, socket: root.Handle, buf: []u8, scratch: *root.Scratch) anyerror!?usize {
+fn vtRecv(userdata: ?*anyopaque, socket: types.Handle, buf: []u8, scratch: *types.Scratch) anyerror!?usize {
     _ = userdata;
     const wb = scratchBuf(scratch);
     wb[0] = .{ .len = @intCast(buf.len), .buf = buf.ptr };
     return recvInto(socket, wb, scratchOverlapped(scratch));
 }
 
-fn vtSend(userdata: ?*anyopaque, socket: root.Handle, buf: []const u8, scratch: *root.Scratch) anyerror!?usize {
+fn vtSend(userdata: ?*anyopaque, socket: types.Handle, buf: []const u8, scratch: *types.Scratch) anyerror!?usize {
     _ = userdata;
     const wb = scratchBuf(scratch);
     wb[0] = .{ .len = @intCast(buf.len), .buf = @constCast(buf.ptr) };
@@ -794,11 +871,11 @@ fn udpHdr(comptime T: type, hdr: []usize) *T {
 
 fn vtUdpRecv(
     userdata: ?*anyopaque,
-    socket: root.Handle,
+    socket: types.Handle,
     buf: []u8,
     from: []u8,
     hdr: []usize,
-    scratch: *root.Scratch,
+    scratch: *types.Scratch,
 ) anyerror!void {
     _ = userdata;
     const h = udpHdr(UdpRecvHdr, hdr);
@@ -820,16 +897,16 @@ fn vtUdpRecv(
     );
     // 契约与 `recvInto` 相同：返回 0 只代表提交成功，完成包仍会排队。
     if (rc == 0) return;
-    if (lastError() != WSA_IO_PENDING) return error.RequestFailed;
+    if (lastError() != WSA_IO_PENDING) return wsaError();
 }
 
 fn vtUdpSend(
     userdata: ?*anyopaque,
-    socket: root.Handle,
+    socket: types.Handle,
     buf: []const u8,
     to: net.IpAddress,
     hdr: []usize,
-    scratch: *root.Scratch,
+    scratch: *types.Scratch,
 ) anyerror!void {
     _ = userdata;
     const h = udpHdr(UdpSendHdr, hdr);
@@ -848,39 +925,53 @@ fn vtUdpSend(
         null,
     );
     if (rc == 0) return;
-    if (lastError() != WSA_IO_PENDING) return error.RequestFailed;
+    if (lastError() != WSA_IO_PENDING) return wsaError();
 }
 
-fn vtAccept(userdata: ?*anyopaque, listen: root.Handle, accept_socket: root.Handle, addr_buf: []u8, scratch: *root.Scratch) anyerror!?usize {
+fn vtAccept(userdata: ?*anyopaque, listen: types.Handle, accept_socket: types.Handle, addr_buf: []u8, scratch: *types.Scratch) anyerror!?usize {
     _ = userdata;
     return acceptEx(listen, accept_socket, addr_buf, scratchOverlapped(scratch));
 }
 
-fn vtUpdateAccept(userdata: ?*anyopaque, listen: root.Handle, accept_socket: root.Handle) void {
+fn vtUpdateAccept(userdata: ?*anyopaque, listen: types.Handle, accept_socket: types.Handle) void {
     _ = userdata;
     updateAcceptContext(listen, accept_socket);
 }
 
-fn vtConnect(userdata: ?*anyopaque, socket: root.Handle, address: std.Io.net.IpAddress, scratch: *root.Scratch) anyerror!void {
+fn vtConnect(userdata: ?*anyopaque, socket: types.Handle, address: std.Io.net.IpAddress, scratch: *types.Scratch) anyerror!void {
     _ = userdata;
     _ = try connectEx(socket, address, scratchOverlapped(scratch));
 }
 
-fn vtUpdateConnect(userdata: ?*anyopaque, socket: root.Handle) void {
+fn vtUpdateConnect(userdata: ?*anyopaque, socket: types.Handle) void {
     _ = userdata;
     updateConnectContext(socket);
 }
 
-fn vtClose(userdata: ?*anyopaque, socket: root.Handle) void {
+fn vtClose(userdata: ?*anyopaque, socket: types.Handle) void {
     _ = userdata;
     closeSocket(socket);
 }
 
+/// 与 `vtClose` 相同的动作，但把 `closesocket(2)` 的 WSA 错误映射成具体错误。
+/// `WSAENOTSOCK` / `WSAEINVAL` 说明句柄已失效（重复关闭），其余归
+/// `error.CloseFailed`。
+fn vtCloseChecked(userdata: ?*anyopaque, socket: types.Handle) anyerror!void {
+    _ = userdata;
+    const s: SOCKET = @intCast(socket);
+    if (c.closesocket(s) != 0) {
+        return switch (lastError()) {
+            WSA_ENOTSOCK, WSA_EINVAL => error.NotOpen,
+            else => error.CloseFailed,
+        };
+    }
+}
+
 /// 取消一个重叠操作。`CancelIoEx` 成功后 IOCP 仍会投递一个
 /// `ERROR_OPERATION_ABORTED` 完成包，循环据此回收节点。
-fn vtCancel(userdata: ?*anyopaque, socket: root.Handle, scratch: *root.Scratch) void {
+fn vtCancel(userdata: ?*anyopaque, socket: types.Handle, scratch: *types.Scratch) void {
     _ = userdata;
-    if (socket == root.INVALID_HANDLE) return;
+    if (socket == types.INVALID_HANDLE) return;
     const ov: *anyopaque = @ptrCast(scratchOverlapped(scratch));
     _ = c.CancelIoEx(@ptrFromInt(socket), ov);
 }
@@ -891,7 +982,7 @@ fn vtNotify(userdata: ?*anyopaque) void {
 
 /// 一次系统调用收割多个 IOCP 完成包。空 `OVERLAPPED` 是 `notify` 唤醒信号，
 /// 直接跳过。`OVERLAPPED.Internal` 是 NTSTATUS：非 0 表示操作失败。
-fn vtWaitBatch(userdata: ?*anyopaque, timeout_ms: u32, refs: []root.Ref) anyerror!usize {
+fn vtWaitBatch(userdata: ?*anyopaque, timeout_ms: u32, refs: []types.Ref) anyerror!usize {
     const port = stateOf(userdata).port;
     var entries: [64]c.OVERLAPPED_ENTRY = undefined;
     const cap: u32 = @intCast(@min(refs.len, entries.len));
@@ -910,14 +1001,14 @@ fn vtWaitBatch(userdata: ?*anyopaque, timeout_ms: u32, refs: []root.Ref) anyerro
     var i: u32 = 0;
     while (i < removed) : (i += 1) {
         const ov = entries[i].overlapped orelse continue; // 唤醒信号，无完成包
-        const scratch: *root.Scratch = @ptrCast(@alignCast(ov));
+        const scratch: *types.Scratch = @ptrCast(@alignCast(ov));
         const overlapped: *const OVERLAPPED = @ptrCast(@alignCast(ov));
         refs[n] = .{
             .scratch = scratch,
             .bytes = entries[i].bytes,
             .failed = overlapped.Internal != 0,
             // AcceptEx 写进预先建好的 socket，内核不另给新句柄。
-            .new_handle = root.INVALID_HANDLE,
+            .new_handle = types.INVALID_HANDLE,
         };
         n += 1;
     }
@@ -926,27 +1017,27 @@ fn vtWaitBatch(userdata: ?*anyopaque, timeout_ms: u32, refs: []root.Ref) anyerro
 
 // ---- 套接字 / 文件辅助操作（经 VTable 暴露给上层） ------------------------
 
-fn vtCreateSocket(userdata: ?*anyopaque, address: net.IpAddress) anyerror!root.Handle {
+fn vtCreateSocket(userdata: ?*anyopaque, address: net.IpAddress) anyerror!types.Handle {
     _ = userdata;
     return @intCast(try createTcpSocket(address));
 }
 
-fn vtSetReuseAddress(userdata: ?*anyopaque, socket: root.Handle, on: bool) anyerror!void {
+fn vtSetReuseAddress(userdata: ?*anyopaque, socket: types.Handle, on: bool) anyerror!void {
     _ = userdata;
     try setReuseAddress(@intCast(socket), on);
 }
 
-fn vtSetSockOpt(userdata: ?*anyopaque, socket: root.Handle, opt: root.SockOpt, value: u32) anyerror!void {
+fn vtSetSockOpt(userdata: ?*anyopaque, socket: types.Handle, opt: types.SockOpt, value: u32) anyerror!void {
     _ = userdata;
     try setSockOpt(@intCast(socket), opt, value);
 }
 
-fn vtShutdownSend(userdata: ?*anyopaque, socket: root.Handle) anyerror!void {
+fn vtShutdownSend(userdata: ?*anyopaque, socket: types.Handle) anyerror!void {
     _ = userdata;
     try shutdownSend(@intCast(socket));
 }
 
-fn vtShutdown(userdata: ?*anyopaque, socket: root.Handle, how: root.ShutdownHow) anyerror!void {
+fn vtShutdown(userdata: ?*anyopaque, socket: types.Handle, how: types.ShutdownHow) anyerror!void {
     _ = userdata;
     const flag: c_int = switch (how) {
         .read => SD_RECEIVE,
@@ -961,10 +1052,10 @@ const IOV_MAX = 32;
 
 fn vtSendMsg(
     userdata: ?*anyopaque,
-    socket: root.Handle,
+    socket: types.Handle,
     bufs: []const []const u8,
     hdr: []usize,
-    scratch: *root.Scratch,
+    scratch: *types.Scratch,
 ) anyerror!void {
     _ = userdata;
     _ = hdr;
@@ -988,10 +1079,10 @@ fn vtSendMsg(
 
 fn vtRecvMsg(
     userdata: ?*anyopaque,
-    socket: root.Handle,
+    socket: types.Handle,
     bufs: []const []u8,
     hdr: []usize,
-    scratch: *root.Scratch,
+    scratch: *types.Scratch,
 ) anyerror!void {
     _ = userdata;
     _ = hdr;
@@ -1027,9 +1118,9 @@ fn vtRecvMsg(
 /// （`ERROR_INVALID_PARAMETER`）。socket 是能挂的那一类，所以单独有这条路径。
 fn vtNetPoll(
     userdata: ?*anyopaque,
-    socket: root.Handle,
-    want: root.Ready,
-    scratch: *root.Scratch,
+    socket: types.Handle,
+    want: types.Ready,
+    scratch: *types.Scratch,
 ) anyerror!?void {
     _ = userdata;
     if (!want.read and !want.write) return error.NothingToWatch;
@@ -1060,12 +1151,12 @@ fn vtNetPoll(
     // 「等待完成包」，与其它异步原语一致。
     return null;
 }
-fn vtBind(userdata: ?*anyopaque, socket: root.Handle, address: net.IpAddress) anyerror!void {
+fn vtBind(userdata: ?*anyopaque, socket: types.Handle, address: net.IpAddress) anyerror!void {
     _ = userdata;
     try bindSocket(@intCast(socket), address);
 }
 
-fn vtListen(userdata: ?*anyopaque, socket: root.Handle, backlog: c_int) anyerror!void {
+fn vtListen(userdata: ?*anyopaque, socket: types.Handle, backlog: c_int) anyerror!void {
     _ = userdata;
     try listenSocket(@intCast(socket), backlog);
 }
@@ -1101,45 +1192,45 @@ fn vtTruncateFile(userdata: ?*anyopaque, path: []const u8, size: u64) anyerror!v
     return truncateFile(path, size);
 }
 
-fn vtOpenFile(userdata: ?*anyopaque, path: []const u8, mode: root.FileMode) anyerror!root.Handle {
+fn vtOpenFile(userdata: ?*anyopaque, path: []const u8, mode: types.FileMode) anyerror!types.Handle {
     _ = userdata;
     return openFile(path, mode);
 }
 
-fn vtReadFileHandle(userdata: ?*anyopaque, file: root.Handle, offset: u64, buf: []u8) anyerror!usize {
+fn vtReadFileHandle(userdata: ?*anyopaque, file: types.Handle, offset: u64, buf: []u8) anyerror!usize {
     _ = userdata;
     return readFileHandle(file, offset, buf);
 }
 
-fn vtWriteFileHandle(userdata: ?*anyopaque, file: root.Handle, offset: u64, bytes: []const u8) anyerror!usize {
+fn vtWriteFileHandle(userdata: ?*anyopaque, file: types.Handle, offset: u64, bytes: []const u8) anyerror!usize {
     _ = userdata;
     return writeFileHandle(file, offset, bytes);
 }
 
-fn vtCloseFile(userdata: ?*anyopaque, file: root.Handle) void {
+fn vtCloseFile(userdata: ?*anyopaque, file: types.Handle) void {
     _ = userdata;
     closeFile(file);
 }
 
-fn vtStatFile(userdata: ?*anyopaque, file: root.Handle) anyerror!root.Stat {
+fn vtStatFile(userdata: ?*anyopaque, file: types.Handle) anyerror!types.Stat {
     _ = userdata;
     const st = try statFile(file);
     return .{ .kind = @fromBackingInt(@intCast(@backingInt(st.kind))), .size = st.size, .mtime_ms = st.mtime_ms };
 }
 
-fn vtSetFileSize(userdata: ?*anyopaque, file: root.Handle, size: u64) anyerror!void {
+fn vtSetFileSize(userdata: ?*anyopaque, file: types.Handle, size: u64) anyerror!void {
     _ = userdata;
     return setFileSize(file, size);
 }
 
-fn vtSyncFile(userdata: ?*anyopaque, file: root.Handle) anyerror!void {
+fn vtSyncFile(userdata: ?*anyopaque, file: types.Handle) anyerror!void {
     _ = userdata;
     return syncFile(file);
 }
 
 // 阶段 F：Windows 没有 POSIX 权限位/uid/gid，4 个原语为 null。
 // 时间戳/access/realpath/hardLink 有 Win32 等价物。
-fn vtSetFileTimestamps(userdata: ?*anyopaque, file: root.Handle, atime_ns: i64, mtime_ns: i64) anyerror!void {
+fn vtSetFileTimestamps(userdata: ?*anyopaque, file: types.Handle, atime_ns: i64, mtime_ns: i64) anyerror!void {
     _ = userdata;
     return setFileTimestamps(file, atime_ns, mtime_ns);
 }
@@ -1170,15 +1261,15 @@ fn vtReadLink(userdata: ?*anyopaque, link_path: []const u8, buf: []u8) anyerror!
 }
 
 // 目录流需要分配器（`WinDirStream` 是堆对象），从后端状态里取。
-fn vtOpenDir(userdata: ?*anyopaque, path: []const u8) anyerror!root.Handle {
+fn vtOpenDir(userdata: ?*anyopaque, path: []const u8) anyerror!types.Handle {
     return openDir(stateOf(userdata).alloc, path);
 }
 
-fn vtReadDirHandle(userdata: ?*anyopaque, dir: root.Handle, buf: []root.DirEntry) anyerror!usize {
+fn vtReadDirHandle(userdata: ?*anyopaque, dir: types.Handle, buf: []types.DirEntry) anyerror!usize {
     return readDirHandle(stateOf(userdata).alloc, dir, buf);
 }
 
-fn vtCloseDir(userdata: ?*anyopaque, dir: root.Handle) void {
+fn vtCloseDir(userdata: ?*anyopaque, dir: types.Handle) void {
     closeDir(stateOf(userdata).alloc, dir);
 }
 
@@ -1202,23 +1293,23 @@ fn vtSymLink(userdata: ?*anyopaque, target: []const u8, link_path: []const u8) a
     return symLink(target, link_path);
 }
 
-fn vtStatPath(userdata: ?*anyopaque, path: []const u8) anyerror!root.Stat {
+fn vtStatPath(userdata: ?*anyopaque, path: []const u8) anyerror!types.Stat {
     _ = userdata;
     const st = try stat(path);
     return .{ .kind = @fromBackingInt(@intCast(@backingInt(st.kind))), .size = st.size, .mtime_ms = st.mtime_ms };
 }
 
-fn vtListDir(userdata: ?*anyopaque, path: []const u8, buf: []root.DirEntry) anyerror!usize {
+fn vtListDir(userdata: ?*anyopaque, path: []const u8, buf: []types.DirEntry) anyerror!usize {
     _ = userdata;
     return listDir(path, @ptrCast(buf));
 }
 
 fn vtDeleteFile(userdata: ?*anyopaque, path: []const u8) anyerror!void {
     _ = userdata;
-    deleteFile(path);
+    try deleteFileChecked(path);
 }
 
-const vtable_storage: root.VTable = .{
+const vtable_storage: io_mod.VTable = .{
     .deinit = vtDeinit,
     .now = vtNow,
     .createSocket = vtCreateSocket,
@@ -1268,29 +1359,28 @@ const vtable_storage: root.VTable = .{
     .accept = vtAccept,
     .updateAccept = vtUpdateAccept,
     .connect = vtConnect,
+    .close = vtClose,
+    .closeChecked = vtCloseChecked,
     .updateConnect = vtUpdateConnect,
     .cancel = vtCancel,
-    .close = vtClose,
     .waitBatch = vtWaitBatch,
     .notify = vtNotify,
 };
 
 /// 拉起 IOCP 后端，交回一个可供循环驱动的 `Io`。
 /// 无配置入口，保留给旧调用点。
-pub fn create(alloc: std.mem.Allocator) !root.Io {
+pub fn create(alloc: std.mem.Allocator) !io_mod.Io {
     return createWith(alloc, .{});
 }
 
-/// 带配置的入口。当前这些后端不按 `queue_size` 缩放内部批量数组
-/// （epoll / kqueue 的就绪数组和 IOCP 的 OVERLAPPED_ENTRY 数组仍是编译期
-/// 定长），所以这里只接住参数、不改动行为。`Options` 的其余字段由 Loop
-/// 层消费。将来要缩放时在这个函数里改即可，上层不用动。
-pub fn createWith(alloc: std.mem.Allocator, opts: root.Options) !root.Io {
+/// 带配置的入口。IOCP 的 `OVERLAPPED_ENTRY` 批量数组仍是编译期定长 64，
+/// 所以这里只接住参数、不改动行为；`Options` 的其余字段由 Loop 层消费。
+pub fn createWith(alloc: std.mem.Allocator, opts: io_mod.Options) !io_mod.Io {
     _ = opts;
     return createBody(alloc);
 }
 
-fn createBody(alloc: std.mem.Allocator) !root.Io {
+fn createBody(alloc: std.mem.Allocator) !io_mod.Io {
     try startup();
     const st = try alloc.create(State);
     errdefer alloc.destroy(st);
@@ -1399,6 +1489,9 @@ const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_PATH_NOT_FOUND: u32 = 3;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_HANDLE: u32 = 6;
+const ERROR_TOO_MANY_OPEN_FILES: u32 = 24;
+const ERROR_DISK_FULL: u32 = 112;
+const ERROR_DIR_NOT_EMPTY: u32 = 145;
 
 // 重解析点（符号链接 / junction）相关常量，见 `winnt.h` / `winioctl.h`。
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
@@ -1573,7 +1666,7 @@ pub fn fileSize(path: []const u8) anyerror!u64 {
     if (h == invalidHandle()) return error.FileNotFound;
     defer _ = c.CloseHandle(h);
     var sz: i64 = 0;
-    if (!fl32.GetFileSizeEx(h, &sz).toBool()) return error.RequestFailed;
+    if (!fl32.GetFileSizeEx(h, &sz).toBool()) return winError();
     return @intCast(sz);
 }
 
@@ -1586,7 +1679,7 @@ pub fn readFileInto(path: []const u8, buf: []u8) anyerror!usize {
     var total: usize = 0;
     while (total < buf.len) {
         var got: u32 = 0;
-        if (!fl32.ReadFile(h, buf.ptr + total, @intCast(buf.len - total), &got, null).toBool()) return error.RequestFailed;
+        if (!fl32.ReadFile(h, buf.ptr + total, @intCast(buf.len - total), &got, null).toBool()) return winError();
         if (got == 0) break;
         total += got;
     }
@@ -1597,16 +1690,24 @@ pub fn writeFileAll(path: []const u8, bytes: []const u8) anyerror!void {
     var wbuf: [1024]u16 = undefined;
     const w = try widePath(path, &wbuf);
     const h = fl32.CreateFileW(w.ptr, GENERIC_WRITE, FILE_SHARE_READ, null, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, null);
-    if (h == invalidHandle()) return error.RequestFailed;
+    if (h == invalidHandle()) return winError();
     defer _ = c.CloseHandle(h);
     var written: u32 = 0;
-    if (!fl32.WriteFile(h, bytes.ptr, @intCast(bytes.len), &written, null).toBool()) return error.RequestFailed;
+    if (!fl32.WriteFile(h, bytes.ptr, @intCast(bytes.len), &written, null).toBool()) return winError();
 }
 
+/// 清理用 void 版本，专为 `defer`。
 pub fn deleteFile(path: []const u8) void {
+    deleteFileChecked(path) catch {};
+}
+
+pub fn deleteFileChecked(path: []const u8) !void {
     var wbuf: [1024]u16 = undefined;
-    const w = widePath(path, &wbuf) catch return;
-    _ = fl32.DeleteFileW(w.ptr);
+    const w = try widePath(path, &wbuf);
+    if (!fl32.DeleteFileW(w.ptr).toBool()) {
+        if (fl32.GetLastError() == ERROR_FILE_NOT_FOUND) return; // 幂等
+        return error.DeleteFailed;
+    }
 }
 
 /// 从 `offset` 处读入 `buf`，返回实际读到的字节数（文件尾会短读）。
@@ -1618,11 +1719,11 @@ pub fn readFileAt(path: []const u8, offset: u64, buf: []u8) anyerror!usize {
     if (h == invalidHandle()) return error.FileNotFound;
     defer _ = c.CloseHandle(h);
     const dist: std.os.windows.LARGE_INTEGER = @intCast(offset);
-    if (!fl32.SetFilePointerEx(h, dist, null, FILE_BEGIN).toBool()) return error.RequestFailed;
+    if (!fl32.SetFilePointerEx(h, dist, null, FILE_BEGIN).toBool()) return winError();
     var total: usize = 0;
     while (total < buf.len) {
         var got: u32 = 0;
-        if (!fl32.ReadFile(h, buf.ptr + total, @intCast(buf.len - total), &got, null).toBool()) return error.RequestFailed;
+        if (!fl32.ReadFile(h, buf.ptr + total, @intCast(buf.len - total), &got, null).toBool()) return winError();
         if (got == 0) break;
         total += got;
     }
@@ -1634,12 +1735,12 @@ pub fn appendFile(path: []const u8, bytes: []const u8) anyerror!void {
     var wbuf: [1024]u16 = undefined;
     const w = try widePath(path, &wbuf);
     const h = fl32.CreateFileW(w.ptr, GENERIC_WRITE, FILE_SHARE_READ, null, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, null);
-    if (h == invalidHandle()) return error.RequestFailed;
+    if (h == invalidHandle()) return winError();
     defer _ = c.CloseHandle(h);
     // 定位到文件末尾再写，等价于 POSIX 的 O_APPEND 语义。
-    if (!fl32.SetFilePointerEx(h, 0, null, FILE_END).toBool()) return error.RequestFailed;
+    if (!fl32.SetFilePointerEx(h, 0, null, FILE_END).toBool()) return winError();
     var written: u32 = 0;
-    if (!fl32.WriteFile(h, bytes.ptr, @intCast(bytes.len), &written, null).toBool()) return error.RequestFailed;
+    if (!fl32.WriteFile(h, bytes.ptr, @intCast(bytes.len), &written, null).toBool()) return winError();
 }
 
 /// 把文件截断到 `size` 字节。
@@ -1650,8 +1751,8 @@ pub fn truncateFile(path: []const u8, size: u64) anyerror!void {
     if (h == invalidHandle()) return error.FileNotFound;
     defer _ = c.CloseHandle(h);
     const dist: std.os.windows.LARGE_INTEGER = @intCast(size);
-    if (!fl32.SetFilePointerEx(h, dist, null, FILE_BEGIN).toBool()) return error.RequestFailed;
-    if (!fl32.SetEndOfFile(h).toBool()) return error.RequestFailed;
+    if (!fl32.SetFilePointerEx(h, dist, null, FILE_BEGIN).toBool()) return winError();
+    if (!fl32.SetEndOfFile(h).toBool()) return winError();
 }
 
 // ---- 文件句柄层（阶段 A）--------------------------------------------------
@@ -1662,7 +1763,7 @@ pub fn truncateFile(path: []const u8, size: u64) anyerror!void {
 // 与另外两个后端的同步 Work 池语义不一致。
 
 /// 打开文件并返回 HANDLE。
-pub fn openFile(path: []const u8, mode: root.FileMode) anyerror!root.Handle {
+pub fn openFile(path: []const u8, mode: types.FileMode) anyerror!types.Handle {
     var wbuf: [1024]u16 = undefined;
     const w = try widePath(path, &wbuf);
     const access: u32 = switch (mode) {
@@ -1696,7 +1797,7 @@ fn seekTo(h: HANDLE, offset: u64) anyerror!void {
 }
 
 /// 从 `offset` 读入 `buf`。返回实际读到的字节数；文件尾短读不报错。
-pub fn readFileHandle(file: root.Handle, offset: u64, buf: []u8) anyerror!usize {
+pub fn readFileHandle(file: types.Handle, offset: u64, buf: []u8) anyerror!usize {
     const h: HANDLE = @ptrFromInt(file);
     try seekTo(h, offset);
     var total: usize = 0;
@@ -1710,7 +1811,7 @@ pub fn readFileHandle(file: root.Handle, offset: u64, buf: []u8) anyerror!usize 
 }
 
 /// 从 `offset` 写入全部 `bytes`。返回写入的字节数。
-pub fn writeFileHandle(file: root.Handle, offset: u64, bytes: []const u8) anyerror!usize {
+pub fn writeFileHandle(file: types.Handle, offset: u64, bytes: []const u8) anyerror!usize {
     const h: HANDLE = @ptrFromInt(file);
     try seekTo(h, offset);
     var total: usize = 0;
@@ -1724,7 +1825,7 @@ pub fn writeFileHandle(file: root.Handle, offset: u64, bytes: []const u8) anyerr
 }
 
 /// 关闭句柄。无效句柄不报错（幂等）。
-pub fn closeFile(file: root.Handle) void {
+pub fn closeFile(file: types.Handle) void {
     const h: HANDLE = @ptrFromInt(file);
     if (h != invalidHandle()) _ = c.CloseHandle(h);
 }
@@ -1741,7 +1842,7 @@ fn fileTimeToUnixMs(ft: std.os.windows.FILETIME) i64 {
 
 /// 取句柄元数据。`GetFileInformationByHandle` 直接作用于句柄，
 /// 不需要重新解析路径（也就没有「open 后路径被换掉」的竞态）。
-pub fn statFile(file: root.Handle) anyerror!Stat {
+pub fn statFile(file: types.Handle) anyerror!Stat {
     const h: HANDLE = @ptrFromInt(file);
     if (h == invalidHandle()) return error.InvalidHandle;
     var info: BY_HANDLE_FILE_INFORMATION = undefined;
@@ -1762,7 +1863,7 @@ pub fn statFile(file: root.Handle) anyerror!Stat {
 
 /// 把句柄对应文件截断到 `size` 字节。
 /// 先定位到目标长度再 `SetEndOfFile`（Win32 没有 `ftruncate` 那种一步到位）。
-pub fn setFileSize(file: root.Handle, size: u64) anyerror!void {
+pub fn setFileSize(file: types.Handle, size: u64) anyerror!void {
     const h: HANDLE = @ptrFromInt(file);
     if (h == invalidHandle()) return error.InvalidHandle;
     try seekTo(h, size);
@@ -1770,13 +1871,11 @@ pub fn setFileSize(file: root.Handle, size: u64) anyerror!void {
 }
 
 /// 把缓冲内容刷到磁盘。`FlushFileBuffers` 是 Win32 的 `fsync` 等价物。
-pub fn syncFile(file: root.Handle) anyerror!void {
+pub fn syncFile(file: types.Handle) anyerror!void {
     const h: HANDLE = @ptrFromInt(file);
     if (h == invalidHandle()) return error.InvalidHandle;
     if (!fl32.FlushFileBuffers(h).toBool()) return error.SyncFailed;
 }
-
-
 
 /// Unix 纪元纳秒 → FILETIME（100ns 间隔，自 1601-01-01）。
 fn unixNsToFileTime(ns: i64) std.os.windows.FILETIME {
@@ -1789,7 +1888,7 @@ fn unixNsToFileTime(ns: i64) std.os.windows.FILETIME {
 }
 
 /// 改时间戳（`SetFileTime`）。时间是 Unix 纪元纳秒。
-pub fn setFileTimestamps(file: root.Handle, atime_ns: i64, mtime_ns: i64) anyerror!void {
+pub fn setFileTimestamps(file: types.Handle, atime_ns: i64, mtime_ns: i64) anyerror!void {
     const h: HANDLE = @ptrFromInt(file);
     if (h == invalidHandle()) return error.InvalidHandle;
     const atime = unixNsToFileTime(atime_ns);
@@ -1972,7 +2071,7 @@ const WinDirStream = struct {
 
 /// 打开目录。返回的是自建的流对象指针（不是 Win32 HANDLE），
 /// 由 `closeDir` 释放。
-pub fn openDir(st_alloc: std.mem.Allocator, path: []const u8) anyerror!root.Handle {
+pub fn openDir(st_alloc: std.mem.Allocator, path: []const u8) anyerror!types.Handle {
     var joined_buf: [1100]u8 = undefined;
     if (path.len + 3 > joined_buf.len) return error.NameTooLong;
     @memcpy(joined_buf[0..path.len], path);
@@ -1999,7 +2098,7 @@ pub fn openDir(st_alloc: std.mem.Allocator, path: []const u8) anyerror!root.Hand
 }
 
 /// 从目录流读下一批条目。
-pub fn readDirHandle(st_alloc: std.mem.Allocator, dir: root.Handle, buf: []root.DirEntry) anyerror!usize {
+pub fn readDirHandle(st_alloc: std.mem.Allocator, dir: types.Handle, buf: []types.DirEntry) anyerror!usize {
     _ = st_alloc;
     if (buf.len == 0) return 0;
     const stream: *WinDirStream = @ptrFromInt(dir);
@@ -2027,7 +2126,7 @@ pub fn readDirHandle(st_alloc: std.mem.Allocator, dir: root.Handle, buf: []root.
 }
 
 /// 关闭目录流。幂等。
-pub fn closeDir(st_alloc: std.mem.Allocator, dir: root.Handle) void {
+pub fn closeDir(st_alloc: std.mem.Allocator, dir: types.Handle) void {
     const stream: *WinDirStream = @ptrFromInt(dir);
     _ = fl32.FindClose(stream.handle);
     st_alloc.destroy(stream);
