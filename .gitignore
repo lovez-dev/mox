@@ -1,0 +1,15 @@
+# Build outputs and caches
+zig-out/
+/zig-out-*/
+.zig-cache/
+zig-cache/
+zig-pkg/
+out/
+tmp/
+
+# Editors and operating systems
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

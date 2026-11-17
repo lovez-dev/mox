@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / ${{ matrix.optimize }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm, ubuntu-24.04, ubuntu-24.04-arm, macos-latest]
+        optimize: [debug, safe]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Check and test
+        run: zig build check test --summary all -Doptimize=${{ matrix.optimize }}
+      - name: Verify downstream package and embed helper
+        run: zig build test-package --summary all
+      - name: Test explicit epoll
+        if: runner.os == 'Linux'
+        run: zig build test -Dbackend=epoll -Doptimize=${{ matrix.optimize }}
+      - name: Test explicit io_uring
+        if: runner.os == 'Linux'
+        run: zig build test -Dbackend=uring -Doptimize=${{ matrix.optimize }}
+
+  cross:
+    name: Compile / ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-windows, aarch64-linux-gnu, x86_64-macos, x86_64-freebsd, aarch64-freebsd]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Compile without executing target binaries
+        run: zig build check -Dtarget=${{ matrix.target }}
+
+  websocket:
+    name: WebSocket / Autobahn
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Run WebSocket protocol suite
+        run: sh tests/autobahn/run.sh

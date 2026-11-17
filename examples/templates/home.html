@@ -1,0 +1,5 @@
+{% extends "layouts/base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<ul>{% for item in items %}{% include "components/item.html" with item %}{% else %}<li>No items.</li>{% endfor %}</ul>
+{% endblock %}

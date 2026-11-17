@@ -1,0 +1,13 @@
+.{
+    .name = .mox_io_embed_example,
+    .version = "0.1.0",
+    .fingerprint = 0x0ef4f61a91bb6d14,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{ .mox_io = .{ .path = "../.." } },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+        "assets",
+    },
+}

@@ -1,0 +1,33 @@
+.{
+    .name = .mox,
+    .version = "0.1.0",
+    .fingerprint = 0x3f50f07f12876f0,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .lovez_bench = .{
+            .url = "git+https://github.com/lovez-dev/lovez-bench.git#c69441eb86078036b4b3aa4572b7edcedfc8fb09",
+            .hash = "lovez_bench-0.1.0-_h5dQpaFAAA_V2PMlVezkRfov4gPQApT_d9gl6O3pxjG",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "build",
+        "modules/mox_io",
+        "src",
+        "bench",
+        "examples",
+        "tests/integration.zig",
+        "tests/proxy.zig",
+        "tests/support.zig",
+        "tests/autobahn/server.zig",
+        "tests/package/build.zig",
+        "tests/package/build.zig.zon",
+        "tests/package/src",
+        "tests/package/assets",
+        "tests/package/views",
+        "docs",
+        "LICENSE",
+        "README.md",
+    },
+}
