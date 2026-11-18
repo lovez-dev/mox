@@ -885,12 +885,20 @@ pub fn Suite(comptime Backend: type) type {
             var pipe: mox_io.Pipe = .{};
             try pipe.init();
             defer pipe.deinit() catch unreachable;
+            // Use a private fixture so the cwd contract survives package relocation.
+            var tmp = testing.tmpDir(.{});
+            defer tmp.cleanup();
+            try tmp.dir.writeFile(testing.io, .{ .sub_path = "cwd-marker", .data = "" });
+            var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const path_len = try tmp.dir.realPath(testing.io, &path_buffer);
+            const cwd = try testing.allocator.dupeSentinel(u8, path_buffer[0..path_len], 0);
+            defer testing.allocator.free(cwd);
             const args: []const [:0]const u8 = if (builtin.os.tag == .windows)
                 &.{ "where.exe", "mox-io-argument-with-space and quote\" and slash\\" }
             else
-                &.{ "/bin/sh", "-c", "test \"$1\" = 'space and quote\" and slash\\' && test -f mox_io.zig && printf quoted", "sh", "space and quote\" and slash\\" };
+                &.{ "/bin/sh", "-c", "test \"$1\" = 'space and quote\" and slash\\' && test -f cwd-marker && printf quoted", "sh", "space and quote\" and slash\\" };
             // Windows where.exe uses ordinary argv parsing and returns 1 for no match.
-            try child.spawn(.{ .argv = args, .cwd = "src", .stdout = &pipe.writer, .stderr = &pipe.writer });
+            try child.spawn(.{ .argv = args, .cwd = cwd, .stdout = &pipe.writer, .stderr = &pipe.writer });
             try pipe.writer.close();
             var bytes: [2048]u8 = undefined;
             var read: mox_io.Pipe.Transfer = .{ .end = &pipe.reader, .read_buffer = &bytes };
