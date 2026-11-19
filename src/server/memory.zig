@@ -6,6 +6,14 @@ pub const Budget = struct {
     backing: std.mem.Allocator,
     limit: usize,
     used: usize = 0,
+    locked: std.atomic.Value(bool) = .init(false),
+
+    fn lock(self: *Budget) void {
+        while (self.locked.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+    fn unlock(self: *Budget) void {
+        self.locked.store(false, .release);
+    }
 
     pub fn allocator(self: *Budget) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
@@ -17,6 +25,8 @@ pub const Budget = struct {
 
     fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *Budget = @ptrCast(@alignCast(ptr));
+        self.lock();
+        defer self.unlock();
         if (!self.fits(len)) return null;
         const bytes = self.backing.rawAlloc(len, alignment, ra) orelse return null;
         self.used += len;
@@ -25,6 +35,8 @@ pub const Budget = struct {
 
     fn resize(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
         const self: *Budget = @ptrCast(@alignCast(ptr));
+        self.lock();
+        defer self.unlock();
         if (len > bytes.len and !self.fits(len - bytes.len)) return false;
         if (!self.backing.rawResize(bytes, alignment, len, ra)) return false;
         self.used = self.used - bytes.len + len;
@@ -33,6 +45,8 @@ pub const Budget = struct {
 
     fn remap(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
         const self: *Budget = @ptrCast(@alignCast(ptr));
+        self.lock();
+        defer self.unlock();
         if (len > bytes.len and !self.fits(len - bytes.len)) return null;
         const result = self.backing.rawRemap(bytes, alignment, len, ra) orelse return null;
         self.used = self.used - bytes.len + len;
@@ -41,6 +55,8 @@ pub const Budget = struct {
 
     fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
         const self: *Budget = @ptrCast(@alignCast(ptr));
+        self.lock();
+        defer self.unlock();
         self.backing.rawFree(bytes, alignment, ra);
         self.used -= bytes.len;
     }

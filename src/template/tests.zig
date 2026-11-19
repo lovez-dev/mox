@@ -1,6 +1,47 @@
 const std = @import("std");
 const t = @import("../template.zig");
 
+test "trusted HTML preserves markup while ordinary text stays escaped across sinks" {
+    const Data = struct { html: t.SafeHtml, text: []const u8 };
+    const Page = t.Template("<main>{{{ html }}}<p>{{ text }}</p></main>", Data);
+    const data: Data = .{ .html = t.SafeHtml.fromTrusted("<strong>A&amp;B</strong>"), .text = "<visitor>" };
+    const expected = "<main><strong>A&amp;B</strong><p>&lt;visitor&gt;</p></main>";
+    var output: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(expected, try Page.renderInto(&output, data, .{}));
+    const allocated = try Page.renderAlloc(std.testing.allocator, data, .{});
+    defer std.testing.allocator.free(allocated);
+    try std.testing.expectEqualStrings(expected, allocated);
+    var writer = std.Io.Writer.fixed(&output);
+    try Page.renderTo(&writer, data, .{});
+    try std.testing.expectEqualStrings(expected, writer.buffered());
+}
+
+test "trusted HTML still validates text, input and output budgets, and cancellation" {
+    const Page = t.Template("{{{ html }}}", struct { html: t.SafeHtml });
+    var output: [64]u8 = undefined;
+    for ([_][]const u8{ "\xff", "\x00" }) |invalid| {
+        try std.testing.expectError(error.InvalidText, Page.renderInto(&output, .{ .html = .{ .bytes = invalid } }, .{}));
+    }
+    const html = t.SafeHtml.fromTrusted("<p>valid</p>");
+    try std.testing.expectError(error.InputLimitExceeded, Page.renderInto(&output, .{ .html = html }, .{ .max_input_bytes = html.bytes.len - 1 }));
+    try std.testing.expectError(error.OutputLimitExceeded, Page.renderInto(&output, .{ .html = html }, .{ .max_output_bytes = html.bytes.len - 1 }));
+    var cancel = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, Page.renderInto(&output, .{ .html = html }, .{ .cancelled = &cancel }));
+    try std.testing.expectEqualStrings("", try Page.renderInto(&output, .{ .html = t.SafeHtml.fromTrusted("") }, .{}));
+}
+
+test "quoted string expressions ignore embedded operators and escape their output" {
+    const Page = t.Template("{% if language == \"en\" %}English{% endif %}{% if text == \"a and b == c or d\" %}yes{% endif %}{{ \"<literal>&\" }}", struct { language: []const u8, text: []const u8 });
+    var output: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("Englishyes&lt;literal&gt;&amp;", try Page.renderInto(&output, .{ .language = "en", .text = "a and b == c or d" }, .{}));
+}
+
+test "dynamic datetime and download values use attribute escaping" {
+    const Page = t.Template("<time datetime=\"{{ date }}\">now</time><a href=\"{{ url }}\" download=\"{{ filename }}\">file</a>", struct { date: []const u8, filename: []const u8, url: t.Url });
+    var output: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("<time datetime=\"2026-01-01\">now</time><a href=\"/file\" download=\"a&quot;b.txt\">file</a>", try Page.renderInto(&output, .{ .date = "2026-01-01", .filename = "a\"b.txt", .url = try t.Url.init("/file") }, .{}));
+}
+
 test "typed interpolation and optional narrowing" {
     const User = struct { name: []const u8 };
     const Page = t.Template("<h1>{{ title }}</h1>{% if user %}<p>{{ user.name }}</p>{% else %}<p>Guest</p>{% endif %}", struct { title: []const u8, user: ?User });

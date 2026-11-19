@@ -23,6 +23,24 @@ pub const Diagnostic = struct {
 
 pub const Error = error{ OutputLimitExceeded, InputLimitExceeded, IterationLimitExceeded, WorkLimitExceeded, BufferTooSmall, InvalidText, InvalidUrl, InvalidNumber, Cancelled };
 
+/// References caller memory, which must remain valid and unchanged through rendering.
+/// Trust boundary: only use for balanced markup from a checked template or a
+/// renderer that escapes untrusted source. This does not sanitize HTML.
+pub const SafeHtml = struct {
+    bytes: []const u8,
+
+    pub fn fromTrusted(bytes: []const u8) SafeHtml {
+        return .{ .bytes = bytes };
+    }
+};
+
+pub fn emitHtml(sink: anytype, budget: *Budget, value: SafeHtml) !void {
+    try budget.scan(value.bytes.len);
+    try validateText(value.bytes);
+    try budget.poll();
+    try sink.writeAll(value.bytes);
+}
+
 /// References caller memory. Validation is repeated when rendered, including for
 /// directly initialized values; the bytes must remain valid and unchanged.
 pub const Url = struct {

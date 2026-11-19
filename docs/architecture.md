@@ -10,21 +10,21 @@ The router resolves methods and path parameters, then invokes the composed handl
 
 ## Backpressure and bounded state
 
-At the connection limit, acceptance pauses and the kernel backlog holds incoming connections. Request admission, memory budgets, message limits, and bounded output queues constrain different resources. Socket completion drives the next stream-production call, so application producers do not outrun transmission. Handlers execute on the loop and must not perform blocking application work.
+At the connection limit, acceptance pauses and the kernel backlog holds incoming connections. Request admission, memory budgets, message limits, and bounded output queues constrain different resources. Socket completion drives the next stream-production call, so application producers do not outrun transmission. Handlers execute on the loop by default and must return promptly there. `blocking_handlers` dispatches complete request handlers to the existing mox_io worker pool; queued and running work remains subject to request admission and fixed loop capacity. The loop alone publishes responses, updates observations, and submits transport work. An allocator lock protects the shared dynamic-memory budget across the loop and workers.
 
-WebSocket parsing and fragmentation state remain separate from transport submission. SSE events and HTTP chunks are encoded into caller-managed buffers before submission. File work uses mox_io's file execution path; proxying uses a separate upstream connection with an explicit response bound.
+WebSocket parsing and fragmentation state remain separate from transport submission. Upgraded connections have a dedicated admission counter and release their ordinary HTTP request slots. `upgradeBlocking` copies each reassembled data message into an arena and runs one message callback at a time off the loop; its reply is copied into the output queue before that arena is released. SSE events and HTTP chunks are encoded into caller-managed buffers before submission. File work uses mox_io's file execution path; proxying uses a separate upstream connection with an explicit response bound.
 
 ## Cancellation and release
 
 Successfully submitted operations retain their input/output buffers until the terminal completion is consumed. Closing a connection requests cancellation, then waits for pending operation and close completions before releasing the connection and its storage. Submission failure creates no future completion and must be cleaned up locally.
 
-Graceful shutdown stops accepting and stops admitting new keep-alive requests. Active requests can drain until the configured deadline; forced shutdown cancels them. The deadline ends application draining, while backend cleanup can take longer. A connection is never freed merely because a shutdown timeout expired.
+Graceful shutdown stops accepting and stops admitting new keep-alive requests. Active requests can drain until the configured deadline; forced shutdown cancels them. The deadline ends application draining, while backend cleanup can take longer. A connection is never freed merely because a shutdown timeout expired. Worker operation IDs are cancelled with their connection. Queued callbacks can be skipped, but a running callback must return before its completion releases request storage. If it returns a stream after cancellation, that stream still receives its one cancellation close hook.
 
 ## Module responsibilities
 
 `http.zig`, `router.zig`, and `multipart.zig` implement independent codecs and dispatch. `types.zig` defines public handlers and data contracts. `middleware.zig` composes request policies. `server/` handles completion-driven connection lifecycles and response sessions; `websocket/protocol.zig` validates frame syntax and UTF-8. `root.zig` is the public runtime import, and `build.zig` exports the library, asset embedding helper, and optional template build helper.
 
-One `serve` call has one loop thread. Backend file workers do not automatically parallelize handlers. Applications requiring multiple HTTP execution threads must explicitly arrange their server topology and application synchronization.
+One `serve` call has one loop thread. Enabling `blocking_handlers` reuses backend workers rather than constructing a second application pool. Application callbacks may then overlap across requests and must synchronize shared mutable state. Body-stream, stream-producer, ordinary WebSocket, and SSE callbacks still execute on the loop; worker WebSocket callbacks are selected separately through `upgradeBlocking`.
 
 ## HTML templates
 

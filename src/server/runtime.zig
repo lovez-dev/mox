@@ -58,6 +58,16 @@ fn Server(comptime Loop: type) type {
 
         const Connection = struct {
             server: *Self,
+            peer: t.Address = .{},
+            // Work owns request arenas until its terminal completion; pending pins the connection.
+            work_response: types.Response = .{},
+            work_error: ?anyerror = null,
+            work_active: bool = false,
+            work_id: ?t.OpId = null,
+            ws_work: bool = false,
+            ws_result: []const u8 = "",
+            ws_message: types.WsMessage = .{ .opcode = .text, .data = &.{} },
+            ws_arena: ?std.heap.ArenaAllocator = null,
             handle: ?t.Handle,
             file: ?t.Handle = null,
             upstream: ?t.Handle = null,
@@ -83,6 +93,7 @@ fn Server(comptime Loop: type) type {
             consumed: usize = 0,
             chunk_decoder: http.ChunkedDecoder = .{},
             admitted: bool = false,
+            websocket_admitted: bool = false,
             observation: Observation = .{},
             response: types.Response = .{},
             stream_done: bool = false,
@@ -116,7 +127,7 @@ fn Server(comptime Loop: type) type {
             }
 
             fn context(c: *Connection) types.Context {
-                return .{ .gpa = c.arena.allocator(), .request = &c.request.?, .params = &c.params, .body = c.request.?.body };
+                return .{ .gpa = c.arena.allocator(), .request = &c.request.?, .params = &c.params, .body = c.request.?.body, .peer = c.peer };
             }
 
             fn receive(c: *Connection) !void {
@@ -146,6 +157,7 @@ fn Server(comptime Loop: type) type {
             fn close(c: *Connection) void {
                 if (c.closing) return;
                 c.closing = true;
+                if (c.work_id) |id| _ = c.server.loop.cancel(id) catch {};
                 c.closeHandle(&c.handle);
                 c.closeHandle(&c.file);
                 c.closeHandle(&c.upstream);
@@ -156,13 +168,21 @@ fn Server(comptime Loop: type) type {
                 c.input.items.len -= count;
             }
 
+            fn releaseHttpAdmission(c: *Connection) void {
+                if (c.admitted) {
+                    c.server.admission.release();
+                    c.admitted = false;
+                }
+            }
+
             fn finishObservation(c: *Connection, complete: bool) void {
                 if (c.observation.finish(c.server.loop.now() / 1_000_000, complete)) |event| {
                     if (c.server.config.on_request_complete) |callback| callback(event);
                 }
-                if (c.admitted) {
-                    c.server.admission.release();
-                    c.admitted = false;
+                c.releaseHttpAdmission();
+                if (c.websocket_admitted) {
+                    c.server.admission.releaseWebSocket();
+                    c.websocket_admitted = false;
                 }
             }
 
@@ -196,6 +216,8 @@ fn Server(comptime Loop: type) type {
                 c.body_received = 0;
                 c.consumed = 0;
                 c.response = .{};
+                c.work_error = null;
+                c.work_response = .{};
                 c.chunk_decoder = .{};
                 c.mode = .reading;
                 try c.process();
@@ -312,12 +334,36 @@ fn Server(comptime Loop: type) type {
                     try c.startProxy(options_);
                     return;
                 };
+                if (c.server.config.blocking_handlers) {
+                    // Unbound Work still pins connection storage through pending; close cancels work_id.
+                    c.work_id = c.server.loop.work(.{ .context = c, .run = runHandler }, c.options()) catch |err| {
+                        if (err == error.Capacity) return c.respond(.{ .status = .service_unavailable, .body = "service unavailable" });
+                        return err;
+                    };
+                    c.work_active = true;
+                    c.pending += 1;
+                    return;
+                }
+                try c.respond(try c.callHandler());
+            }
+
+            fn runHandler(ptr: ?*anyopaque, _: usize) io.Error!usize {
+                const c: *Connection = @ptrCast(@alignCast(ptr.?));
+                c.work_response = c.callHandler() catch |err| {
+                    c.work_error = err;
+                    c.work_response = .{ .status = .internal_server_error };
+                    return 0;
+                };
+                return 0;
+            }
+
+            fn callHandler(c: *Connection) !types.Response {
+                const req = &c.request.?;
                 var ctx = c.context();
                 var response: types.Response = undefined;
                 if (c.entry) |entry| {
                     response = entry.handler(&ctx) catch |err| blk: {
-                        metrics.requestFailed();
-                        c.observation.error_name = @errorName(err);
+                        c.work_error = err;
                         break :blk c.server.config.error_handler(&ctx, err);
                     };
                 } else {
@@ -334,7 +380,7 @@ fn Server(comptime Loop: type) type {
                         response = .{ .status = .method_not_allowed, .headers = headers_ };
                     } else response = c.server.config.not_found(&ctx) catch |err| c.server.config.error_handler(&ctx, err);
                 }
-                try c.respond(response);
+                return response;
             }
 
             fn headers(c: *Connection, response: types.Response, length: u64, chunked: bool) !void {
@@ -352,6 +398,11 @@ fn Server(comptime Loop: type) type {
             }
 
             fn respond(c: *Connection, response: types.Response) anyerror!void {
+                if (c.work_error) |err| {
+                    metrics.requestFailed();
+                    c.observation.error_name = @errorName(err);
+                    c.work_error = null;
+                }
                 c.response = response;
                 c.observation.status = @intCast(@backingInt(response.status));
                 c.mode = .response;
@@ -365,10 +416,16 @@ fn Server(comptime Loop: type) type {
                         try c.fail(.bad_request);
                         return;
                     };
+                    if (!c.server.admission.acquireWebSocket()) {
+                        return c.respond(.{ .status = .service_unavailable, .body = "service unavailable" });
+                    }
+                    c.websocket_admitted = true;
+                    c.releaseHttpAdmission();
                     c.ws_handler = handler;
                     c.mode = .websocket;
                     c.observation.status = 101;
                     try c.output.appendSlice(c.allocator(), bytes);
+                    if (response.blocking_ws != null and response.body.len != 0) try wsSend(c, .text, response.body);
                 } else if (response.sse_handler != null and !c.headOnly()) {
                     if (!c.chunkedAllowed()) {
                         try c.fail(.http_version_not_supported);
@@ -487,7 +544,30 @@ fn Server(comptime Loop: type) type {
                 c.ws_deadline = c.server.loop.now() + 5_000_000_000;
             }
 
+            fn runWs(ptr: ?*anyopaque, _: usize) io.Error!usize {
+                const c: *Connection = @ptrCast(@alignCast(ptr.?));
+                c.ws_result = c.response.blocking_ws.?(c.response.ws_state, c.ws_arena.?.allocator(), c.ws_message) catch |err| {
+                    c.work_error = err;
+                    return 0;
+                };
+                return 0;
+            }
+
+            fn startWsWork(c: *Connection, message: types.WsMessage) !void {
+                c.ws_arena = std.heap.ArenaAllocator.init(c.allocator());
+                errdefer {
+                    c.ws_arena.?.deinit();
+                    c.ws_arena = null;
+                }
+                c.ws_message = .{ .opcode = message.opcode, .data = try c.ws_arena.?.allocator().dupe(u8, message.data) };
+                c.work_id = try c.server.loop.work(.{ .context = c, .run = runWs }, c.options());
+                c.work_active = true;
+                c.ws_work = true;
+                c.pending += 1;
+            }
+
             fn processWs(c: *Connection) !void {
+                if (c.work_active) return;
                 if (c.consumed != 0) {
                     c.removeInput(c.consumed);
                     c.consumed = 0;
@@ -538,13 +618,23 @@ fn Server(comptime Loop: type) type {
                             if (c.fragment_opcode != null or !frame.final) {
                                 try c.fragments.appendSlice(c.allocator(), frame.payload);
                                 c.fragment_opcode = opcode;
-                                if (frame.final) {
-                                    c.ws_handler.?(handle, .{ .opcode = opcode, .data = c.fragments.items });
-                                    c.fragments.clearRetainingCapacity();
-                                    c.fragment_opcode = null;
+                                if (!frame.final) {
+                                    c.removeInput(frame.consumed);
+                                    continue;
                                 }
-                            } else c.ws_handler.?(handle, .{ .opcode = opcode, .data = frame.payload });
-                            if (frame.final) c.utf8 = .{};
+                            }
+                            const message: types.WsMessage = .{ .opcode = opcode, .data = if (c.fragment_opcode != null) c.fragments.items else frame.payload };
+                            if (c.response.blocking_ws != null) {
+                                try c.startWsWork(message);
+                            } else c.ws_handler.?(handle, message);
+                            c.fragments.clearRetainingCapacity();
+                            c.fragment_opcode = null;
+                            c.utf8 = .{};
+                            if (c.work_active) {
+                                c.removeInput(frame.consumed);
+                                try c.flush();
+                                return;
+                            }
                         },
                         else => unreachable,
                     }
@@ -628,6 +718,29 @@ fn Server(comptime Loop: type) type {
             }
 
             fn completed(c: *Connection, result: t.Completion) !void {
+                if (result.kind == .work) {
+                    c.work_active = false;
+                    c.work_id = null;
+                    if (c.closing or result.status != .ok) {
+                        // A completed callback can return a stream after cancellation.
+                        // Retain it for releaseRequest so its close hook still runs once.
+                        if (!c.ws_work) c.response = c.work_response;
+                        c.close();
+                        return;
+                    }
+                    if (c.ws_work) {
+                        c.ws_work = false;
+                        if (c.work_error != null) {
+                            c.endWs(1011);
+                        } else try wsSend(c, .text, c.ws_result);
+                        c.ws_arena.?.deinit();
+                        c.ws_arena = null;
+                        c.work_error = null;
+                        try c.flush();
+                        try c.processWs();
+                    } else try c.respond(c.work_response);
+                    return;
+                }
                 if (result.kind == .close) return;
                 if (c.closing) {
                     if (result.opened) |h| {
@@ -737,7 +850,7 @@ fn Server(comptime Loop: type) type {
         };
 
         fn init(self: *Self, config: types.Config) !void {
-            self.* = .{ .config = config, .loop = undefined, .budget = .{ .backing = config.gpa, .limit = config.max_memory_bytes }, .router = undefined, .admission = .{ .max_inflight = config.max_inflight_requests, .max_per_second = config.max_requests_per_second } };
+            self.* = .{ .config = config, .loop = undefined, .budget = .{ .backing = config.gpa, .limit = config.max_memory_bytes }, .router = undefined, .admission = .{ .max_inflight = config.max_inflight_requests, .max_websockets = config.max_websocket_connections, .max_per_second = config.max_requests_per_second } };
             self.router = try routing.Router.init(self.budget.allocator(), config.routes);
             errdefer self.router.deinit();
             try self.loop.init(io.mem.PageAllocator.allocator(), .{ .operations = @intCast(config.max_connections * 4 + 16), .resources = @intCast(config.max_connections * 3 + 1), .events = 128 });
@@ -798,7 +911,7 @@ fn Server(comptime Loop: type) type {
                                     self.listener_pending += 1;
                                     continue;
                                 };
-                                c.* = .{ .server = self, .handle = h, .arena = std.heap.ArenaAllocator.init(self.budget.allocator()) };
+                                c.* = .{ .server = self, .handle = h, .peer = result.peer, .arena = std.heap.ArenaAllocator.init(self.budget.allocator()) };
                                 self.connections.append(self.budget.allocator(), c) catch {
                                     self.budget.allocator().destroy(c);
                                     self.loop.close(h, .cancel, 0) catch |err| if (err != error.NativeFailure) return err;
@@ -839,6 +952,7 @@ fn Server(comptime Loop: type) type {
                 }
                 c.releaseRequest(.cancelled);
                 c.finishObservation(false);
+                if (c.ws_arena) |*arena| arena.deinit();
                 c.arena.deinit();
                 c.input.deinit(c.allocator());
                 c.output.deinit(c.allocator());

@@ -133,6 +133,10 @@ pub const Response = struct {
     file_path: []const u8 = "",
     /// WebSocket handler interpreted by the server runtime.
     ws_handler: ?WsHandler = null,
+    /// Complete text/binary messages run on a worker and return one text frame.
+    blocking_ws: ?WsWorkHandler = null,
+    /// Application state kept valid until the upgraded connection retires.
+    ws_state: ?*anyopaque = null,
     /// SSE handler interpreted by the server runtime.
     sse_handler: ?SseHandler = null,
     /// Return already serialized JSON bytes with content_type set to application/json.
@@ -158,6 +162,14 @@ pub const Response = struct {
     pub fn upgrade(handler: WsHandler) Response {
         return .{ .ws_handler = handler };
     }
+
+    /// Run complete data messages serially on workers; control frames stay on the loop.
+    /// Returned text may reference message.data, state, or the supplied arena.
+    pub fn upgradeBlocking(state: ?*anyopaque, handler: WsWorkHandler) Response {
+        return .{ .ws_handler = ignoreWs, .blocking_ws = handler, .ws_state = state };
+    }
+
+    fn ignoreWs(_: WsConn, _: WsMessage) void {}
 
     /// Start an SSE stream. If the handler returns true, send completions or
     /// writer.setTick(ms) schedule subsequent invocations after the response headers.
@@ -213,6 +225,10 @@ pub const WsVtable = struct {
 /// Event-loop callback for complete text/binary messages, ping/pong, and valid peer close frames.
 /// The handle must not escape the callback or cross threads. Ping is answered automatically.
 pub const WsHandler = *const fn (conn: WsConn, msg: WsMessage) void;
+/// Runs off the loop. The message and arena remain valid until its terminal
+/// completion; never retain either or call WsConn from this callback. Errors close
+/// the WebSocket with 1011. Other messages on this connection wait for completion.
+pub const WsWorkHandler = *const fn (state: ?*anyopaque, arena: std.mem.Allocator, msg: WsMessage) anyerror![]const u8;
 
 /// Runtime-owned writer used by an SSE handler to publish events.
 pub const SseWriter = struct {
@@ -248,6 +264,8 @@ pub const SseHandler = *const fn (writer: SseWriter) bool;
 
 /// Per-request state passed to handlers and middleware, valid during invocation.
 pub const Context = struct {
+    /// Socket peer, independent of untrusted forwarded request headers.
+    peer: mox_io.types.Address = .{},
     gpa: std.mem.Allocator,
     request: *const http.Request,
     /// Captured path parameters, valid for this request only.
@@ -502,6 +520,10 @@ pub const RequestEvent = struct {
 pub const Backend = enum { default, epoll, uring, kqueue, iocp };
 
 pub const Config = struct {
+    /// Run route, not_found and error handlers on the existing I/O worker pool.
+    /// Callbacks may overlap across requests; body, stream and SSE callbacks stay
+    /// on the loop. Request storage is retained until running callbacks return.
+    blocking_handlers: bool = false,
     backend: Backend = .default,
     /// Optional embedded files, kept valid until serve() returns; disk is the fallback.
     assets: ?*const mox_io.fs.EmbeddedFs = null,
@@ -517,9 +539,10 @@ pub const Config = struct {
 
     /// Maximum concurrent connections. At capacity, stop accepting and leave new connections in the kernel backlog.
     max_connections: usize = 1024,
-    /// Per-server requests from parsed head through response completion; 0 disables.
-    /// WebSocket/SSE hold a slot for their entire connection lifetime.
+    /// Per-server requests from parsed head through response completion; SSE holds its slot for the stream lifetime; 0 disables.
     max_inflight_requests: usize = 0,
+    /// Maximum upgraded WebSocket connections, independent of ordinary request capacity; 0 disables this limit.
+    max_websocket_connections: usize = 256,
     /// Per-server fixed one-second window, shared across all routes; 0 disables.
     max_requests_per_second: u32 = 0,
     /// Aggregate dynamic framework/request memory budget across active connections, excluding kernel and loop infrastructure; 0 is unlimited.

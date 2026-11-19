@@ -37,14 +37,15 @@ pub fn yield() void {
 pub fn start(self: *Thread, callback: *const fn (*anyopaque) void, context: *anyopaque) Error!void {
     self.* = .{ .callback = callback, .context = context };
     if (builtin.os.tag == .windows) {
-        // STACK_SIZE_PARAM_IS_A_RESERVATION keeps the 1 MiB reservation lazily committed.
-        self.native = @intFromPtr(CreateThread(null, 1024 * 1024, windowsEntry, self, 0x10000, null) orelse return error.NativeFailure);
+        // std.Io filesystem callbacks can exceed 1 MiB in Debug builds.
+        // STACK_SIZE_PARAM_IS_A_RESERVATION commits the 16 MiB reservation lazily.
+        self.native = @intFromPtr(CreateThread(null, 16 * 1024 * 1024, windowsEntry, self, 0x10000, null) orelse return error.NativeFailure);
     } else {
         // Opaque storage is sized/aligned for pthread_attr_t on the supported targets.
         var attributes: [64]u8 align(8) = undefined;
         if (pthread_attr_init(&attributes) != 0) return error.NativeFailure;
         defer _ = pthread_attr_destroy(&attributes);
-        if (pthread_attr_setstacksize(&attributes, 1024 * 1024) != 0) return error.NativeFailure;
+        if (pthread_attr_setstacksize(&attributes, 16 * 1024 * 1024) != 0) return error.NativeFailure;
         if (pthread_create(&self.native, &attributes, posixEntry, self) != 0) return error.NativeFailure;
     }
 }

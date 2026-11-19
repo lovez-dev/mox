@@ -54,7 +54,7 @@ pub const State = struct {
             self.dynamic_url = true;
             return .url;
         }
-        if (!oneOf(attr, "id class title alt name value placeholder role lang dir width height colspan rowspan tabindex min max step pattern for") and !std.mem.startsWith(u8, attr, "aria-") and !std.mem.startsWith(u8, attr, "data-")) @compileError("dynamic attribute is outside the supported safe attribute subset");
+        if (!oneOf(attr, "id class title alt name value placeholder role lang dir width height colspan rowspan tabindex min max step pattern for datetime download") and !std.mem.startsWith(u8, attr, "aria-") and !std.mem.startsWith(u8, attr, "data-")) @compileError("dynamic attribute is outside the supported safe attribute subset");
         self.value_len += 1;
         return .attribute;
     }
@@ -67,7 +67,7 @@ pub const State = struct {
         if (!oneOf(tag, "html head body title meta link base style script main header footer nav section article aside h1 h2 h3 h4 h5 h6 div p span a strong em b i u s small sub sup mark time code pre blockquote q br hr wbr ul ol li dl dt dd table caption colgroup col thead tbody tfoot tr th td form label input button select option optgroup textarea fieldset legend datalist output progress meter details summary dialog img picture source video audio track canvas iframe object embed area map address figure figcaption abbr cite kbd samp var ruby rt rp bdi bdo ins del")) @compileError("unsupported HTML element (foreign content and parser-changing elements are forbidden)");
         const is_void = oneOf(tag, "area base br col embed hr img input link meta source track wbr");
         if (self.closing) {
-            if (self_closing or is_void or self.depth <= self.floor or !self.stack[self.depth - 1].eql(tag)) @compileError("unbalanced HTML closing tag");
+            if (self_closing or is_void or self.depth <= self.floor or !self.stack[self.depth - 1].eql(tag)) @compileError("unbalanced HTML closing tag: " ++ tag);
             self.depth -= 1;
         } else if (!is_void) {
             if (self_closing) @compileError("non-void HTML elements require an explicit closing tag");

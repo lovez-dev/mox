@@ -72,9 +72,8 @@ pub const StreamParser = struct {
                 if (std.mem.startsWith(u8, self.pending.items[used..], "--")) {
                     used += 2;
                     self.consume(used);
-                    self.state = .done;
-                    try handler(state, .complete);
-                    break;
+                    self.state = .closing;
+                    continue;
                 }
                 if (!std.mem.startsWith(u8, self.pending.items[used..], "\r\n")) return self.fail(error.TruncatedBody);
                 self.consume(used + 2);
@@ -195,12 +194,18 @@ pub fn parse(
 
     var pos: usize = 0;
     var count: usize = 0;
+    var closed = false;
 
     pos = std.mem.indexOf(u8, body, delim) orelse return error.TruncatedBody;
     pos += delim.len;
-    if (pos + 2 <= body.len and body[pos] == '-' and body[pos + 1] == '-') return 0;
-    if (pos < body.len and body[pos] == '\r') pos += 1;
-    if (pos < body.len and body[pos] == '\n') pos += 1;
+    if (pos + 2 > body.len) return error.TruncatedBody;
+    if (body[pos] == '-' and body[pos + 1] == '-') {
+        pos += 2;
+        if (pos == body.len or (pos + 2 == body.len and std.mem.eql(u8, body[pos..], "\r\n"))) return 0;
+        return error.TruncatedBody;
+    }
+    if (body[pos] != '\r' or body[pos + 1] != '\n') return error.TruncatedBody;
+    pos += 2;
 
     while (pos < body.len) {
         const next = std.mem.indexOf(u8, body[pos..], delim) orelse return error.TruncatedBody;
@@ -230,14 +235,50 @@ pub fn parse(
         count += 1;
 
         pos += next + delim.len;
-        if (pos + 2 <= body.len and body[pos] == '-' and body[pos + 1] == '-') break;
-        if (pos < body.len and body[pos] == '\r') pos += 1;
-        if (pos < body.len and body[pos] == '\n') pos += 1;
+        if (pos + 2 > body.len) return error.TruncatedBody;
+        if (body[pos] == '-' and body[pos + 1] == '-') {
+            pos += 2;
+            if (pos != body.len and (pos + 2 != body.len or !std.mem.eql(u8, body[pos..], "\r\n"))) return error.TruncatedBody;
+            closed = true;
+            break;
+        }
+        if (body[pos] != '\r' or body[pos + 1] != '\n') return error.TruncatedBody;
+        pos += 2;
     }
+    if (!closed) return error.TruncatedBody;
     return count;
 }
 
-/// Extract a name or filename parameter from Content-Disposition.
+test "parse rejects a body without a closing multipart delimiter" {
+    const body = "--BOUND\r\n" ++
+        "Content-Disposition: form-data; name=\"field\"\r\n" ++
+        "\r\n" ++
+        "value\r\n" ++
+        "--BOUND";
+    var parts: [4]Part = undefined;
+    try std.testing.expectError(error.TruncatedBody, parse(body, "BOUND", &parts));
+}
+
+test "parse requires a complete delimiter after each multipart part" {
+    const body = "--BOUND\r\n" ++
+        "Content-Disposition: form-data; name=\"field\"\r\n" ++
+        "\r\n" ++
+        "value\r\n" ++
+        "--BOUNDx";
+    var parts: [4]Part = undefined;
+    try std.testing.expectError(error.TruncatedBody, parse(body, "BOUND", &parts));
+}
+
+test "parse rejects data after the terminal multipart delimiter" {
+    const body = "--BOUND\r\n" ++
+        "Content-Disposition: form-data; name=\"field\"\r\n" ++
+        "\r\n" ++
+        "value\r\n" ++
+        "--BOUND--x";
+    var parts: [4]Part = undefined;
+    try std.testing.expectError(error.TruncatedBody, parse(body, "BOUND", &parts));
+}
+
 fn extractParam(header_val: []const u8, param: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i < header_val.len) {
@@ -317,6 +358,14 @@ const StreamCollector = struct {
         }
     }
 };
+
+test "stream parser rejects trailing data after an empty closing delimiter" {
+    var parser = try StreamParser.init(std.testing.allocator, "BOUND");
+    defer parser.deinit();
+    var collector = StreamCollector{};
+    defer collector.bytes.deinit(std.testing.allocator);
+    try std.testing.expectError(error.TruncatedBody, parser.feed("--BOUND--x", true, &collector, StreamCollector.handle));
+}
 
 test "stream parser handles boundaries split between chunks" {
     var parser = try StreamParser.init(std.testing.allocator, "BOUND");

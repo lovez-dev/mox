@@ -52,6 +52,7 @@ pub const WsConn = types.WsConn;
 pub const WsMessage = types.WsMessage;
 pub const WsOpcode = types.WsOpcode;
 pub const WsHandler = types.WsHandler;
+pub const WsWorkHandler = types.WsWorkHandler;
 pub const WsSendError = types.WsSendError;
 pub const SseWriter = types.SseWriter;
 pub const SseHandler = types.SseHandler;

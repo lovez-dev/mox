@@ -1,7 +1,7 @@
 //! Bounded compile-time syntax and layout expansion; no source-language evaluation.
 const std = @import("std");
 pub const Source = struct { path: []const u8, text: []const u8 };
-pub const Kind = enum { text, value, comment, condition, loop, include, attr, block, extends, end, alternative };
+pub const Kind = enum { text, value, safe_html, comment, condition, loop, include, attr, block, extends, end, alternative };
 pub const Node = struct {
     kind: Kind,
     text: []const u8,
@@ -26,6 +26,12 @@ fn token(source: []const u8, at: usize) Node {
     }
     if (i + 1 >= source.len) i = source.len;
     if (i != at) return .{ .kind = .text, .text = source[at..i], .next = i, .offset = at };
+    if (std.mem.startsWith(u8, source[at..], "{{{")) {
+        const end = std.mem.indexOfPos(u8, source, at + 3, "}}}") orelse @compileError("unterminated safe HTML interpolation");
+        const expression = trim(source[at + 3 .. end]);
+        if (expression.len == 0) @compileError("empty safe HTML interpolation");
+        return .{ .kind = .safe_html, .text = expression, .next = end + 3, .offset = at };
+    }
     const marker = source[at + 1];
     const close = switch (marker) {
         '{' => "}}",

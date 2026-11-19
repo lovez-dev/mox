@@ -61,6 +61,20 @@ pub fn LoopEnv(comptime E: type, comptime name: []const u8, comptime T: type) ty
 
 const Op = enum { value, invert, conjunction, disjunction, equal, unequal, less, greater, less_equal, greater_equal };
 const Expression = struct { op: Op = .value, left: []const u8, right: []const u8 = "" };
+fn stringLiteral(comptime value: []const u8) bool {
+    return value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"' and std.mem.indexOfScalar(u8, value[1 .. value.len - 1], '"') == null;
+}
+
+fn operatorAt(comptime text: []const u8, comptime operator: []const u8) ?usize {
+    var quoted = false;
+    for (text, 0..) |byte, i| {
+        if (byte == '"') quoted = !quoted;
+        if (!quoted and std.mem.startsWith(u8, text[i..], operator)) return i;
+    }
+    if (quoted) @compileError("unterminated string literal");
+    return null;
+}
+
 fn comparison(op: Op) bool {
     return switch (op) {
         .equal, .unequal, .less, .greater, .less_equal, .greater_equal => true,
@@ -73,7 +87,7 @@ fn parse(comptime raw: []const u8) Expression {
     const operators = .{ " or ", " and ", " == ", " != ", " <= ", " >= ", " < ", " > " };
     const ops = [_]Op{ .disjunction, .conjunction, .equal, .unequal, .less_equal, .greater_equal, .less, .greater };
     inline for (operators, ops) |operator, op| {
-        if (std.mem.indexOf(u8, text, operator)) |at| return .{ .op = op, .left = syntax.trim(text[0..at]), .right = syntax.trim(text[at + operator.len ..]) };
+        if (operatorAt(text, operator)) |at| return .{ .op = op, .left = syntax.trim(text[0..at]), .right = syntax.trim(text[at + operator.len ..]) };
     }
     if (std.mem.startsWith(u8, text, "not ")) return .{ .op = .invert, .left = syntax.trim(text[4..]) };
     return .{ .left = text };
@@ -83,6 +97,7 @@ pub fn Type(comptime E: type, comptime expression: []const u8) type {
     switch (expr.op) {
         .value => {
             if (syntax.eq(expr.left, "true") or syntax.eq(expr.left, "false")) return bool;
+            if (stringLiteral(expr.left)) return []const u8;
             if (std.fmt.parseInt(i64, expr.left, 10)) |_| return i64 else |_| {}
             return E.Type(expr.left);
         },
@@ -126,6 +141,7 @@ pub fn eval(env: anytype, comptime expression: []const u8, budget: *runtime.Budg
     const expr = comptime parse(expression);
     switch (expr.op) {
         .value => {
+            if (comptime stringLiteral(expr.left)) return expr.left[1 .. expr.left.len - 1];
             if (comptime syntax.eq(expr.left, "true")) return true;
             if (comptime syntax.eq(expr.left, "false")) return false;
             if (comptime std.fmt.parseInt(i64, expr.left, 10)) |n| return n else |_| {}

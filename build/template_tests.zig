@@ -4,8 +4,16 @@ const Case = struct { name: []const u8, source: []const u8, model: []const u8 = 
 
 pub fn add(b: *std.Build, mox: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, step: *std.Build.Step) void {
     const cases = [_]Case{
+        .{ .name = "safe-html-string", .source = "{{{ value }}}", .diagnostic = "raw interpolation requires template.SafeHtml: value" },
+        .{ .name = "safe-html-attribute", .source = "<p title=\"{{{ value }}}\">x</p>", .model = "struct { value: t.SafeHtml }", .diagnostic = "SafeHtml requires an HTML text boundary" },
+        .{ .name = "safe-html-script", .source = "<script>{{{ value }}}</script>", .model = "struct { value: t.SafeHtml }", .diagnostic = "SafeHtml requires an HTML text boundary" },
+        .{ .name = "safe-html-style", .source = "<style>{{{ value }}}</style>", .model = "struct { value: t.SafeHtml }", .diagnostic = "SafeHtml requires an HTML text boundary" },
+        .{ .name = "safe-html-rcdata", .source = "<textarea>{{{ value }}}</textarea>", .model = "struct { value: t.SafeHtml }", .diagnostic = "SafeHtml requires an HTML text boundary" },
+        .{ .name = "safe-html-unclosed", .source = "{{{ value", .model = "struct { value: t.SafeHtml }", .diagnostic = "unterminated safe HTML interpolation" },
+        .{ .name = "safe-html-empty", .source = "{{{ }}}", .diagnostic = "empty safe HTML interpolation" },
+        .{ .name = "string-literal-unclosed", .source = "{{ \"value }}", .diagnostic = "unterminated string literal" },
         .{ .name = "chained-comparison", .source = "{% if true == false == false %}x{% endif %}", .diagnostic = "chained comparisons are unsupported" },
-        .{ .name = "close-parent", .source = "<div>{% if true %}</div><div>{% endif %}</div>", .diagnostic = "unbalanced HTML closing tag" },
+        .{ .name = "close-parent", .source = "<div>{% if true %}</div><div>{% endif %}</div>", .diagnostic = "unbalanced HTML closing tag: div" },
         .{ .name = "nested-block", .source = "{% if true %}{% block content %}x{% endblock %}{% endif %}", .diagnostic = "blocks cannot be nested inside control blocks or other blocks" },
         .{ .name = "boolean-attribute-value", .source = "<input disabled=\"{{ value }}\">", .model = "struct { value: bool }", .diagnostic = "dynamic attribute is outside the supported safe attribute subset" },
         .{ .name = "missing-field", .source = "{{ missing }}", .diagnostic = "missing field" },

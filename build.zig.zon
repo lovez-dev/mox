@@ -18,6 +18,7 @@
         "bench",
         "examples",
         "tests/integration.zig",
+        "tests/workers.zig",
         "tests/proxy.zig",
         "tests/support.zig",
         "tests/autobahn/server.zig",

@@ -58,21 +58,24 @@ A base layout declares `{% block content %}default content{% endblock %}`. Child
 | Construct | Behavior |
 | --- | --- |
 | `{{ field.path }}` | Escape text, booleans, integers up to 128 bits and finite floats up to 64 bits. Missing fields and unsupported types fail compilation. |
+| `{{{ fragment }}}` | Emit an explicitly trusted `mox.template.SafeHtml` only at an HTML text boundary; ordinary strings are rejected. |
 | `{% if value %}…{% else %}…{% endif %}` | Accept a boolean or optional. A standalone optional path is available as its payload in the true branch. Other implicit truthiness is rejected. |
 | `{% for item in items %}…{% else %}…{% endfor %}` | Iterate arrays or slices. Byte strings are not collections. The else body runs only for zero items. |
 | `loop.index`, `loop.first`, `loop.last` | Metadata for the innermost loop; index starts at zero. Nested bindings shadow parent bindings. |
 | `{% attr disabled when disabled %}` | Emit an allowlisted boolean attribute only when the expression is true. Place this after whitespace in an opening tag. |
 | `{# comment #}` | Remove a template comment. Other literal whitespace is preserved. |
 
-Expressions support field paths, `true`, `false`, decimal signed 64-bit literals, `not`, `and`, `or`, and `== != < > <= >=`. Binary operators require surrounding spaces. Precedence is `or`, `and`, comparisons, then `not`; boolean operations short-circuit. Comparisons accept integers, same-type floats, boolean equality, or text equality. Parentheses, string literals, chained comparisons, indexing, callbacks, arbitrary source-language expressions and implicit optional defaults are unsupported. Compute formatting, localization, authorization and complex expressions in application code.
+Expressions support field paths, `true`, `false`, decimal signed 64-bit literals, double-quoted string literals, `not`, `and`, `or`, and `== != < > <= >=`. Binary operators require surrounding spaces and are ignored inside quoted strings. String contents are literal bytes with no escape-sequence processing or embedded double quotes. Precedence is `or`, `and`, comparisons, then `not`; boolean operations short-circuit. Comparisons accept integers, same-type floats, boolean equality, or text equality. Parentheses, chained comparisons, indexing, callbacks, arbitrary source-language expressions and implicit optional defaults are unsupported. Compute formatting, localization, authorization and complex expressions in application code.
 
 ## HTML and URL safety
 
 The context checker accepts a conservative HTML subset with quoted attribute values, explicitly balanced elements, and complete fragments at every condition, loop, include and block boundary. Both conditional branches must preserve their entry context. It does not emulate browser error recovery or validate every HTML content-model rule.
 
-All scalar output escapes `&`, `<`, `>`, quotes and apostrophes. Text must be valid UTF-8, with no NUL, DEL or control bytes except tab, CR and LF. `title` and `textarea` interpolation is escaped as text. No unchecked HTML string, raw filter or callback can bypass escaping.
+All scalar output escapes `&`, `<`, `>`, quotes and apostrophes. Text must be valid UTF-8, with no NUL, DEL or control bytes except tab, CR and LF. `title` and `textarea` interpolation is escaped as text. Ordinary strings and `{{ value }}` always use escaping.
 
-Dynamic ordinary attributes are limited to `id`, `class`, `title`, `alt`, `name`, `value`, `placeholder`, `role`, `lang`, `dir`, `width`, `height`, `colspan`, `rowspan`, `tabindex`, `min`, `max`, `step`, `pattern`, `for`, `aria-*`, and `data-*`. Attribute values remain data; JavaScript that later interprets them must apply its own appropriate validation.
+For balanced markup from a checked template or a renderer that escapes untrusted source, wrap it with `mox.template.SafeHtml.fromTrusted(bytes)` and use `{{{ fragment }}}`. This is an explicit application trust boundary: it does not sanitize HTML, validate element balance, or reject scripts. Keep the bytes valid and unchanged throughout rendering. Runtime UTF-8/control-byte validation, input/output/work budgets, and cancellation still apply. Raw interpolation is rejected in attributes, comments, tag names, script/style, and title/textarea contexts.
+
+Dynamic ordinary attributes are limited to `id`, `class`, `title`, `alt`, `name`, `value`, `placeholder`, `role`, `lang`, `dir`, `width`, `height`, `colspan`, `rowspan`, `tabindex`, `min`, `max`, `step`, `pattern`, `for`, `datetime`, `download`, `aria-*`, and `data-*`. Attribute values remain data; JavaScript that later interprets them must apply its own appropriate validation.
 
 Dynamic `href`, `src`, `action`, `formaction`, `poster` and `cite` must contain exactly one complete `mox.template.Url`. Literal prefixes/suffixes and multiple interpolations are rejected:
 

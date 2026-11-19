@@ -36,6 +36,8 @@ pub fn main() !void {
 }
 ```
 
+For handlers that perform blocking work, enable `Config.blocking_handlers` and set `max_inflight_requests` to bound admitted work. WebSocket message callbacks can opt into workers with `Response.upgradeBlocking`.
+
 Run the included example with `zig build run`. The integrated `mox_io` module is available as `mox.io`, `mox.mox_io`, and `dep.module("mox_io")`; see [usage](docs/usage.md) for embedding assets, templates, and shutdown, and [API contracts](docs/api.md) for memory and callback lifetimes.
 
 ## Testing

@@ -16,9 +16,25 @@ For Content-Length uploads, set a route's `on_body`, optionally with `body_strea
 
 Return `Response.stream` for demand-driven chunked output. Each `next` call writes into a bounded `StreamWriter` and must produce bytes or call `finish()`. The next call waits for the previous output to drain. Allocate stream state with `ctx.gpa` or keep it valid until `close` runs. `close` reports completion, failure, or cancellation and releases application resources; the framework subsequently reclaims the request arena.
 
+For blocking database, password, or filesystem calls in a complete handler, set `Config.blocking_handlers = true` and choose a finite `max_inflight_requests`, such as 128. Handlers then share the existing I/O worker pool and may overlap across requests. Body-stream, response-stream, and SSE callbacks remain on the loop. `ctx.peer` provides the accepted socket address independently of forwarded headers.
+
 ## WebSocket and SSE
 
 Return `Response.upgrade(handler)` for WebSocket. The server validates the upgrade and client frames, reassembles fragmented messages, checks text UTF-8, and automatically replies to ping. Handle `sendText` and `sendBinary` errors; the bounded output queue can return `QueueFull`. Connection handles and message slices must remain within the callback.
+
+Use `Response.upgradeBlocking(state, handler)` when a complete WebSocket message needs blocking application work:
+
+```zig
+fn messageWork(_: ?*anyopaque, arena: std.mem.Allocator, message: mox.WsMessage) ![]const u8 {
+    return arena.dupe(u8, message.data);
+}
+
+fn websocket(_: *mox.Context) !mox.Response {
+    return mox.Response.upgradeBlocking(null, messageWork);
+}
+```
+
+The callback receives stable reassembled input and returns one text reply. Use valid UTF-8 for the reply; other input on that connection waits for completion. Do not retain the input/arena or use a `WsConn` from the worker. Connection state can be allocated with `ctx.gpa`; callback errors close with 1011. Upgraded WebSockets use `max_websocket_connections` (default 256) independently of ordinary request capacity.
 
 Return `Response.sse(handler)` for event streams. `writer.send(event, data)` copies an event; multiline data is encoded as separate data fields. Event names must not contain CR or LF. Returning false, or calling `writer.close()`, finishes the stream after queued output. When the handler returns true without sending, `setTick(ms)` schedules another call; zero disables timer-driven pumping.
 
@@ -72,9 +88,9 @@ The model and referenced bytes remain valid and unchanged until rendering return
 
 ## Shutdown and concurrency
 
-`serve` blocks its calling thread until shutdown and I/O cleanup finish. A call runs one event loop; it does not automatically distribute HTTP connections over all CPU cores. Handlers, stream callbacks, WebSocket callbacks, and SSE callbacks run on that loop and must return promptly. Offload expensive application work separately.
+`serve` blocks its calling thread until shutdown and I/O cleanup finish. A call runs one event loop; it does not automatically distribute HTTP connections over all CPU cores. By default, handlers, stream callbacks, WebSocket callbacks, and SSE callbacks run on that loop and must return promptly. Enable `blocking_handlers` for complete HTTP handlers, or return `upgradeBlocking` for worker WebSocket message callbacks. These paths reuse the I/O worker pool; synchronize shared mutable application state.
 
-Keep a `ServerControl` alive until `serve` returns. Another thread may call `shutdown()` to stop admitting requests and allow active work to finish within `shutdown_timeout_ms`, or `close()` to cancel immediately. Cleanup still waits until the I/O backend has released references. Commands are sticky; create a fresh control for each server invocation. The library installs no process signal handlers.
+Keep a `ServerControl` alive until `serve` returns. Another thread may call `shutdown()` to stop admitting requests and allow active work to finish within `shutdown_timeout_ms`, or `close()` to cancel immediately. Cleanup still waits until the I/O backend has released references and running worker callbacks have returned. Queued work is cancelled where possible; running callbacks must finish their own bounded blocking calls. Commands are sticky; create a fresh control for each server invocation. The library installs no process signal handlers.
 
 `Config.ready` runs on the loop once the listener is bound, with its actual address. Port zero selects an ephemeral port. The callback must not block; use it to notify another thread.
 

@@ -4,7 +4,7 @@ The supported import is `@import("mox")`. `mox.io` exposes the integrated `mox_i
 
 ## HTML templates
 
-`mox.Template(source, Model)` compiles an inline template. `mox.template.Bundle` registers a fixed set of source/model entries; the build helper exposes the same entry lookup through `views.get(path)`. Entries provide `renderInto(buffer, model, limits)`, `renderAlloc(allocator, model, limits)`, and synchronous `renderTo(writer, model, limits)`. `mox.TemplateLimits` aliases `mox.template.Limits`. Checked URL values use `mox.template.Url`.
+`mox.Template(source, Model)` compiles an inline template. `mox.template.Bundle` registers a fixed set of source/model entries; the build helper exposes the same entry lookup through `views.get(path)`. Entries provide `renderInto(buffer, model, limits)`, `renderAlloc(allocator, model, limits)`, and synchronous `renderTo(writer, model, limits)`. `mox.TemplateLimits` aliases `mox.template.Limits`. Checked URL values use `mox.template.Url`; explicitly trusted HTML fragments use `mox.template.SafeHtml` with `{{{ fragment }}}`.
 
 The caller keeps model data valid and unchanged for the complete call. Caller-buffer output remains in that buffer; allocated output is released with the supplied allocator after its consumer finishes. With `ctx.gpa`, the framework releases output after response transmission. Limits apply per call, with cumulative input/work/iteration counters across both allocation passes. See [template contracts](templates.md) for context restrictions, diagnostics, cancellation, and partial-output behavior.
 
@@ -18,6 +18,7 @@ The caller keeps model data valid and unchanged for the complete call. Caller-bu
 | `address` | `mox.io.types.Address`; use `loopback`, `ipv4`, or `ipv6`. |
 | `backend` | `default`, `epoll`, `uring`, `kqueue`, or `iocp`; unsupported selections fail. |
 | `routes` | Immutable route definitions and referenced strings; keep them valid until return. |
+| `blocking_handlers` | Default `false`; run route, fallback, and error handlers on the existing I/O worker pool. |
 | `assets` | Optional immutable `EmbeddedFs` view; keep both view and image valid until return. |
 | `control` | Optional cross-thread shutdown control; keep it valid until return. |
 | `ready` | Optional listener notification; invoked once on the loop thread. |
@@ -25,15 +26,19 @@ The caller keeps model data valid and unchanged for the complete call. Caller-bu
 
 Defaults select IOCP on Windows, epoll on Linux, and kqueue on supported BSD/macOS systems. Select `uring` explicitly on Linux; kernel and execution-environment support are required.
 
-`max_connections` bounds open client connections. `max_inflight_requests` bounds admitted requests, and `max_requests_per_second` applies a fixed one-second admission window. WebSocket and SSE connections retain an in-flight slot for their session. Zero disables either request-admission limit.
+`max_connections` bounds open client connections. `max_inflight_requests` bounds requests from parsed head through response completion, including queued and running handler work; an exhausted request limit returns 503. `max_requests_per_second` applies a fixed one-second admission window and returns 429 when exhausted. Zero disables either request-admission limit. SSE retains an in-flight request slot for its session. A successful WebSocket upgrade releases its HTTP slot and acquires a separate `max_websocket_connections` slot (default 256; zero disables this specific limit); exceeding that limit returns 503 before upgrading.
 
 `max_body_size` bounds request bodies; zero removes that specific limit. `max_memory_bytes` bounds dynamic framework/request storage, excluding kernel buffers and loop infrastructure; zero disables the budget. Disabling a limit does not remove other limits or allocator failures. `ws_max_message_size` and `ws_max_queue_size` bound WebSocket messages and queued output.
 
 `idle_timeout_ms` controls idle HTTP connections, `request_timeout_ms` bounds a request from its first received bytes through response transmission, and `shutdown_timeout_ms` bounds the graceful drain period. HTTP deadlines end at WebSocket/SSE upgrade; sessions remain until disconnect, application close, or server shutdown. Zero disables the first two timers and makes graceful shutdown cancel immediately for the last. Timer expiry cancels work; it does not permit freeing memory still referenced by an outstanding I/O operation. A blocking application callback cannot be preempted by these timers.
 
+With `blocking_handlers = true`, callbacks share the existing worker pool with file work. They may run concurrently across requests; shared application state and externally used allocators require suitable synchronization. Router lookup and transport submission stay on the loop, as do body-stream, response-stream, SSE, observation, and ordinary WebSocket callbacks. The framework serializes access to its aggregate memory budget. `max_connections`, fixed loop operation capacity, and `max_inflight_requests` bound pending work; no separate unbounded queue is created. Request deadlines cancel queued work and wait for running callbacks to return before reclaiming request storage. Applications must bound their own blocking calls; shutdown cannot forcibly interrupt a running callback.
+
 ## Request and response data
 
 `Handler` is `*const fn (*Context) anyerror!Response`. Context, request headers, parameters, and request body slices are temporary and must not escape their documented callback/request lifetime. Copy data into application-managed storage before retaining it.
+
+`ctx.peer` is the socket peer address and port from accept; forwarded headers never overwrite it. Apply an application-specific trusted-proxy policy before interpreting those headers.
 
 `ctx.gpa` is a request arena. Allocations remain valid through response transmission and stream cleanup, then the framework reclaims them. `ctx.json(T)` returns `std.json.Parsed(T)`; deinitializing it is safe, and the arena also reclaims its storage at request completion.
 
@@ -41,7 +46,9 @@ A response's body, content type, and header arrays and values must remain valid 
 
 `Response.stream` takes precedence over `file_path` and `body`. `Stream.next` receives a bounded writer and must produce data or finish. `Stream.close(state, end)` runs exactly once for an accepted stream, including failure and cancellation. HEAD does not invoke `next`. Never retain a writer or its output buffer.
 
-`BodyChunkHandler` receives temporary segments and a final flag. Pair initialization with deinitialization to release external upload resources on completion, handler error, or disconnect. An early disconnect does not fabricate a successful final segment.
+`BodyChunkHandler` receives temporary segments and a final flag. Pair initialization with deinitialization to release external upload resources on completion, handler error, or disconnect. An early disconnect does not fabricate a successful final segment. Both multipart parsers require a complete closing delimiter followed by end of input or one CRLF; trailing epilogues are rejected. Buffered parsing keeps boundary-like payload bytes that lack a valid delimiter suffix.
+
+`Response.upgradeBlocking(state, handler)` dispatches each complete text/binary message to a `WsWorkHandler(state, arena, message) anyerror![]const u8`; its result is one text frame. The input is copied into a per-message arena before transport buffers change. The returned bytes may reference that input, the supplied arena, or longer-lived immutable application data. The loop copies the reply before releasing the arena. Callback errors close with 1011. Messages execute serially per connection, pausing further input processing, including control frames, until completion; other connections can progress. Do not call `WsConn` methods from a worker. Allocate connection state with `ctx.gpa` or keep it valid until the connection retires. Set `Response.body` to send an optional nonempty initial text frame after the handshake. Ordinary `Response.upgrade` callbacks and WebSocket framing remain on the loop.
 
 ## Rate limiting middleware
 

@@ -7,6 +7,7 @@ const runtime = @import("template/runtime.zig");
 pub const Source = syntax.Source;
 pub const Limits = runtime.Limits;
 pub const Url = runtime.Url;
+pub const SafeHtml = runtime.SafeHtml;
 pub const Error = runtime.Error;
 pub const Diagnostic = runtime.Diagnostic;
 pub const Entry = struct { path: []const u8, Model: type };
@@ -101,6 +102,10 @@ fn validate(comptime sources: []const Source, comptime source: []const u8, compt
                 if (!runtime.scalar(T)) @compileError("expression '" ++ node.text ++ "' has type " ++ @typeName(T) ++ ": unsupported interpolation type");
                 if (context == .url and T != Url) @compileError("URL attributes require template.Url: " ++ node.text);
             },
+            .safe_html => {
+                if (!state.boundary()) @compileError("SafeHtml requires an HTML text boundary");
+                if (model.Type(E, node.text) != SafeHtml) @compileError("raw interpolation requires template.SafeHtml: " ++ node.text);
+            },
             .attr => {
                 const attr = syntax.attribute(node.text);
                 state.booleanAttribute(attr.name);
@@ -152,6 +157,7 @@ fn render(comptime sources: []const Source, comptime source: []const u8, env: an
             .text => try sink.writeAll(node.text),
             .comment => {},
             .value => try runtime.emit(sink, budget, try model.eval(env, node.text, budget)),
+            .safe_html => try runtime.emitHtml(sink, budget, try model.eval(env, node.text, budget)),
             .attr => {
                 const attr = comptime syntax.attribute(node.text);
                 if (try model.eval(env, attr.condition, budget)) try sink.writeAll(" " ++ attr.name ++ " ");

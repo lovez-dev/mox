@@ -162,7 +162,7 @@ const routes = [_]mox.Route{
     .{ .method = .GET, .path = "/quiet-sse", .handler = quietSse },
 };
 
-const Server = struct {
+pub const Server = struct {
     thread: mox_io.sync.Thread = .{},
     control: mox.ServerControl = .{},
     control_override: ?*mox.ServerControl = null,
@@ -171,6 +171,11 @@ const Server = struct {
     assets: ?*const mox_io.fs.EmbeddedFs = null,
     idle_timeout_ms: u32 = 2000,
     request_timeout_ms: u32 = 1000,
+    route_table: []const mox.Route = &routes,
+    blocking_handlers: bool = false,
+    max_inflight_requests: usize = 0,
+    max_websocket_connections: usize = 256,
+    on_request_complete: ?*const fn (mox.RequestEvent) void = observe,
 
     fn run(raw: *anyopaque) void {
         const self: *Server = @ptrCast(@alignCast(raw));
@@ -178,10 +183,13 @@ const Server = struct {
             .gpa = std.testing.allocator,
             .address = t.Address.loopback(0),
             .backend = std.meta.stringToEnum(@FieldType(mox.Config, "backend"), test_options.backend) orelse .default,
-            .routes = &routes,
+            .routes = self.route_table,
+            .blocking_handlers = self.blocking_handlers,
+            .max_inflight_requests = self.max_inflight_requests,
+            .max_websocket_connections = self.max_websocket_connections,
             .control = self.control_override orelse &self.control,
             .ready = ready,
-            .on_request_complete = observe,
+            .on_request_complete = self.on_request_complete,
             .max_connections = 8,
             .max_body_size = 32,
             .assets = self.assets,
@@ -194,7 +202,7 @@ const Server = struct {
         self.finished.store(true, .release);
     }
 
-    fn start(self: *Server) !u16 {
+    pub fn start(self: *Server) !u16 {
         ready_port.store(0, .release);
         try self.thread.start(run, self);
         const deadline = mox_io.os.now() + timeout_ns;
@@ -213,7 +221,7 @@ const Server = struct {
     }
 
     // All exits join the worker before its control and allocator leave scope.
-    fn stop(self: *Server) void {
+    pub fn stop(self: *Server) void {
         self.control.close();
         const deadline = mox_io.os.now() + timeout_ns;
         while (!self.finished.load(.acquire)) {
@@ -242,7 +250,7 @@ pub const Client = struct {
         self.loop.deinit() catch @panic("client deinit failed");
     }
 
-    fn one(self: *Client) !t.Completion {
+    pub fn one(self: *Client) !t.Completion {
         const deadline = self.loop.now() + timeout_ns;
         var output: [1]t.Completion = undefined;
         while (true) {
@@ -251,7 +259,7 @@ pub const Client = struct {
         }
     }
 
-    fn connect(self: *Client, port: u16) !t.Handle {
+    pub fn connect(self: *Client, port: u16) !t.Handle {
         const socket = try self.loop.openTcp(.ipv4);
         _ = try self.loop.connect(socket, t.Address.loopback(port), .{ .deadline = self.loop.now() + timeout_ns });
         const completion = try self.one();
@@ -259,12 +267,12 @@ pub const Client = struct {
         return socket;
     }
 
-    fn send(self: *Client, socket: t.Handle, request: []const u8) !void {
+    pub fn send(self: *Client, socket: t.Handle, request: []const u8) !void {
         _ = try self.loop.sendAll(socket, request, .{ .deadline = self.loop.now() + timeout_ns });
         if ((try self.one()).status != .ok) return error.SendFailed;
     }
 
-    fn receive(self: *Client, socket: t.Handle, buffer: []u8) !usize {
+    pub fn receive(self: *Client, socket: t.Handle, buffer: []u8) !usize {
         var len: usize = 0;
         while (len < buffer.len) {
             _ = try self.loop.recv(socket, buffer[len..], .{ .deadline = self.loop.now() + timeout_ns });
@@ -276,7 +284,7 @@ pub const Client = struct {
         return error.ResponseTooLarge;
     }
 
-    fn expectDisconnected(self: *Client, socket: t.Handle) !void {
+    pub fn expectDisconnected(self: *Client, socket: t.Handle) !void {
         var buffer: [256]u8 = undefined;
         _ = try self.loop.recv(socket, &buffer, .{ .deadline = self.loop.now() + timeout_ns });
         const completion = try self.one();
@@ -701,4 +709,5 @@ test "request deadline is absolute while the client trickles header bytes" {
 
 test {
     _ = @import("proxy.zig");
+    _ = @import("workers.zig");
 }
