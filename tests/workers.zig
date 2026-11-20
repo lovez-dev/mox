@@ -39,6 +39,8 @@ fn waitFor(counter: *std.atomic.Value(u32), value: u32) !void {
 }
 
 fn slow(ctx: *mox.Context) !mox.Response {
+    const pressure = if (ctx.request.header("x-pressure") != null) try ctx.gpa.alloc(u8, 512 * 1024) else null;
+    if (pressure) |bytes| @memset(bytes, 0xa5);
     _ = started.fetchAdd(1, .acq_rel);
     const deadline = io.os.now() + timeout_ns;
     while (!released.load(.acquire)) {
@@ -47,6 +49,9 @@ fn slow(ctx: *mox.Context) !mox.Response {
     }
     // Read and allocate after cancellation to catch early arena reclamation.
     if (!std.mem.eql(u8, ctx.body, "payload") or !std.mem.eql(u8, ctx.request.header("x-retained") orelse "", "still-valid")) return error.RequestStorageChanged;
+    if (pressure) |bytes| for (bytes) |byte| {
+        if (byte != 0xa5) return error.WorkerStorageReclaimed;
+    };
     const response = try ctx.gpa.dupe(u8, ctx.body);
     _ = finished.fetchAdd(1, .release);
     if (ctx.request.header("x-stream") != null) {
@@ -155,6 +160,34 @@ test "blocked handler leaves another request runnable and retains request storag
     try std.testing.expectEqualStrings("payload", try integration.body(buffer[0..len]));
     try closeSocket(&client, socket);
     try std.testing.expectEqual(@as(u32, 1), finished.load(.acquire));
+}
+
+test "memory pressure preserves a running worker arena while another request completes" {
+    support.lock();
+    defer support.unlock();
+    reset();
+    // Arena growth rounds the 512 KiB request above the 75% pressure mark
+    // while leaving room for both connection buffers.
+    var server: Server = .{ .route_table = &routes, .blocking_handlers = true, .max_memory_bytes = 1024 * 1024 };
+    const port = try server.start();
+    defer server.stop();
+    defer released.store(true, .release);
+    var client: Client = .{};
+    try client.init();
+    defer client.deinit();
+    const socket = try client.connect(port);
+    try client.send(socket, "POST /slow HTTP/1.1\r\nHost: localhost\r\nX-Retained: still-valid\r\nX-Pressure: 1\r\nContent-Length: 7\r\nConnection: close\r\n\r\npayload");
+    try waitFor(&started, 1);
+    var buffer: [2048]u8 = undefined;
+    const other = try client.exchange(port, get, &buffer);
+    try std.testing.expectEqualStrings("fast", try integration.body(other));
+    try std.testing.expectEqual(@as(u32, 0), finished.load(.acquire));
+    released.store(true, .release);
+    const size = try client.receive(socket, &buffer);
+    try std.testing.expectEqualStrings("payload", try integration.body(buffer[0..size]));
+    try closeSocket(&client, socket);
+    try std.testing.expectEqual(@as(u32, 1), finished.load(.acquire));
+    try std.testing.expectEqual(null, server.failure);
 }
 
 test "worker dispatch preserves method errors and records failures in either execution mode" {

@@ -547,6 +547,9 @@ pub const Config = struct {
     max_requests_per_second: u32 = 0,
     /// Aggregate dynamic framework/request memory budget across active connections, excluding kernel and loop infrastructure; 0 is unlimited.
     max_memory_bytes: usize = 256 * 1024 * 1024,
+    /// Usable request-arena capacity retained per idle HTTP connection; 0 frees all.
+    /// Retained storage stays in max_memory_bytes and is reclaimed under pressure.
+    request_arena_retain_bytes: usize = 8 * 1024,
     /// WebSocket frame/message and queued output byte limits, per connection.
     ws_max_message_size: usize = 1024 * 1024,
     ws_max_queue_size: usize = 4 * 1024 * 1024,

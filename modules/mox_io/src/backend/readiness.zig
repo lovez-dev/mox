@@ -50,6 +50,7 @@ pub fn Driver(comptime Native: type) type {
         ready_tail: u32 = t.none,
         ready_count: usize = 0,
         batch: u32,
+        native_check: u3 = 0,
 
         last_error: i32 = 0,
         counters: c.NativeStats = .{},
@@ -313,8 +314,23 @@ pub fn Driver(comptime Native: type) type {
             self.counters.polls +|= 1;
             self.batch_read = null;
             self.processReady();
+            // Inline completions can stay nonempty indefinitely under load.
+            // Refresh kernel readiness at least every eight pumps so another
+            // socket's read, accept, or wake event cannot starve behind them.
+            // Check before harvesting so a native error never loses results.
+            self.native_check +%= 1;
+            if (self.native_check == 0) {
+                try self.collectNative(0);
+                self.processReady();
+            }
             const present = self.harvest(output);
             if (present != 0 or self.ready_count != 0) return present;
+            try self.collectNative(duration);
+            self.processReady();
+            return self.harvest(output);
+        }
+
+        fn collectNative(self: *Self, duration: ?u64) Error!void {
             const events = self.native.poll(duration) catch |err| {
                 self.last_error = self.native.last_error;
                 return err;
@@ -333,8 +349,6 @@ pub fn Driver(comptime Native: type) type {
                 resource.ready_write = resource.ready_write or event.write;
                 self.pushReady(resource.handle.index);
             }
-            self.processReady();
-            return self.harvest(output);
         }
 
         pub fn stats(self: *const Self) c.NativeStats {

@@ -82,6 +82,14 @@ For file-based layouts, includes, loops and registered page models, see [templat
 
 The model and referenced bytes remain valid and unchanged until rendering returns. With `ctx.gpa`, the framework releases the response body after transmission. Rendering runs synchronously on the server loop; use endpoint-specific limits and move expensive report generation to application-managed background work.
 
+## Task board application
+
+Run `zig build run-board` and open `http://127.0.0.1:8080/`. To choose another port, use `zig build run-board -- 8081`. `zig build example-board` builds the executable without starting it.
+
+The [example](../examples/board/main.zig) provides a server-rendered task board and JSON CRUD endpoints: `GET /api/tasks`, `GET /api/tasks/:id`, `POST /api/tasks`, `PATCH /api/tasks/:id`, and `DELETE /api/tasks/:id`. Creation accepts a JSON `title`; updates accept `title` and/or `done`. Titles contain 1 to 160 UTF-8 bytes after trimming, without control bytes. Unknown fields are rejected. `/health` provides a small JSON readiness response.
+
+Storage starts with 16 tasks, holds at most 64 tasks, and resets on process restart. There is no database, authentication, or cross-process state. The server binds only to loopback. A short store lock protects mutations and snapshots; serialization and HTML rendering run after releasing it. Replies use the request arena and remain valid through transmission. Source changes require rebuilding.
+
 ## Proxying
 
 `proxyRoute(method, path, options)` forwards to a fixed-IP HTTP upstream. Set `ProxyOptions.address`, `timeout_ms`, and `max_response_bytes`. Responses are bounded and buffered, rather than relayed as an unbounded stream. DNS resolution, HTTPS upstreams, HTTP/2, and CONNECT tunneling are outside this API. Deploy behind a TLS terminator when HTTPS is required.

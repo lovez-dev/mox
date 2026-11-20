@@ -175,6 +175,8 @@ pub const Server = struct {
     blocking_handlers: bool = false,
     max_inflight_requests: usize = 0,
     max_websocket_connections: usize = 256,
+    request_arena_retain_bytes: usize = 8 * 1024,
+    max_memory_bytes: usize = 256 * 1024 * 1024,
     on_request_complete: ?*const fn (mox.RequestEvent) void = observe,
 
     fn run(raw: *anyopaque) void {
@@ -187,6 +189,8 @@ pub const Server = struct {
             .blocking_handlers = self.blocking_handlers,
             .max_inflight_requests = self.max_inflight_requests,
             .max_websocket_connections = self.max_websocket_connections,
+            .request_arena_retain_bytes = self.request_arena_retain_bytes,
+            .max_memory_bytes = self.max_memory_bytes,
             .control = self.control_override orelse &self.control,
             .ready = ready,
             .on_request_complete = self.on_request_complete,
@@ -355,6 +359,49 @@ test "native HTTP pipeline, HEAD, routing, body limits, and chunked requests" {
     const chunked = try client.exchange(port, "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", &buffer);
     try std.testing.expect(std.mem.startsWith(u8, chunked, "HTTP/1.1 200"));
     try std.testing.expectEqualStrings("hello world", try body(chunked));
+}
+
+fn retainedResponse(ctx: *mox.Context) !mox.Response {
+    const marker = (ctx.param("marker") orelse return error.MissingMarker)[0];
+    const size = try std.fmt.parseInt(usize, ctx.query("size") orelse "0", 10);
+    if (size > 32 * 1024) return error.ResponseTooLarge;
+    const data = try ctx.gpa.alloc(u8, size);
+    @memset(data, marker);
+    return .{ .body = data };
+}
+
+test "arena-backed pipelined responses survive shrink and keep-alive reuse in both handler modes" {
+    support.lock();
+    defer support.unlock();
+    const table = [_]mox.Route{.{ .method = .GET, .path = "/retained/:marker", .handler = retainedResponse }};
+    for ([_]bool{ false, true }) |blocking| {
+        for ([_]usize{ 0, 128, 8 * 1024 }) |limit| {
+            var server: Server = .{ .route_table = &table, .blocking_handlers = blocking, .request_arena_retain_bytes = limit };
+            const port = try server.start();
+            defer server.stop();
+            var client: Client = .{};
+            try client.init();
+            defer client.deinit();
+            var buffer: [32 * 1024]u8 = undefined;
+            const response = try client.exchange(port, "GET /retained/A?size=16384 HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+                "GET /retained/B?size=5 HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+                "GET /retained/C?size=2048 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", &buffer);
+            var offset: usize = 0;
+            const expected = [_]struct { size: usize, marker: u8 }{ .{ .size = 16384, .marker = 'A' }, .{ .size = 5, .marker = 'B' }, .{ .size = 2048, .marker = 'C' } };
+            for (expected) |item| {
+                const start = offset;
+                const end = (std.mem.indexOfPos(u8, response, start, "\r\n\r\n") orelse return error.MissingResponseHead) + 4;
+                try std.testing.expect(std.mem.startsWith(u8, response[start..end], "HTTP/1.1 200"));
+                var length: [16]u8 = undefined;
+                try expectHeader(response[start..end], "content-length", try std.fmt.bufPrint(&length, "{d}", .{item.size}));
+                try std.testing.expect(response.len - end >= item.size);
+                for (response[end..][0..item.size]) |byte| try std.testing.expectEqual(item.marker, byte);
+                offset = end + item.size;
+            }
+            try std.testing.expectEqual(response.len, offset);
+            try std.testing.expectEqual(null, server.failure);
+        }
+    }
 }
 
 test "template arena output survives transmission and failures precede headers" {

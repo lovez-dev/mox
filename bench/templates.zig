@@ -2,7 +2,7 @@
 //! text and output bounds but does not implement the engine's work/input budgets.
 const std = @import("std");
 const mox = @import("mox");
-const bench = @import("lovez_bench");
+const zlap = @import("zlap");
 
 const Data = struct { title: []const u8, items: []const []const u8 };
 const Page = mox.Template("<h1>{{ title }}</h1><ul>{% for item in items %}<li>{{ item }}</li>{% endfor %}</ul>", Data);
@@ -12,7 +12,7 @@ var items: [16][]const u8 = undefined;
 var data: Data = .{ .title = "Items & descriptions", .items = &items };
 
 pub fn main(init: std.process.Init) !void {
-    const config: bench.Config = .{ .batch_size = 1000, .sample_count = 20, .rounds = 3, .min_sample_ns = 5_000_000, .allocator = init.gpa, .count_allocations = true };
+    const config: zlap.Config = .{ .batch_size = 1000, .sample_count = 20, .rounds = 3, .min_sample_ns = 5_000_000, .allocator = init.gpa, .count_allocations = true };
     var payload: [1024]u8 = undefined;
     for (std.meta.tags(Workload)) |workload| {
         configure(workload, &payload);
@@ -24,11 +24,11 @@ pub fn main(init: std.process.Init) !void {
         defer init.gpa.free(allocated);
         if (!std.mem.eql(u8, reference, allocated)) return error.OutputMismatch;
         std.debug.print("Workload: {s}; output: {d} bytes\n", .{ @tagName(workload), reference.len });
-        const reference_result = try bench.runConfigured(init.io, config, manual);
+        const reference_result = try zlap.runConfigured(init.io, config, manual);
         reference_result.print("Handwritten checked HTML / caller buffer");
-        const into_result = try bench.runConfigured(init.io, config, into);
+        const into_result = try zlap.runConfigured(init.io, config, into);
         into_result.print("Template renderInto / caller buffer");
-        const alloc_result = try bench.runConfigured(init.io, config, alloc);
+        const alloc_result = try zlap.runConfigured(init.io, config, alloc);
         alloc_result.print("Template renderAlloc / two passes");
     }
 }

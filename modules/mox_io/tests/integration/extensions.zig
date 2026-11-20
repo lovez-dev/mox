@@ -191,6 +191,52 @@ pub fn Suite(comptime Backend: type) type {
             try testing.expect(loop.stats().memory.allocations == allocations);
         }
 
+        test "readiness receives progress while immediate sends keep completions queued" {
+            if (Backend != mox_io.backends.Epoll and Backend != mox_io.backends.Kqueue) return error.SkipZigTest;
+            var loop: Loop = undefined;
+            try init(&loop);
+            defer cleanup(&loop) catch unreachable;
+            const listener = try loop.listen(t.Address.loopback(0), 8);
+            const client = try loop.openTcp(.ipv4);
+            _ = try loop.accept(listener, .{});
+            _ = try loop.connect(client, try loop.localAddress(listener), .{});
+            var pair: [2]t.Completion = undefined;
+            try gather(&loop, &pair);
+            var peer: t.Handle = undefined;
+            for (pair) |result| {
+                try testing.expect(result.status == .ok);
+                if (result.accepted) |handle| peer = handle;
+            }
+            var byte: [1]u8 = undefined;
+            const receiving = &loop.operations.requests[0];
+            receiving.* = .{ .id = .{ .index = 0, .generation = 9000 }, .handle = peer, .native = loop.resources.slots[peer.index].native, .kind = .recv, .options = .{}, .read_buffer = &byte };
+            try loop.backend.submit(receiving);
+            try testing.expect(try loop.backend.poll(loop.events, 0) == 0);
+            var saw_receive = false;
+            // Direct backend requests do not enter the Loop's operation table.
+            // Retire their results here even if the progress assertion fails.
+            defer {
+                if (!saw_receive) loop.backend.cancel(receiving.id);
+                _ = loop.backend.poll(loop.events, 0) catch 0;
+            }
+            const sending = &loop.operations.requests[1];
+            for (0..64) |iteration| {
+                sending.* = .{ .id = .{ .index = 1, .generation = iteration + 10000 }, .handle = client, .native = loop.resources.slots[client.index].native, .kind = .send, .options = .{}, .write_buffer = "x" };
+                try loop.backend.submit(sending);
+                const count = try loop.backend.poll(loop.events, 0);
+                var saw_send = false;
+                for (loop.events[0..count]) |result| {
+                    try testing.expect(result.status == .ok and result.bytes == 1);
+                    if (result.id.generation == receiving.id.generation) saw_receive = true;
+                    if (result.id.generation == sending.id.generation) saw_send = true;
+                }
+                try testing.expect(saw_send);
+                if (saw_receive) break;
+            }
+            try testing.expect(saw_receive);
+            try testing.expectEqual(@as(u8, 'x'), byte[0]);
+        }
+
         test "io_uring native receive progresses under immediate send pressure" {
             if (Backend != mox_io.backends.Uring) return error.SkipZigTest;
             var loop: Loop = undefined;

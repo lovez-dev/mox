@@ -11,7 +11,7 @@ zig build test-package
 zig build example
 ```
 
-`check` checks formatting and compiles the library, tests, examples, WebSocket fixture, and benchmarks. `test` executes protocol, template, and server integration tests, including expected template compilation failures. `test-package` exercises a separate consuming build, embedded assets, and file-based templates. `example` installs the basic server; `run` starts it. `example-templates` installs the HTML template server.
+`check` checks formatting and compiles the library, tests, examples, WebSocket fixture, and benchmarks. `test` executes protocol, template, task board, and server integration tests, including expected template compilation failures. `test-package` exercises a separate consuming build, embedded assets, and file-based templates. `example` installs the basic server; `run` starts it. `example-templates` installs the HTML template server. `example-board` builds the in-memory task board, and `run-board` starts it on loopback.
 
 Choose a supported backend explicitly for integration tests:
 
@@ -38,7 +38,7 @@ Use `zig fmt` for formatting. Add regression coverage for parser boundaries, can
 zig build bench -Doptimize=ReleaseFast
 ```
 
-The benchmark uses lovez-bench for HTTP parsing, routing, and serialization workloads. Results are written under `out/bench/`; they describe those workloads rather than whole-server network throughput.
+The benchmark uses [zlap](https://github.com/lovez-dev/zlap) for HTTP parsing, routing, and serialization workloads. Results are written under `out/bench/`; they describe those workloads rather than whole-server network throughput.
 
 `zig build bench-templates -Doptimize=fast` compares equal-output HTML rendering with a checked handwritten baseline. It prints repeated timing and allocation measurements without saving a report. See [templates](templates.md#verification-and-measurement) for workload scope and differences in resource limits.
 

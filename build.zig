@@ -101,6 +101,19 @@ pub fn build(b: *std.Build) void {
     b.step("example-templates", "Build the HTML template server").dependOn(&b.addInstallArtifact(template_example, .{}).step);
     check.dependOn(&b.addObject(.{ .name = "check-template-example", .root_module = template_example_module }).step);
 
+    const board_module = consumerModule(b, "examples/board/main.zig", mox, target, optimize);
+    const board = b.addExecutable(.{ .name = "mox-board", .root_module = board_module });
+    b.step("example-board", "Build the in-memory task board").dependOn(&b.addInstallArtifact(board, .{}).step);
+    const run_board = b.addRunArtifact(board);
+    run_board.addPassthruArgs();
+    b.step("run-board", "Run the task board on loopback; optional port argument").dependOn(&run_board.step);
+    check.dependOn(&b.addObject(.{ .name = "check-board", .root_module = board_module }).step);
+    const board_tests = b.addTest(.{ .name = "board-tests", .root_module = consumerModule(b, "examples/board/app.zig", mox, target, optimize) });
+    check.dependOn(&b.addTest(.{ .name = "check-board-tests", .root_module = board_tests.root_module, .emit_object = true }).step);
+    const run_board_tests = b.addRunArtifact(board_tests);
+    run_board_tests.has_side_effects = true;
+    test_step.dependOn(&run_board_tests.step);
+
     const autobahn = b.addExecutable(.{
         .name = "mox-autobahn",
         .root_module = consumerModule(b, "tests/autobahn/server.zig", mox, target, optimize),
@@ -110,9 +123,9 @@ pub fn build(b: *std.Build) void {
     const autobahn_object = b.addObject(.{ .name = "check-autobahn", .root_module = autobahn.root_module });
     check.dependOn(&autobahn_object.step);
 
-    const bench_dependency = b.dependency("lovez_bench", .{ .target = target, .optimize = optimize });
+    const zlap = b.dependency("zlap", .{ .target = target, .optimize = optimize }).module("zlap");
     const bench_module = consumerModule(b, "bench/http.zig", mox, target, optimize);
-    bench_module.addImport("lovez_bench", bench_dependency.module("lovez_bench"));
+    bench_module.addImport("zlap", zlap);
     const benchmark = b.addExecutable(.{ .name = "mox-http-bench", .root_module = bench_module });
     const run_benchmark = b.addRunArtifact(benchmark);
     run_benchmark.has_side_effects = true;
@@ -124,7 +137,7 @@ pub fn build(b: *std.Build) void {
     check.dependOn(&bench_object.step);
 
     const template_bench_module = consumerModule(b, "bench/templates.zig", mox, target, optimize);
-    template_bench_module.addImport("lovez_bench", bench_dependency.module("lovez_bench"));
+    template_bench_module.addImport("zlap", zlap);
     const template_bench = b.addExecutable(.{ .name = "mox-template-bench", .root_module = template_bench_module });
     const run_template_bench = b.addRunArtifact(template_bench);
     run_template_bench.has_side_effects = true;

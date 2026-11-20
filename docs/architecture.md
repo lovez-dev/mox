@@ -16,6 +16,8 @@ WebSocket parsing and fragmentation state remain separate from transport submiss
 
 ## Cancellation and release
 
+Completed keep-alive HTTP requests reset their arenas only after response transmission and cleanup hooks. A bounded amount of arena capacity may remain for the next request; it stays in the shared memory budget. Budget pressure disables retention and reclaims idle HTTP arenas on the loop thread. A parsed request or worker excludes its arena from idle reclamation, and connection retirement releases all remaining arena storage.
+
 Successfully submitted operations retain their input/output buffers until the terminal completion is consumed. Closing a connection requests cancellation, then waits for pending operation and close completions before releasing the connection and its storage. Submission failure creates no future completion and must be cleaned up locally.
 
 Graceful shutdown stops accepting and stops admitting new keep-alive requests. Active requests can drain until the configured deadline; forced shutdown cancels them. The deadline ends application draining, while backend cleanup can take longer. A connection is never freed merely because a shutdown timeout expired. Worker operation IDs are cancelled with their connection. Queued callbacks can be skipped, but a running callback must return before its completion releases request storage. If it returns a stream after cancellation, that stream still receives its one cancellation close hook.

@@ -1,4 +1,4 @@
-//! Loop-thread allocation budget shared by connection buffers and request arenas.
+//! Synchronized allocation budget shared by connection buffers and request arenas.
 
 const std = @import("std");
 
@@ -17,6 +17,14 @@ pub const Budget = struct {
 
     pub fn allocator(self: *Budget) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    /// Keep room for live work instead of retaining idle request storage.
+    pub fn isUnderPressure(self: *Budget) bool {
+        if (self.limit == 0) return false;
+        self.lock();
+        defer self.unlock();
+        return self.used >= self.limit - self.limit / 4;
     }
 
     fn fits(self: *Budget, amount: usize) bool {
@@ -61,6 +69,87 @@ pub const Budget = struct {
         self.used -= bytes.len;
     }
 };
+
+/// Called only after response I/O and request cleanup finish on the loop thread.
+/// A failed consolidation may leave a larger arena, so release it on failure.
+pub fn resetRequestArena(arena: *std.heap.ArenaAllocator, budget: *Budget, retain_bytes: usize) void {
+    if (retain_bytes == 0 or budget.isUnderPressure()) {
+        _ = arena.reset(.free_all);
+    } else if (!arena.reset(.{ .retain_with_limit = retain_bytes })) {
+        _ = arena.reset(.free_all);
+    }
+}
+
+test "request arena reuses bounded storage charged through connection retirement" {
+    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var budget: Budget = .{ .backing = tracking.allocator(), .limit = 16 * 1024 };
+    var arena = std.heap.ArenaAllocator.init(budget.allocator());
+    const first = try arena.allocator().alloc(u8, 128);
+    @memset(first, 0xa5);
+    resetRequestArena(&arena, &budget, 1024);
+    try std.testing.expect(arena.queryCapacity() > 0 and arena.queryCapacity() <= 1024);
+    try std.testing.expect(budget.used > 0);
+    const before = tracking.allocations;
+    _ = try arena.allocator().alloc(u8, 128);
+    try std.testing.expectEqual(before, tracking.allocations);
+    resetRequestArena(&arena, &budget, 1024);
+    arena.deinit();
+    try std.testing.expectEqual(@as(usize, 0), budget.used);
+    try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+}
+
+test "request arena frees oversized requests and honors disabled retention" {
+    var budget: Budget = .{ .backing = std.testing.allocator, .limit = 0 };
+    var arena = std.heap.ArenaAllocator.init(budget.allocator());
+    defer arena.deinit();
+    _ = try arena.allocator().alloc(u8, 32 * 1024);
+    resetRequestArena(&arena, &budget, 1024);
+    try std.testing.expect(arena.queryCapacity() <= 1024);
+    _ = try arena.allocator().alloc(u8, 64);
+    resetRequestArena(&arena, &budget, 0);
+    try std.testing.expectEqual(@as(usize, 0), arena.queryCapacity());
+    try std.testing.expectEqual(@as(usize, 0), budget.used);
+}
+
+test "request arena retention failure releases remaining backing storage" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1, .resize_fail_index = 0 });
+    var budget: Budget = .{ .backing = failing.allocator(), .limit = 0 };
+    var arena = std.heap.ArenaAllocator.init(budget.allocator());
+    defer arena.deinit();
+    _ = try arena.allocator().alloc(u8, 4096);
+    resetRequestArena(&arena, &budget, 128);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), arena.queryCapacity());
+    try std.testing.expectEqual(@as(usize, 0), budget.used);
+}
+
+test "request arena retention yields to the shared memory budget" {
+    var budget: Budget = .{ .backing = std.testing.allocator, .limit = 4096 };
+    var arena = std.heap.ArenaAllocator.init(budget.allocator());
+    defer arena.deinit();
+    _ = try arena.allocator().alloc(u8, 64);
+    resetRequestArena(&arena, &budget, 512);
+    try std.testing.expect(!budget.isUnderPressure());
+    const active = try budget.allocator().alloc(u8, budget.limit - budget.used);
+    try std.testing.expect(budget.isUnderPressure());
+    resetRequestArena(&arena, &budget, 512);
+    try std.testing.expectEqual(@as(usize, 0), arena.queryCapacity());
+    try std.testing.expectEqual(active.len, budget.used);
+    budget.allocator().free(active);
+    try std.testing.expect(!budget.isUnderPressure());
+}
+
+test "budget pressure starts at three quarters and ignores unlimited budgets" {
+    var budget: Budget = .{ .backing = std.testing.allocator, .limit = 4096 };
+    const below = try budget.allocator().alloc(u8, 3071);
+    defer budget.allocator().free(below);
+    try std.testing.expect(!budget.isUnderPressure());
+    const edge = try budget.allocator().alloc(u8, 1);
+    defer budget.allocator().free(edge);
+    try std.testing.expect(budget.isUnderPressure());
+    budget.limit = 0;
+    try std.testing.expect(!budget.isUnderPressure());
+}
 
 test "budget rejects growth and restores capacity after release" {
     var budget: Budget = .{ .backing = std.testing.allocator, .limit = 32 };

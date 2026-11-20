@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const mox = @import("mox");
-const bench = @import("lovez_bench");
+const zlap = @import("zlap");
 
 var router: mox.Router = undefined;
 
@@ -14,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .method = .GET, .path = "/assets/*path", .handler = handler },
     });
     defer router.deinit();
-    const config: bench.Config = .{
+    const config: zlap.Config = .{
         .batch_size = 2000,
         .sample_count = 20,
         .rounds = 3,
@@ -22,11 +22,11 @@ pub fn main(init: std.process.Init) !void {
         .allocator = init.gpa,
         .count_allocations = true,
     };
-    const parse_result = try bench.runConfigured(init.io, config, parse);
+    const parse_result = try zlap.runConfigured(init.io, config, parse);
     parse_result.print("HTTP request parsing");
-    const route_result = try bench.runConfigured(init.io, config, route);
+    const route_result = try zlap.runConfigured(init.io, config, route);
     route_result.print("Route matching");
-    const serialize_result = try bench.runConfigured(init.io, config, serialize);
+    const serialize_result = try zlap.runConfigured(init.io, config, serialize);
     serialize_result.print("HTTP response serialization");
 }
 

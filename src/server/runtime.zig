@@ -13,7 +13,8 @@ const framing = @import("proxy_framing.zig");
 const proxy = @import("proxy_protocol.zig");
 const metrics = @import("metrics.zig");
 const Observation = @import("observation.zig").Observation;
-const Budget = @import("memory.zig").Budget;
+const memory = @import("memory.zig");
+const Budget = memory.Budget;
 const Admission = @import("admission.zig").Admission;
 
 pub fn serve(config: types.Config) !void {
@@ -208,7 +209,7 @@ fn Server(comptime Loop: type) type {
                     return;
                 }
                 c.removeInput(c.consumed);
-                _ = c.arena.reset(.free_all);
+                memory.resetRequestArena(&c.arena, &c.server.budget, c.server.config.request_arena_retain_bytes);
                 c.request = null;
                 c.entry = null;
                 c.params = .{};
@@ -890,7 +891,12 @@ fn Server(comptime Loop: type) type {
                     .close => self.beginDrain(true),
                 };
                 if (self.draining and self.loop.now() >= self.drain_until) self.beginDrain(true);
+                const memory_pressure = self.budget.isUnderPressure();
                 for (self.connections.items) |c| {
+                    // Pending receives use scratch, not idle arena storage. A
+                    // parsed request or worker still pins its arena until finish.
+                    if (memory_pressure and !c.closing and c.mode == .reading and c.request == null and !c.work_active)
+                        _ = c.arena.reset(.free_all);
                     if (!c.closing and c.mode == .sse and c.sse_due != 0 and self.loop.now() >= c.sse_due) c.pumpSse() catch c.close();
                     if (!c.closing and c.mode == .websocket and c.ws_deadline != 0 and self.loop.now() >= c.ws_deadline) c.close();
                 }

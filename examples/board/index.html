@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Task board</title>
+  <link rel="stylesheet" href="/board.css">
+  <script src="/board.js" defer></script>
+</head>
+<body>
+  <main>
+    <header><p class="eyebrow">MOX / EXAMPLE APPLICATION</p><h1>A little room<br>to get things done.</h1><p class="intro">A small task board with server-rendered HTML and a JSON API.</p></header>
+    <section class="board" aria-label="Task board">
+      <div class="board-heading"><h2>Your tasks</h2><span class="count">{{ total }} total</span></div>
+      <form id="create-task"><label for="title">What needs doing?</label><div class="input-row"><input id="title" name="title" maxlength="160" placeholder="Write a task..." required><button type="submit">Add task</button></div></form>
+      <p id="notice" role="status" aria-live="polite"></p>
+      <ul class="tasks">
+      {% for task in tasks %}
+        <li data-id="{{ task.id }}"><label class="task"><input type="checkbox" {% attr checked when task.done %}><span>{{ task.title }}</span></label><button class="delete" type="button" aria-label="Delete task">Delete</button></li>
+      {% else %}
+        <li class="empty">All clear. Add your first task above.</li>
+      {% endfor %}
+      </ul>
+    </section>
+    <footer>In-memory demo / up to 64 tasks / changes reset on restart.</footer>
+  </main>
+</body>
+</html>
